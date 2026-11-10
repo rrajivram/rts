@@ -38,6 +38,7 @@ enum PlaceRef {
     Dyn { o: R, k: R },
     ArrLen { a: R },
     StrLen { s: R },
+    Accessor { o: R, get: Option<u32>, set: Option<u32> },
 }
 
 struct LoopCtx {
@@ -1881,6 +1882,12 @@ impl FnGen<'_, '_> {
                 self.opt_check(o, *opt);
                 PlaceRef::StrLen { s: o.r }
             }
+            Place::Accessor { obj, get, set, opt } => {
+                let o = self.expr(obj);
+                let o = self.coerce(o, Kind::Val);
+                self.opt_check(o, *opt);
+                PlaceRef::Accessor { o: o.r, get: *get, set: *set }
+            }
         }
     }
 
@@ -1956,7 +1963,33 @@ impl FnGen<'_, '_> {
                 self.emit(I::StrLen { d, s });
                 Op { k: Kind::Num, r: d }
             }
+            PlaceRef::Accessor { o, get, .. } => {
+                let d = self.alloc(if want == Kind::Num { Kind::Num } else { Kind::Val });
+                match get {
+                    Some(slot) => self.method_call_raw(slot, o, vec![], Some(d)),
+                    None => {
+                        self.emit(I::LoadUndef { d: d.r });
+                    }
+                }
+                d
+            }
         }
+    }
+
+    /// Virtual call `o.<vtable slot>(args)` with arguments already in registers.
+    fn method_call_raw(&mut self, slot: u32, o: R, args: Vec<(Kind, R)>, dst: Option<Op>) {
+        let n = args.len();
+        self.calls.push(CallInfo {
+            target: CallTarget::Method(slot),
+            this: Some(o),
+            args,
+            spread: vec![false; n],
+            has_spread: false,
+            dst: dst.map(|d| (d.k, d.r)),
+            packed_rest: false,
+        });
+        let ci = self.calls.len() as u32 - 1;
+        self.emit(I::Call { ci });
     }
 
     fn store_var(&mut self, v: VarId, val: Op) {
@@ -2024,6 +2057,11 @@ impl FnGen<'_, '_> {
                 self.emit(I::SetArrLen { a, s: val.r });
             }
             PlaceRef::StrLen { .. } => {}
+            PlaceRef::Accessor { o, set, .. } => {
+                if let Some(slot) = set {
+                    self.method_call_raw(slot, o, vec![(val.k, val.r)], None);
+                }
+            }
         }
     }
 
@@ -2645,7 +2683,11 @@ fn collect_nums_stmt(s: &HStmt, out: &mut Vec<f64>, hir: &HProgram) {
 fn collect_nums_place(p: &Place, out: &mut Vec<f64>, hir: &HProgram) {
     match p {
         Place::Var(_) => {}
-        Place::Field { obj, .. } | Place::Prop { obj, .. } | Place::ArrLen { obj, .. } | Place::StrLen { obj, .. } => {
+        Place::Field { obj, .. }
+        | Place::Prop { obj, .. }
+        | Place::ArrLen { obj, .. }
+        | Place::StrLen { obj, .. }
+        | Place::Accessor { obj, .. } => {
             collect_nums_expr(obj, out, hir)
         }
         Place::Index { obj, index: k, .. } | Place::DynIndex { obj, key: k, .. } => {

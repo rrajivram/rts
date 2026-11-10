@@ -132,6 +132,8 @@ pub struct ClassDef {
     pub vtable: Vec<(Name, FuncId)>,
     pub ctor: FuncId,
     pub statics: FxHashMap<Name, VB>,
+    /// Accessor properties: name → (getter, setter) as (function, vtable slot).
+    pub accessors: FxHashMap<Name, (Option<(FuncId, u32)>, Option<(FuncId, u32)>)>,
     pub resolved: bool,
     pub is_abstract: bool,
     pub prelude_error: bool,
@@ -790,7 +792,19 @@ impl Checker {
                         optional: f.optional,
                     })
                     .collect();
-                let methods: Vec<(Name, FuncId)> = c.vtable.clone();
+                let accessors: Vec<(Name, Option<(FuncId, u32)>)> = c.accessors.iter().map(|(n, (g, _))| (n.clone(), *g)).collect();
+                let methods: Vec<(Name, FuncId)> = c.vtable.iter().filter(|(n, _)| !n.contains(' ')).cloned().collect();
+                for (n, g) in accessors {
+                    let ty = match g {
+                        Some((f, _)) => self.func_ret(f).unwrap_or(Type::Any),
+                        None => Type::Any,
+                    };
+                    props.push(Prop {
+                        name: n,
+                        ty,
+                        optional: false,
+                    });
+                }
                 for (n, f) in methods {
                     if let Ok(ft) = self.func_type(f) {
                         props.push(Prop {
@@ -996,6 +1010,18 @@ impl Checker {
     }
 
     fn fn_assignable(&mut self, f: &FuncType, g: &FuncType) -> bool {
+        // Generic signatures: rename f's type parameters to g's (or erase them).
+        if !f.tparams.is_empty() {
+            let map: FxHashMap<TParamId, Type> = f
+                .tparams
+                .iter()
+                .enumerate()
+                .map(|(i, t)| (*t, g.tparams.get(i).map_or(Type::Any, |u| Type::Param(*u))))
+                .collect();
+            let f2 = self.subst_fn(f, &map);
+            let f2 = FuncType { tparams: vec![], ..f2 };
+            return self.fn_assignable(&f2, g);
+        }
         // Fewer parameters are fine; parameters are checked bivariantly (as TS does for methods).
         let fp: Vec<&FParam> = f.params.iter().filter(|p| !p.rest).collect();
         let gp: Vec<&FParam> = g.params.iter().filter(|p| !p.rest).collect();
@@ -1535,6 +1561,10 @@ impl Checker {
                 methods.insert(n.clone(), (*f, i as u32));
             }
             let mut ctor_ast = None;
+            let mut accessors = match &self.classes[cid as usize].parent {
+                Some((p, _)) => self.classes[*p as usize].accessors.clone(),
+                None => FxHashMap::default(),
+            };
             // Parameter properties come first in the layout (as Node's TS transform does).
             for m in &decl.members {
                 if let ast::ClassMember::Constructor(f) = m {
@@ -1645,7 +1675,37 @@ impl Checker {
                         kind,
                     } => {
                         if *kind != ast::MethodKind::Method {
-                            return err("getters and setters are not supported yet", func.span);
+                            if *is_static {
+                                return err("static accessors are not supported yet", func.span);
+                            }
+                            let vname: Name = format!("{} {name}", if *kind == ast::MethodKind::Get { "get" } else { "set" }).into();
+                            let f = self.new_func(
+                                vname.clone(),
+                                Some(func.clone()),
+                                FnKind::Method,
+                                Some(cid),
+                                None,
+                                cscope.clone(),
+                                Some(this_ty.clone()),
+                            );
+                            let slot = match vtable.iter().position(|(n, _)| *n == vname) {
+                                Some(i) => {
+                                    vtable[i].1 = f;
+                                    i as u32
+                                }
+                                None => {
+                                    vtable.push((vname.clone(), f));
+                                    vtable.len() as u32 - 1
+                                }
+                            };
+                            methods.insert(vname, (f, slot));
+                            let e = accessors.entry(name.clone()).or_insert((None, None));
+                            if *kind == ast::MethodKind::Get {
+                                e.0 = Some((f, slot));
+                            } else {
+                                e.1 = Some((f, slot));
+                            }
+                            continue;
                         }
                         if func.body.is_none() && !decl.is_abstract && !decl.members.iter().any(|m| matches!(m, ast::ClassMember::Method { name: n2, func: f2, .. } if n2 == name && f2.body.is_some())) {
                             return err(format!("method '{name}' has no body"), func.span);
@@ -1754,6 +1814,7 @@ impl Checker {
             c.vtable = vtable;
             c.ctor = ctor;
             c.statics = statics;
+            c.accessors = accessors;
             // Static initializers run where the class is declared.
             self.static_inits.extend(static_inits.into_iter().map(|(v, e)| (cid, v, e)));
             Ok(())

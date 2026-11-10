@@ -469,6 +469,7 @@ impl Checker {
             vtable: vec![],
             ctor: 0,
             statics: Default::default(),
+            accessors: Default::default(),
             resolved: false,
             is_abstract: decl.is_abstract,
             prelude_error,

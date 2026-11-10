@@ -235,6 +235,8 @@ pub enum Place {
     ArrLen { obj: HExpr, opt: bool },
     /// `str.length` (read only)
     StrLen { obj: HExpr, opt: bool },
+    /// Class accessor property: getter/setter vtable slots.
+    Accessor { obj: HExpr, get: Option<u32>, set: Option<u32>, opt: bool },
 }
 
 #[derive(Debug, Clone)]

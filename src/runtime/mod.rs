@@ -192,10 +192,13 @@ impl Shape {
     }
 }
 
+/// Fields stored inline for small objects (one allocation per object).
+pub type Fields = smallvec::SmallVec<[Value; 4]>;
+
 #[derive(Debug)]
 pub struct ObjInner {
     pub shape: Rc<Shape>,
-    pub vals: Vec<Value>,
+    pub vals: Fields,
 }
 
 #[derive(Debug)]
@@ -206,6 +209,14 @@ pub struct Object {
 
 impl Object {
     pub fn new(shape: Rc<Shape>, vals: Vec<Value>, class: Option<Rc<ClassRt>>) -> Rc<Object> {
+        Self::with_fields(shape, Fields::from_vec(vals), class)
+    }
+    /// An object with `n` undefined fields.
+    pub fn blank(shape: Rc<Shape>, class: Option<Rc<ClassRt>>) -> Rc<Object> {
+        let n = shape.keys.len();
+        Self::with_fields(shape, Fields::from_elem(Value::Undef, n), class)
+    }
+    pub fn with_fields(shape: Rc<Shape>, vals: Fields, class: Option<Rc<ClassRt>>) -> Rc<Object> {
         Rc::new(Object {
             inner: RefCell::new(ObjInner { shape, vals }),
             class,

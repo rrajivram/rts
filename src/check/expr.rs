@@ -372,14 +372,22 @@ impl Checker {
             }
         });
         let kind = if f.is_arrow { FnKind::Arrow } else { FnKind::Normal };
-        let scope = self.ctx().scope.clone();
+        let mut scope = self.ctx().scope.clone();
         let name = f.name.clone().unwrap_or_else(|| "".into());
+        // A named function expression can refer to itself: bind its name in a
+        // scope of its own, backed by a hidden variable in the current block.
+        let self_var = match &f.name {
+            Some(n) if !f.is_arrow => {
+                let v = self.new_var(format!("$fn:{n}").into(), None, true, &scope);
+                let inner = Scope::new(Some(scope.clone()), scope.owner);
+                scope = inner;
+                Some((n.clone(), v))
+            }
+            _ => None,
+        };
         let fid = self.new_func(name.clone(), Some(f.clone()), kind, None, ctxf.clone(), scope.clone(), None);
-        // A named function expression can refer to itself.
-        if let Some(n) = &f.name
-            && !f.is_arrow
-        {
-            let _ = n;
+        if let Some((n, v)) = &self_var {
+            scope.vals.borrow_mut().insert(n.clone(), VB::Func(*v, fid));
         }
         self.inherit_narrowing(fid);
         // Check the body now: the enclosing context is on the stack (for `this`).
@@ -393,7 +401,13 @@ impl Checker {
         }
         self.ensure_checked(fid)?;
         let ft = self.func_type(fid)?;
-        Ok(HExpr::new(HK::Closure(fid), Type::Func(ft)))
+        let closure = HExpr::new(HK::Closure(fid), Type::Func(ft.clone()));
+        if let Some((_, v)) = self_var {
+            self.vars[v as usize].ty = Type::Func(ft.clone());
+            self.var_pending[v as usize] = false;
+            return Ok(HExpr::new(HK::Assign(Box::new(Place::Var(v)), Box::new(closure)), Type::Func(ft)));
+        }
+        Ok(closure)
     }
 
     fn check_unary(&mut self, op: UnaryOp, x: &Expr, span: Span) -> CResult<HExpr> {
@@ -625,6 +639,9 @@ impl Checker {
                 if let Place::StrLen { .. } = &*p {
                     return err("cannot assign to 'length' of a string", e.span);
                 }
+                if let Place::Accessor { set: None, .. } = &*p {
+                    return err("cannot assign to a property that only has a getter", e.span);
+                }
                 let _ = ty;
                 Ok(*p)
             }
@@ -821,6 +838,23 @@ impl Checker {
                     let fty = c.fields[slot].ty.clone().unwrap_or(Type::Any);
                     let fty = self.subst(&fty, &map);
                     return Ok(HExpr::read(Place::Field { obj: h, slot: slot as u32, opt }, wrap_opt(fty)));
+                }
+                if let Some((g, st)) = c.accessors.get(prop).cloned() {
+                    let ty = match (g, st) {
+                        (Some((f, _)), _) => self.func_ret(f)?,
+                        (None, Some((f, _))) => self.func_params(f)?.first().map_or(Type::Any, |p| p.ty.clone()),
+                        _ => Type::Any,
+                    };
+                    let ty = self.subst(&ty, &map);
+                    return Ok(HExpr::read(
+                        Place::Accessor {
+                            obj: h,
+                            get: g.map(|x| x.1),
+                            set: st.map(|x| x.1),
+                            opt,
+                        },
+                        wrap_opt(ty),
+                    ));
                 }
                 if let Some((f, _)) = c.methods.get(prop).cloned() {
                     let ft = self.func_type(f)?;

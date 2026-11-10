@@ -477,6 +477,13 @@ impl Vm {
         }
     }
 
+    /// The getter or setter function for an accessor property, if the class has one.
+    fn accessor(o: &Object, kind: &str, name: &str) -> Option<u32> {
+        let c = o.class.as_ref()?;
+        let key = format!("{kind} {name}");
+        c.methods.get(key.as_str()).copied()
+    }
+
     fn get_prop_slow(&mut self, recv: &Value, site: &PropSite) -> Result<Value, Value> {
         let name = &*site.name;
         match recv {
@@ -487,6 +494,10 @@ impl Vm {
                         *site.cache.entry.borrow_mut() = Some((inner.shape.clone(), i));
                         return Ok(inner.vals[i as usize].clone());
                     }
+                }
+                if let Some(g) = Self::accessor(o, "get", name) {
+                    let f = Value::Func(Rc::new(Closure { func: g, caps: Box::new([]) }));
+                    return self.call(&f, recv.clone(), vec![]);
                 }
                 self.lookup_method(recv, name)
             }
@@ -508,6 +519,12 @@ impl Vm {
 
     fn set_prop(&mut self, recv: &Value, site: &PropSite, val: Value) -> Result<(), Value> {
         match recv {
+            Value::Obj(o) if o.inner.borrow().shape.lookup(&site.name).is_none() && Self::accessor(o, "set", &site.name).is_some() => {
+                let s = Self::accessor(o, "set", &site.name).unwrap();
+                let f = Value::Func(Rc::new(Closure { func: s, caps: Box::new([]) }));
+                self.call(&f, recv.clone(), vec![val])?;
+                Ok(())
+            }
             Value::Obj(o) => {
                 let mut inner = o.inner.borrow_mut();
                 if let Some((sh, slot)) = &*site.cache.entry.borrow()
@@ -1157,7 +1174,8 @@ impl Vm {
                     I::NewObj { d, shape } => {
                         let sh = self.prog.shapes[shape as usize].clone();
                         let n = sh.keys.len();
-                        v!(d) = Value::Obj(Object::new(sh, vec![Value::Undef; n], None))
+                        let _ = n;
+                        v!(d) = Value::Obj(Object::blank(sh, None))
                     }
                     I::ObjSpread { o, s } => {
                         let src = v!(s).clone();
@@ -1239,7 +1257,8 @@ impl Vm {
                     I::NewInst { d, class } => {
                         let c = self.prog.classes[class as usize].clone();
                         let n = c.shape.keys.len();
-                        v!(d) = Value::Obj(Object::new(c.shape.clone(), vec![Value::Undef; n], Some(c)))
+                        let _ = n;
+                        v!(d) = Value::Obj(Object::blank(c.shape.clone(), Some(c)))
                     }
                     I::LoadClass { d, class } => v!(d) = Value::Class(self.prog.classes[class as usize].clone()),
 
