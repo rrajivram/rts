@@ -129,16 +129,17 @@ interpreter on all of them.
 Where the speedup comes from, using `fib` as the example (`rts --dump` vs `rts --no-types --dump`):
 
 ```
-typed (10 instructions)                    untyped (16 instructions)
-JCmpN  Lt  n, 2  → else                    LoadK   t, 2
-MovS   r, n                                DynCmp  Lt  c, n, t      ; tag checks on both sides
-Jmp    ret                                 JmpF    c → else
-AddNK  a, n, -1                            MovV    r, n             ; refcount-aware move
-Call   fib(a)        ; args copied raw     Jmp     ret
-AddNK  b, n, -2                            LoadK   t, 1
-Call   fib(b)                              DynNum  Sub  x, n, t
-AddN   r, ra, rb     ; raw f64 add         BoxN    a, x
-MovS / RetN                                Call    fib(a)           ; args boxed
+typed (11 instructions)                    untyped (16 instructions)
+LoadN  k, 2                                LoadK   t, 2
+JCmpN  Lt  n, k  → else                    DynCmp  Lt  c, n, t      ; tag checks on both sides
+MovS   r, n                                JmpF    c → else
+Jmp    ret                                 MovV    r, n             ; refcount-aware move
+AddNK  a, n, -1                            Jmp     ret
+Call   fib(a)        ; args copied raw     LoadK   t, 1
+AddNK  b, n, -2                            DynNum  Sub  x, n, t
+Call   fib(b)                              BoxN    a, x
+AddN   r, ra, rb     ; raw f64 add         Call    fib(a)           ; args boxed
+MovS / RetN
                                            …       (same for n - 2)
                                            DynAdd  r, ra, rb        ; tag dispatch: number? string?
                                            MovV / RetV
