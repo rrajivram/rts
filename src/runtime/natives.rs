@@ -369,8 +369,8 @@ fn merge_sort(v: &mut Vec<Value>, cmp: &mut dyn FnMut(&Value, &Value) -> Result<
 }
 
 /// Whether a callback wants the index/array args (avoid boxing them for 1-param callbacks).
-fn cb_args(x: Value, i: usize, arr: &Rc<Array>) -> Vec<Value> {
-    vec![x, Value::Num(i as f64), Value::Arr(arr.clone())]
+fn cb_args(x: Value, i: usize, arr: &Rc<Array>) -> [Value; 3] {
+    [x, Value::Num(i as f64), Value::Arr(arr.clone())]
 }
 
 pub fn json_stringify(v: &Value, indent: &str, cur: &str, out: &mut String) -> bool {
@@ -1103,7 +1103,8 @@ pub fn call_native(vm: &mut Vm, n: Native, this: Value, args: Vec<Value>) -> NRe
             let a = arr_of(&this).or_else(|m| te(vm, m))?;
             let f = arg(&args, 0);
             let len = a.len();
-            let mut out = Vec::new();
+            // Results start as number storage and degrade on the first non-number.
+            let out = Array::new_num(Vec::new());
             let order: Vec<usize> = if matches!(n, ArrFindLast | ArrFindLastIndex) {
                 (0..len).rev().collect()
             } else {
@@ -1114,11 +1115,15 @@ pub fn call_native(vm: &mut Vm, n: Native, this: Value, args: Vec<Value>) -> NRe
                     break;
                 }
                 let x = a.get(i);
-                let r = vm.call(&f, Value::Undef, cb_args(x.clone(), i, &a))?;
+                let r = vm.call_slice(&f, Value::Undef, &cb_args(x.clone(), i, &a))?;
                 match n {
                     ArrMap => out.push(r),
                     ArrFlatMap => match r {
-                        Value::Arr(b) => out.extend(b.to_vec()),
+                        Value::Arr(b) => {
+                            for y in b.to_vec() {
+                                out.push(y)
+                            }
+                        }
                         r => out.push(r),
                     },
                     ArrFilter => {
@@ -1151,7 +1156,7 @@ pub fn call_native(vm: &mut Vm, n: Native, this: Value, args: Vec<Value>) -> NRe
                 }
             }
             match n {
-                ArrMap | ArrFilter | ArrFlatMap => Value::Arr(make_array(out)),
+                ArrMap | ArrFilter | ArrFlatMap => Value::Arr(out),
                 ArrForEach | ArrFind | ArrFindLast => Value::Undef,
                 ArrFindIndex | ArrFindLastIndex => Value::Num(-1.0),
                 ArrSome => Value::Bool(false),
@@ -1177,7 +1182,7 @@ pub fn call_native(vm: &mut Vm, n: Native, this: Value, args: Vec<Value>) -> NRe
             };
             for i in it {
                 let x = a.get(i);
-                acc = vm.call(&f, Value::Undef, vec![acc, x, Value::Num(i as f64), Value::Arr(a.clone())])?;
+                acc = vm.call_slice(&f, Value::Undef, &[acc, x, Value::Num(i as f64), Value::Arr(a.clone())])?;
             }
             acc
         }
@@ -1194,7 +1199,7 @@ pub fn call_native(vm: &mut Vm, n: Native, this: Value, args: Vec<Value>) -> NRe
                 vals = keyed.into_iter().map(|(_, v)| v).collect();
             } else {
                 merge_sort(&mut vals, &mut |x, y| {
-                    let r = vm.call(&f, Value::Undef, vec![x.clone(), y.clone()])?;
+                    let r = vm.call_slice(&f, Value::Undef, &[x.clone(), y.clone()])?;
                     Ok(r.to_number() < 0.0)
                 })?;
             }

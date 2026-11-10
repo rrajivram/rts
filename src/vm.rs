@@ -87,8 +87,17 @@ fn num_op(op: NumOp, x: f64, y: f64) -> f64 {
     }
 }
 
-/// `%` with an integer fast path (fmod is slow); same results as JS, including -0.
+/// Arithmetic on two dynamic values (numbers first).
 #[inline(always)]
+fn dyn_num(op: NumOp, a: &Value, b: &Value) -> f64 {
+    let (x, y) = match (a, b) {
+        (Value::Num(x), Value::Num(y)) => (*x, *y),
+        (a, b) => (a.to_number(), b.to_number()),
+    };
+    if op == NumOp::Mod { fast_mod(x, y) } else { num_op(op, x, y) }
+}
+
+/// `%` with an integer fast path (fmod is slow); same results as JS, including -0.
 fn fast_mod(x: f64, y: f64) -> f64 {
     let (xi, yi) = (x as i64, y as i64);
     if xi as f64 == x && yi as f64 == y && yi != 0 && xi != i64::MIN {
@@ -218,9 +227,18 @@ impl Vm {
 
     /// Call any callable value from native code.
     pub fn call(&mut self, callee: &Value, this: Value, args: Vec<Value>) -> Result<Value, Value> {
+        if let Value::Native(n) = callee {
+            return call_native(self, *n, this, args);
+        }
+        self.call_slice(callee, this, &args)
+    }
+
+    /// Call from native code with arguments borrowed from the caller (no allocation
+    /// for the argument list — used by callbacks such as `map`'s).
+    pub fn call_slice(&mut self, callee: &Value, this: Value, args: &[Value]) -> Result<Value, Value> {
         let (func, closure) = match callee {
             Value::Func(c) => (self.prog.funcs[c.func as usize].clone(), Some(c.clone())),
-            Value::Native(n) => return call_native(self, *n, this, args),
+            Value::Native(n) => return call_native(self, *n, this, args.to_vec()),
             v => return Err(self.type_error(format!("{} is not a function", describe(v)))),
         };
         if self.frames.len() >= MAX_DEPTH {
@@ -232,7 +250,11 @@ impl Vm {
         };
         self.ensure(sb, vb, &func);
         self.v[vb] = this;
-        self.bind_values(&func, sb, vb, args)?;
+        if func.rest {
+            self.bind_values(&func, sb, vb, args.to_vec())?;
+        } else {
+            self.bind_slice(&func, sb, vb, args)?;
+        }
         let depth = self.frames.len();
         self.frames.push(Frame {
             func: FnRef::new(&func),
@@ -266,6 +288,11 @@ impl Vm {
             args.resize(np - 1, Value::Undef);
             args.push(Value::Arr(make_array(rest)));
         }
+        self.bind_slice(func, sb, vb, &args)
+    }
+
+    /// Bind argument values (no rest packing) to a callee's parameter registers.
+    fn bind_slice(&mut self, func: &FuncCode, sb: usize, vb: usize, args: &[Value]) -> Result<(), Value> {
         let (mut si, mut vi) = (0usize, 1usize);
         for (i, k) in func.params.iter().enumerate() {
             let a = args.get(i);
@@ -345,9 +372,40 @@ impl Vm {
                 }
                 None => unreachable!(),
             },
-            CallTarget::Prop(p) => {
+            CallTarget::Prop(p) => 'prop: {
                 let site = &caller.props[*p as usize];
                 let recv = this.clone().unwrap_or(Value::Undef);
+                // Method inline cache: same shape and class as last time → same method.
+                if let Value::Obj(o) = &recv
+                    && let Some(cls) = &o.class
+                {
+                    let hit = match &*site.cache.method.borrow() {
+                        Some((sh, c, fi)) if Rc::ptr_eq(c, cls) && Rc::ptr_eq(sh, &o.inner.borrow().shape) => Some(*fi),
+                        _ => None,
+                    };
+                    let fi = match hit {
+                        Some(fi) => Some(fi),
+                        None if o.inner.borrow().shape.lookup(&site.name).is_none() => {
+                            let mut k = Some(cls.clone());
+                            let mut found = None;
+                            while let Some(c) = k {
+                                if let Some(fi) = c.methods.get(&*site.name) {
+                                    found = Some(*fi);
+                                    break;
+                                }
+                                k = c.parent.clone();
+                            }
+                            if let Some(fi) = found {
+                                *site.cache.method.borrow_mut() = Some((o.inner.borrow().shape.clone(), cls.clone(), fi));
+                            }
+                            found
+                        }
+                        None => None,
+                    };
+                    if let Some(fi) = fi {
+                        break 'prop (self.prog.funcs[fi as usize].clone(), None);
+                    }
+                }
                 match self.lookup_method(&recv, &site.name)? {
                     Value::Func(c) => (self.prog.funcs[c.func as usize].clone(), Some(c)),
                     Value::Native(n) => return self.call_native_ci(n, ci, recv, sb, vb),
@@ -562,7 +620,7 @@ impl Vm {
         let fr = self.frames.pop().unwrap();
         // Release the frame's references now: deterministic destruction.
         for x in &mut self.v[fr.vb..fr.vb + fr.func.get().nv] {
-            *x = Value::Undef;
+            x.release();
         }
         match fr.ret {
             Ret::Reg(k, d) => {
@@ -585,7 +643,7 @@ impl Vm {
         {
             let fr = self.frames.pop().unwrap();
             for x in &mut self.v[fr.vb..fr.vb + fr.func.get().nv] {
-                *x = Value::Undef;
+                x.release();
             }
             let top = self.frames.last().unwrap();
             self.s[top.sb + d as usize] = bits;
@@ -609,7 +667,7 @@ impl Vm {
             }
             let fr = self.frames.pop().unwrap();
             for x in &mut self.v[fr.vb..fr.vb + fr.func.get().nv] {
-                *x = Value::Undef;
+                x.release();
             }
             if self.frames.len() <= stop {
                 return Err(err);
@@ -742,7 +800,7 @@ impl Vm {
                     I::MovV { d, s } => v!(d) = v!(s).clone(),
                     I::ClearV { d, n } => {
                         for x in &mut self.v[vb + d as usize..vb + d as usize + n as usize] {
-                            *x = Value::Undef;
+                            x.release();
                         }
                     }
                     I::BoxN { d, s } => v!(d) = Value::Num(n!(s)),
@@ -811,7 +869,18 @@ impl Vm {
                         };
                         v!(d) = r
                     }
-                    I::DynNum { op, d, a, b: bb } => s!(d) = b(num_op(op, v!(a).to_number(), v!(bb).to_number())),
+                    I::DynNum { op, d, a, b: bb } => s!(d) = b(dyn_num(op, &v!(a), &v!(bb))),
+                    I::DynNumV { op, d, a, b: bb } => {
+                        let r = dyn_num(op, &v!(a), &v!(bb));
+                        v!(d) = Value::Num(r)
+                    }
+                    I::IncV { d, s, k } => {
+                        let r = match &v!(s) {
+                            Value::Num(x) => x + k,
+                            x => x.to_number() + k,
+                        };
+                        v!(d) = Value::Num(r)
+                    }
                     I::DynCmp { op, d, a, b: bb } => {
                         let r = match (&v!(a), &v!(bb)) {
                             (Value::Str(x), Value::Str(y)) => str_cmp(op, &x.s, &y.s),
@@ -1061,6 +1130,15 @@ impl Vm {
                         }
                     }
                     I::GetDyn { d, o, k } => {
+                        // Array element by integer index.
+                        if let (Value::Arr(a), Value::Num(i)) = (&v!(o), &v!(k))
+                            && *i >= 0.0
+                            && (*i as usize) as f64 == *i
+                        {
+                            let x = a.get(*i as usize);
+                            v!(d) = x;
+                            continue;
+                        }
                         let x = match &v!(o) {
                             other @ (Value::Undef | Value::Null) => {
                                 let m = format!(
@@ -1230,14 +1308,16 @@ impl Vm {
                     }
                     I::GetProp { d, o, p } => {
                         let site = &func.props[p as usize];
-                        let fast = if let Value::Obj(ob) = &v!(o) {
-                            let inner = ob.inner.borrow();
-                            match &*site.cache.entry.borrow() {
-                                Some((sh, slot)) if Rc::ptr_eq(sh, &inner.shape) => Some(inner.vals[*slot as usize].clone()),
-                                _ => None,
+                        let fast = match &v!(o) {
+                            Value::Obj(ob) => {
+                                let inner = ob.inner.borrow();
+                                match &*site.cache.entry.borrow() {
+                                    Some((sh, slot)) if Rc::ptr_eq(sh, &inner.shape) => Some(inner.vals[*slot as usize].clone()),
+                                    _ => None,
+                                }
                             }
-                        } else {
-                            None
+                            Value::Arr(a) if site.is_length => Some(Value::Num(a.len() as f64)),
+                            _ => None,
                         };
                         let x = match fast {
                             Some(x) => x,
@@ -1250,9 +1330,24 @@ impl Vm {
                     }
                     I::SetProp { o, p, s } => {
                         let site = &func.props[p as usize];
-                        let recv = v!(o).clone();
                         let x = v!(s).clone();
-                        tri!(self.set_prop(&recv, site, x));
+                        // Inline cache hit: the shape already has the slot.
+                        let x = if let Value::Obj(ob) = &v!(o) {
+                            let mut inner = ob.inner.borrow_mut();
+                            match &*site.cache.entry.borrow() {
+                                Some((sh, slot)) if Rc::ptr_eq(sh, &inner.shape) => {
+                                    inner.vals[*slot as usize] = x;
+                                    None
+                                }
+                                _ => Some(x),
+                            }
+                        } else {
+                            Some(x)
+                        };
+                        if let Some(x) = x {
+                            let recv = v!(o).clone();
+                            tri!(self.set_prop(&recv, site, x));
+                        }
                     }
                     I::NewInst { d, class } => {
                         let c = self.prog.classes[class as usize].clone();

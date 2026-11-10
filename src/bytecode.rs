@@ -70,6 +70,10 @@ pub enum I {
     DynAdd { d: R, a: R, b: R },
     DynNum { op: NumOp, d: R, a: R, b: R },
     DynCmp { op: CmpOp, d: R, a: R, b: R },
+    /// Dynamic arithmetic producing a boxed number (`any * any` stored as a value).
+    DynNumV { op: NumOp, d: R, a: R, b: R },
+    /// `d = ToNumber(s) + k` as a boxed number (`i++` on an `any` local).
+    IncV { d: R, s: R, k: f64 },
     TypeOf { d: R, s: R },
     In { d: R, k: R, o: R },
     InstanceOf { d: R, o: R, class: u32 },
@@ -164,6 +168,8 @@ pub struct PropSite {
     pub name: Rc<str>,
     pub key: Value,
     pub cache: PropCache,
+    /// The name is `length` (arrays answer it without a lookup).
+    pub is_length: bool,
 }
 
 #[derive(Debug, Default)]

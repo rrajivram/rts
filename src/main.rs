@@ -8,15 +8,17 @@ use rts::vm::Vm;
 
 fn main() -> ExitCode {
     let mut dump = false;
+    let mut erase = false;
     let mut path = None;
     for a in std::env::args().skip(1) {
         match a.as_str() {
             "--dump" => dump = true,
+            "--no-types" => erase = true,
             _ => path = Some(a),
         }
     }
     let Some(path) = path else {
-        eprintln!("usage: rts [--dump] <file.ts>");
+        eprintln!("usage: rts [--dump] [--no-types] <file.ts>");
         return ExitCode::from(2);
     };
     let src = match std::fs::read_to_string(&path) {
@@ -26,7 +28,7 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    let prog = match rts::compile(&src) {
+    let prog = match rts::compile_with(&src, erase) {
         Ok(p) => p,
         Err((e, in_prelude)) => {
             if in_prelude {

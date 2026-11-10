@@ -339,6 +339,17 @@ pub enum Value {
 const _: () = assert!(std::mem::size_of::<Value>() == 16);
 
 impl Value {
+    /// Drop a register's heap reference, if it holds one. Registers holding
+    /// primitives keep their stale contents: nothing to free, nothing to do.
+    #[inline(always)]
+    pub fn release(&mut self) {
+        if !matches!(self, Value::Undef | Value::Null | Value::Bool(_) | Value::Num(_) | Value::Native(_)) {
+            *self = Value::Undef;
+        }
+    }
+}
+
+impl Value {
     pub fn str(s: impl Into<Box<str>>) -> Value {
         Value::Str(JsStr::new(s))
     }
@@ -814,4 +825,7 @@ fn is_error_class(c: &ClassRt) -> bool {
 #[derive(Debug, Default)]
 pub struct PropCache {
     pub entry: RefCell<Option<(Rc<Shape>, u32)>>,
+    /// Method-call sites: (receiver shape, receiver class) → function index,
+    /// for a name that resolves to a class method rather than an own field.
+    pub method: RefCell<Option<(Rc<Shape>, Rc<ClassRt>, u32)>>,
 }

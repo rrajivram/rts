@@ -221,6 +221,9 @@ pub struct Checker {
     pub static_inits: Vec<(ClassId, VarId, ast::Expr)>,
     /// Narrowings inherited by the next function checked (closures see const narrowings).
     pub pending_narrow: Option<Narrow>,
+    /// Experiment switch (`--no-types`): every variable, parameter, return value
+    /// and field is treated as `any`, so the program runs on dynamic paths only.
+    pub erase: bool,
 }
 
 impl TypeNames for Checker {
@@ -243,7 +246,7 @@ pub fn err<T>(msg: impl Into<String>, span: Span) -> CResult<T> {
 }
 
 /// Check a whole program (prelude statements first).
-pub fn check_program(prelude: &[ast::Stmt], program: &[ast::Stmt]) -> CResult<HProgram> {
+pub fn check_program(prelude: &[ast::Stmt], program: &[ast::Stmt], erase: bool) -> CResult<HProgram> {
     let module = Scope::new(None, None);
     let mut c = Checker {
         vars: Vec::new(),
@@ -267,6 +270,7 @@ pub fn check_program(prelude: &[ast::Stmt], program: &[ast::Stmt]) -> CResult<HP
         param_stmts: Vec::new(),
         static_inits: Vec::new(),
         pending_narrow: None,
+        erase,
     };
     c.tp_u = c.new_tparam("U", None);
     c.tp_t = c.new_tparam("T", None);
@@ -354,6 +358,7 @@ impl Checker {
 
     pub fn new_var(&mut self, name: Name, ty: Option<Type>, is_const: bool, scope: &Rc<Scope>) -> VarId {
         let id = self.vars.len() as VarId;
+        let ty = if self.erase { Some(Type::Any) } else { ty };
         self.var_pending.push(ty.is_none());
         self.var_const.push(is_const);
         self.var_outside_main.push(false);
@@ -1137,6 +1142,9 @@ impl Checker {
             if p.optional && p.default.is_none() {
                 ty = Type::union([ty, Type::Undefined]);
             }
+            if self.erase {
+                ty = if p.rest { Type::array(Type::Any) } else { Type::Any };
+            }
             out.push(FParam {
                 name: pat_name(&p.pat),
                 ty,
@@ -1180,6 +1188,10 @@ impl Checker {
         if fd.kind == FnKind::Ctor {
             self.funcs[f as usize].ret = Some(Type::Void);
             return Ok(Type::Void);
+        }
+        if self.erase {
+            self.funcs[f as usize].ret = Some(Type::Any);
+            return Ok(Type::Any);
         }
         if let Some(a) = fd.ast.clone()
             && let Some(rt) = &a.ret
@@ -1582,7 +1594,7 @@ impl Checker {
                             if !fields.iter().any(|fd| fd.name == *n) {
                                 fields.push(FieldDef {
                                     name: n.clone(),
-                                    ty: Some(t),
+                                    ty: Some(if self.erase { Type::Any } else { t }),
                                     ty_expr: p.ty.clone(),
                                     init: None,
                                     optional: p.optional,
@@ -1657,7 +1669,7 @@ impl Checker {
                         };
                         let fd = FieldDef {
                             name: name.clone(),
-                            ty: Some(t),
+                            ty: Some(if self.erase { Type::Any } else { t }),
                             ty_expr: ty.clone(),
                             init: init.clone(),
                             optional: *optional,
@@ -1770,7 +1782,7 @@ impl Checker {
                                 if !fields.iter().any(|fd| fd.name == *n) {
                                     fields.push(FieldDef {
                                         name: n.clone(),
-                                        ty: Some(t),
+                                        ty: Some(if self.erase { Type::Any } else { t }),
                                         ty_expr: p.ty.clone(),
                                         init: None,
                                         optional: p.optional,

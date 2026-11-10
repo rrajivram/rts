@@ -11,8 +11,10 @@ packages.
 cargo build --release
 ./target/release/rts program.ts           # run
 ./target/release/rts --dump program.ts    # show the typed bytecode
+./target/release/rts --no-types program.ts  # ignore all type information (experiment)
 tests/run.sh                              # conformance tests (compared against Node)
 bench/run.py                              # benchmarks vs node, node --jitless, rjs
+bench/types.py                            # typed vs --no-types on the same engine
 ```
 
 ## How it works
@@ -85,6 +87,72 @@ rows shows what type annotations are worth: about 2× on the same program.
 
 **Memory (alloc_churn, peak RSS):** rts **3.3 MB** vs Node **54 MB**
 (jitless: 48 MB). Without a collector, garbage never accumulates.
+
+## Do types actually help? A controlled experiment
+
+`rts --no-types` compiles the same source with every variable, parameter, return
+value, field and `this` treated as `any`. Everything else stays the same: the
+engine, the bytecode format, inline caches, element-kind arrays and the output
+(checked byte for byte). The only thing removed is what the compiler knows
+about types, so any difference comes from type knowledge.
+
+To keep the untyped side from being a strawman, it has the standard tricks of a
+good dynamic interpreter:
+
+- shape-based inline caches for property reads, writes and method calls
+- number-first array storage that degrades on the first non-number (V8's "elements kinds")
+- pre-boxed constants
+- integer fast paths for dynamic arithmetic
+- allocation-free callbacks from built-ins
+
+V8's interpreter (`node --jitless`) is shown for reference.
+
+`bench/types.py` (median of 7 runs, Apple Silicon):
+
+| program | typed | untyped | **types buy** | node --jitless |
+|---|---:|---:|---:|---:|
+| array_sum | 60.6 ms | 191.8 ms | **3.2×** | 187.6 ms |
+| complex | 8.3 ms | 26.1 ms | **3.1×** | 58.4 ms |
+| closures (map/filter/reduce) | 135.5 ms | 396.0 ms | **2.9×** | 184.4 ms |
+| nbody | 225.6 ms | 566.8 ms | **2.5×** | 462.6 ms |
+| strings | 43.5 ms | 102.7 ms | **2.4×** | 110.0 ms |
+| fib | 59.0 ms | 116.8 ms | **2.0×** | 85.0 ms |
+| loop | 91.2 ms | 177.5 ms | **1.9×** | 129.2 ms |
+| complex_untyped (only inferred types) | 15.0 ms | 26.0 ms | **1.7×** | 59.0 ms |
+| alloc_churn | 311.3 ms | 497.6 ms | **1.6×** | 359.5 ms |
+
+Types make every program faster, by 1.6× to 3.2×. The untyped engine is a
+fair baseline: it is in the same range as V8's interpreter, faster on two
+programs and up to about 2× slower on the rest. The typed engine beats V8's
+interpreter on all of them.
+
+Where the speedup comes from, using `fib` as the example (`rts --dump` vs `rts --no-types --dump`):
+
+```
+typed (10 instructions)                    untyped (16 instructions)
+JCmpN  Lt  n, 2  → else                    LoadK   t, 2
+MovS   r, n                                DynCmp  Lt  c, n, t      ; tag checks on both sides
+Jmp    ret                                 JmpF    c → else
+AddNK  a, n, -1                            MovV    r, n             ; refcount-aware move
+Call   fib(a)        ; args copied raw     Jmp     ret
+AddNK  b, n, -2                            LoadK   t, 1
+Call   fib(b)                              DynNum  Sub  x, n, t
+AddN   r, ra, rb     ; raw f64 add         BoxN    a, x
+MovS / RetN                                Call    fib(a)           ; args boxed
+                                           …       (same for n - 2)
+                                           DynAdd  r, ra, rb        ; tag dispatch: number? string?
+                                           MovV / RetV
+```
+
+With types known, numbers stay in untagged registers: no tag checks, no boxing,
+no refcount-aware moves. The compiler can also do things that are impossible
+without types:
+
+- fuse a compare with its branch
+- turn `obj.x` into a fixed slot read instead of a cache check
+- compile `xs.map(x => x * 2)` into an inline loop instead of a callback per element
+
+The last one is the 2.9× on `closures`.
 
 ## Supported TypeScript (POC subset)
 

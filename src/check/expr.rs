@@ -210,6 +210,7 @@ impl Checker {
                 self.note_var_use(v);
                 let key = format!("{v}");
                 let ty = self.ctx().narrow.get(&key).cloned().unwrap_or(t);
+                let ty = if self.erase { Type::Any } else { ty };
                 Ok(HExpr::read(Place::Var(v), ty))
             }
             None => Ok(HExpr::undefined()),

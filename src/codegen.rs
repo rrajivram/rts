@@ -333,6 +333,7 @@ impl FnGen<'_, '_> {
             name: name.clone(),
             key: Value::str(&**name),
             cache: PropCache::default(),
+            is_length: &**name == "length",
         });
         self.props.len() as u32 - 1
     }
@@ -1057,6 +1058,14 @@ impl FnGen<'_, '_> {
                         a: r,
                         k: if *inc { 1.0 } else { -1.0 },
                     });
+                } else if let Place::Var(v) = &**place
+                    && let Home::V(r) = self.home(*v)
+                {
+                    self.emit(I::IncV {
+                        d: r,
+                        s: r,
+                        k: if *inc { 1.0 } else { -1.0 },
+                    });
                 } else {
                     self.update(place, *inc, true);
                 }
@@ -1147,16 +1156,43 @@ impl FnGen<'_, '_> {
             && !matches!(op, HBin::DynNum(_))
         {
             let m = self.mark();
-            let x = self.expr(a);
-            let y = self.expr(b);
+            let x = self.operand(*op, a);
+            let y = self.operand(*op, b);
             self.binop_into(*op, x, y, Some(d.r));
             self.reset(m);
             return;
         }
         let m = self.mark();
+        // Dynamic arithmetic stored as a value: produce the boxed result directly.
+        if d.k == Kind::Val
+            && let HK::Cast(x) = &e.kind
+            && let HK::Binary(op @ HBin::DynNum(nop), a, b) = &x.kind
+        {
+            let xa = self.operand(*op, a);
+            let xb = self.operand(*op, b);
+            if xa.k == Kind::Val || xb.k == Kind::Val {
+                let xa = self.coerce(xa, Kind::Val);
+                let xb = self.coerce(xb, Kind::Val);
+                self.emit(I::DynNumV { op: *nop, d: d.r, a: xa.r, b: xb.r });
+            } else {
+                let t = self.alloc_s();
+                self.num_op(*nop, t, xa.r, xb.r);
+                self.emit(I::BoxN { d: d.r, s: t });
+            }
+            self.reset(m);
+            return;
+        }
         let o = self.expr(e);
-        let o = self.coerce(o, d.k);
-        self.mov(d, o);
+        // Box/unbox straight into the destination instead of via a temporary.
+        match (o.k, d.k) {
+            (Kind::Num, Kind::Val) => self.emit(I::BoxN { d: d.r, s: o.r }),
+            (Kind::Bool, Kind::Val) => self.emit(I::BoxB { d: d.r, s: o.r }),
+            _ => {
+                let o = self.coerce(o, d.k);
+                self.mov(d, o);
+                0
+            }
+        };
         self.reset(m);
     }
 
@@ -1237,13 +1273,25 @@ impl FnGen<'_, '_> {
                 Op { k: Kind::Val, r: d }
             }
             HK::Array(elems) => {
-                let num = matches!(&e.ty, Type::Array(t) if t.kind() == Kind::Num);
+                // Unknown element type: start with number storage, like V8's
+                // elements kinds; the first non-number write degrades it.
+                let num = match &e.ty {
+                    Type::Array(t) if t.kind() == Kind::Num => true,
+                    Type::Array(t) if matches!(**t, Type::Any | Type::Unknown) => {
+                        elems.iter().all(|x| matches!(x, HElem::Expr(x) if x.ty.kind() == Kind::Num || matches!(x.kind, HK::Cast(ref y) if y.ty.kind() == Kind::Num)))
+                    }
+                    _ => false,
+                };
                 let d = self.alloc_v();
                 self.emit(I::NewArr { d, num });
                 for el in elems {
                     let m = self.mark();
                     match el {
                         HElem::Expr(x) => {
+                            let x = match &x.kind {
+                                HK::Cast(y) if num && y.ty.kind() == Kind::Num => y,
+                                _ => x,
+                            };
                             let o = self.expr(x);
                             if num {
                                 let o = self.coerce(o, Kind::Num);
@@ -1497,6 +1545,23 @@ impl FnGen<'_, '_> {
                 self.emit(I::InstanceOf { d, o: o.r, class: *c });
                 Op { k: Kind::Bool, r: d }
             }
+            HK::Cast(x) if k == Kind::Val && matches!(x.kind, HK::Num(_) | HK::Bool(_)) => {
+                // A literal used as a value: load a pre-boxed constant.
+                let v = match x.kind {
+                    HK::Num(n) => Value::Num(n),
+                    HK::Bool(b) => Value::Bool(b),
+                    _ => unreachable!(),
+                };
+                let kk = self.konst(v);
+                let d = self.alloc_v();
+                self.emit(I::LoadK { d, k: kk });
+                Op { k, r: d }
+            }
+            HK::Cast(x) if k == Kind::Val && matches!(x.kind, HK::Binary(HBin::DynNum(_), _, _)) => {
+                let d = self.alloc_v();
+                self.expr_into(e, Op { k, r: d });
+                Op { k, r: d }
+            }
             HK::Cast(x) => self.expr(x),
             HK::OptChain(x) => {
                 let d = self.alloc(k);
@@ -1659,9 +1724,36 @@ impl FnGen<'_, '_> {
             });
             return Op { k: Kind::Num, r: d };
         }
-        let x = self.expr(a);
-        let y = self.expr(b);
+        let x = self.operand(op, a);
+        let y = self.operand(op, b);
         self.binop_regs(op, x, y)
+    }
+
+    /// Evaluate a binary operand. Literals feeding a dynamic operator are
+    /// loaded as pre-boxed constants instead of loaded and then boxed.
+    fn operand(&mut self, op: HBin, e: &HExpr) -> Op {
+        let dynamic = matches!(op, HBin::DynAdd | HBin::DynNum(_) | HBin::DynCmp(_) | HBin::StrictEq(_) | HBin::LooseEq(_));
+        if dynamic && let HK::Num(n) = e.kind {
+            let kk = self.konst(Value::Num(n));
+            let d = self.alloc_v();
+            self.emit(I::LoadK { d, k: kk });
+            return Op { k: Kind::Val, r: d };
+        }
+        if dynamic && let HK::Binary(HBin::DynNum(nop), a, b) = &e.kind {
+            let xa = self.operand(HBin::DynNum(*nop), a);
+            let xb = self.operand(HBin::DynNum(*nop), b);
+            if xa.k == Kind::Val || xb.k == Kind::Val {
+                let xa = self.coerce(xa, Kind::Val);
+                let xb = self.coerce(xb, Kind::Val);
+                let d = self.alloc_v();
+                self.emit(I::DynNumV { op: *nop, d, a: xa.r, b: xb.r });
+                return Op { k: Kind::Val, r: d };
+            }
+            let d = self.alloc_s();
+            self.num_op(*nop, d, xa.r, xb.r);
+            return Op { k: Kind::Num, r: d };
+        }
+        self.expr(e)
     }
 
     fn binop_regs(&mut self, op: HBin, x: Op, y: Op) -> Op {

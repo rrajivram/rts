@@ -21,9 +21,15 @@ pub const PRELUDE: &str = include_str!("prelude.ts");
 
 /// Compile TypeScript source to a bytecode program.
 pub fn compile(src: &str) -> Result<bytecode::Program, (CompileError, bool)> {
+    compile_with(src, false)
+}
+
+/// `erase_types`: ignore all static type knowledge (every binding is `any`).
+/// Used to measure what types are worth on the same engine.
+pub fn compile_with(src: &str, erase_types: bool) -> Result<bytecode::Program, (CompileError, bool)> {
     let prelude = parser::parse_program(lexer::tokenize(PRELUDE).map_err(|e| (e, true))?).map_err(|e| (e, true))?;
     let toks = lexer::tokenize(src).map_err(|e| (e, false))?;
     let program = parser::parse_program(toks).map_err(|e| (e, false))?;
-    let hir = check::check_program(&prelude, &program).map_err(|e| (e, false))?;
+    let hir = check::check_program(&prelude, &program, erase_types).map_err(|e| (e, false))?;
     Ok(codegen::compile(&hir))
 }
