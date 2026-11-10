@@ -1,0 +1,11 @@
+box 3 undefined
+{ name: 'box', items: [ 1, 2, 3 ], extra: 42 }
+3 a1 12
+10
+a 1
+b 2
+number string object object undefined function
+TEXT
+[ 2, 'two!', 6 ]
+undefined none
+undefined

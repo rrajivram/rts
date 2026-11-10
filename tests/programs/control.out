@@ -1,0 +1,22 @@
+[ 'fizz', 'other4', 'other5' ]
+0 0
+1 0
+1 1
+2 0
+2 1
+2 2
+8
+ok 1
+finally 1
+caught too big: 5 RangeError
+finally 5
+cleanup ran
+from try
+email invalid email ValidationError: invalid email
+TypeError? true
+0 5 6 UP
+green not green
+4215
+[ 'a', 'b', 'c' ]
+3 3 15 4 -6 16 -4 15
+2 2
