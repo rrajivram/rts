@@ -111,18 +111,18 @@ function types, object type literals, interfaces (including `extends`), type
 aliases, unions with narrowing, classes, numeric enums, and generic functions
 and classes (erased).
 
-**Statements:** `let`/`const`/`var`, `if`, `while`, `do`, `for`, `for-of`,
+**Statements:** `let`/`const`/`var`, `if`, `while`, `do`, `for`, `for-of`, `for-in`,
 `break`/`continue` (with labels), `switch`, `return`, `throw`/`try`/`catch`,
 functions, classes (fields, constructors, methods, `extends`, `super`, parameter
 properties, static methods), `interface`, `type`, `enum`.
 
 **Expressions:** the usual operators, template literals, optional chaining `?.`,
-`??`, arrows and closures, `new`, object and array literals, spread in array
-literals, `as`, `!`, `typeof`, and `instanceof`.
+`??`, arrows and closures, `new`, object and array literals, spread, destructuring,
+getters and setters, `as`, `!`, `typeof`, and `instanceof`.
 
 **Narrowing:** `typeof x === "…"`, `x === null` / `undefined`, truthiness,
 `instanceof`, and discriminant property checks. Narrowing applies in branches
 and after an `if` whose branch always exits.
 
-**Not yet supported:** async/await, generators, modules, getters and setters,
-decorators, `Map`/`Set`, regular expressions, `for-in`, and destructuring.
+**Not yet supported:** async/await, generators, modules, decorators, regular
+expressions, symbols and user-defined iterators. See README "Next steps".
