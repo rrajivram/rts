@@ -22,16 +22,29 @@ enum Ret {
     Native,
 }
 
+/// A function of the running program. The program (held by the VM in an
+/// `Rc`) outlives every frame, so frames borrow functions without refcounting.
+#[derive(Debug, Clone, Copy)]
+struct FnRef(*const FuncCode);
+
+impl FnRef {
+    fn new(f: &Rc<FuncCode>) -> FnRef {
+        FnRef(Rc::as_ptr(f))
+    }
+    #[inline(always)]
+    fn get<'a>(self) -> &'a FuncCode {
+        unsafe { &*self.0 }
+    }
+}
+
 #[derive(Debug)]
 struct Frame {
-    func: Rc<FuncCode>,
+    func: FnRef,
     pc: usize,
     sb: usize,
     vb: usize,
     closure: Option<Rc<Closure>>,
     ret: Ret,
-    /// (catch pc, exception register)
-    handlers: Vec<(u32, R)>,
 }
 
 pub struct Vm {
@@ -41,6 +54,8 @@ pub struct Vm {
     gs: Vec<u64>,
     gv: Vec<Value>,
     frames: Vec<Frame>,
+    /// Active try handlers: (frame index, catch pc, exception register).
+    handlers: Vec<(usize, u32, R)>,
     out: std::io::BufWriter<std::io::Stdout>,
     pub start: Instant,
     native_ret: Value,
@@ -70,6 +85,20 @@ fn num_op(op: NumOp, x: f64, y: f64) -> f64 {
         NumOp::Shr => (to_int32(x) >> (to_int32(y) as u32 & 31)) as f64,
         NumOp::UShr => ((to_int32(x) as u32) >> (to_int32(y) as u32 & 31)) as f64,
     }
+}
+
+/// `%` with an integer fast path (fmod is slow); same results as JS, including -0.
+#[inline(always)]
+fn fast_mod(x: f64, y: f64) -> f64 {
+    let (xi, yi) = (x as i64, y as i64);
+    if xi as f64 == x && yi as f64 == y && yi != 0 && xi != i64::MIN {
+        let r = xi % yi;
+        if r == 0 && x < 0.0 {
+            return -0.0;
+        }
+        return r as f64;
+    }
+    x % y
 }
 
 #[inline(always)]
@@ -121,6 +150,7 @@ impl Vm {
             gs: vec![0; prog.n_gs],
             gv: vec![Value::Undef; prog.n_gv],
             frames: Vec::new(),
+            handlers: Vec::new(),
             out: std::io::BufWriter::with_capacity(1 << 16, std::io::stdout()),
             start: Instant::now(),
             native_ret: Value::Undef,
@@ -174,13 +204,12 @@ impl Vm {
         let main = self.prog.funcs[self.prog.main as usize].clone();
         self.ensure(0, 0, &main);
         self.frames.push(Frame {
-            func: main,
+            func: FnRef::new(&main),
             pc: 0,
             sb: 0,
             vb: 0,
             closure: None,
             ret: Ret::Discard,
-            handlers: Vec::new(),
         });
         let r = self.run(0);
         self.flush();
@@ -198,7 +227,7 @@ impl Vm {
             return Err(self.range_error("Maximum call stack size exceeded".into()));
         }
         let (sb, vb) = match self.frames.last() {
-            Some(top) => (top.sb + top.func.ns, top.vb + top.func.nv),
+            Some(top) => (top.sb + top.func.get().ns, top.vb + top.func.get().nv),
             None => (0, 0),
         };
         self.ensure(sb, vb, &func);
@@ -206,13 +235,12 @@ impl Vm {
         self.bind_values(&func, sb, vb, args)?;
         let depth = self.frames.len();
         self.frames.push(Frame {
-            func,
+            func: FnRef::new(&func),
             pc: 0,
             sb,
             vb,
             closure,
             ret: Ret::Native,
-            handlers: Vec::new(),
         });
         self.run(depth)?;
         Ok(std::mem::take(&mut self.native_ret))
@@ -288,7 +316,7 @@ impl Vm {
     // ───────────── calls ─────────────
 
     /// Perform a call. Returns Ok(true) if a JS frame was pushed.
-    fn do_call(&mut self, caller: &Rc<FuncCode>, ci: &CallInfo, sb: usize, vb: usize) -> Result<bool, Value> {
+    fn do_call(&mut self, caller: &FuncCode, ci: &CallInfo, sb: usize, vb: usize) -> Result<bool, Value> {
         let this = ci.this.map(|r| self.v[vb + r as usize].clone());
         let (func, closure) = match &ci.target {
             CallTarget::Direct(fi) => (self.prog.funcs[*fi as usize].clone(), None),
@@ -336,12 +364,11 @@ impl Vm {
         if self.frames.len() >= MAX_DEPTH {
             return Err(self.range_error("Maximum call stack size exceeded".into()));
         }
-        let top = self.frames.last().unwrap();
-        let nsb = sb + top.func.ns;
-        let nvb = vb + top.func.nv;
+        let nsb = sb + caller.ns;
+        let nvb = vb + caller.nv;
         self.ensure(nsb, nvb, &func);
         self.v[nvb] = this.unwrap_or(Value::Undef);
-        if ci.spread.iter().any(|x| *x) || (func.rest && !ci.packed_rest) {
+        if ci.has_spread || (func.rest && !ci.packed_rest) {
             let args = self.collect_args(ci, sb, vb)?;
             self.bind_values(&func, nsb, nvb, args)?;
         } else {
@@ -378,7 +405,7 @@ impl Vm {
             }
         }
         self.frames.push(Frame {
-            func,
+            func: FnRef::new(&func),
             pc: 0,
             sb: nsb,
             vb: nvb,
@@ -387,7 +414,6 @@ impl Vm {
                 Some((k, r)) => Ret::Reg(k, r),
                 None => Ret::Discard,
             },
-            handlers: Vec::new(),
         });
         Ok(true)
     }
@@ -518,7 +544,7 @@ impl Vm {
     fn do_return(&mut self, val: Value, stop: usize) -> Result<bool, Value> {
         let fr = self.frames.pop().unwrap();
         // Release the frame's references now: deterministic destruction.
-        for x in &mut self.v[fr.vb..fr.vb + fr.func.nv] {
+        for x in &mut self.v[fr.vb..fr.vb + fr.func.get().nv] {
             *x = Value::Undef;
         }
         match fr.ret {
@@ -541,7 +567,7 @@ impl Vm {
             && rk == k
         {
             let fr = self.frames.pop().unwrap();
-            for x in &mut self.v[fr.vb..fr.vb + fr.func.nv] {
+            for x in &mut self.v[fr.vb..fr.vb + fr.func.get().nv] {
                 *x = Value::Undef;
             }
             let top = self.frames.last().unwrap();
@@ -553,15 +579,19 @@ impl Vm {
 
     fn unwind(&mut self, err: Value, stop: usize) -> Result<(), Value> {
         loop {
-            let fr = self.frames.last_mut().unwrap();
-            if let Some((catch, exc)) = fr.handlers.pop() {
+            let top = self.frames.len() - 1;
+            if let Some(&(fidx, catch, exc)) = self.handlers.last()
+                && fidx == top
+            {
+                self.handlers.pop();
+                let fr = &mut self.frames[top];
                 fr.pc = catch as usize;
                 let vb = fr.vb;
                 self.v[vb + exc as usize] = err;
                 return Ok(());
             }
             let fr = self.frames.pop().unwrap();
-            for x in &mut self.v[fr.vb..fr.vb + fr.func.nv] {
+            for x in &mut self.v[fr.vb..fr.vb + fr.func.get().nv] {
                 *x = Value::Undef;
             }
             if self.frames.len() <= stop {
@@ -575,27 +605,40 @@ impl Vm {
     fn run(&mut self, stop: usize) -> Result<(), Value> {
         'outer: loop {
             let fi = self.frames.len() - 1;
-            let func = self.frames[fi].func.clone();
+            let func: &FuncCode = self.frames[fi].func.get();
             let code = &func.code[..];
             let mut pc = self.frames[fi].pc;
             let sb = self.frames[fi].sb;
             let vb = self.frames[fi].vb;
 
+            // Register access is unchecked: codegen guarantees every register
+            // index is below the function's ns/nv, and `ensure` sized the
+            // stacks before the frame was pushed. The base pointers are
+            // refreshed after anything that can grow the stacks (calls).
+            let mut sp: *mut u64 = unsafe { self.s.as_mut_ptr().add(sb) };
+            let mut vp: *mut Value = unsafe { self.v.as_mut_ptr().add(vb) };
             macro_rules! s {
                 ($r:expr) => {
-                    self.s[sb + $r as usize]
+                    *unsafe { &mut *sp.add($r as usize) }
                 };
             }
             macro_rules! v {
                 ($r:expr) => {
-                    self.v[vb + $r as usize]
+                    *unsafe { &mut *vp.add($r as usize) }
                 };
             }
             macro_rules! n {
                 ($r:expr) => {
-                    f(self.s[sb + $r as usize])
+                    f(unsafe { *sp.add($r as usize) })
                 };
             }
+            macro_rules! refresh {
+                () => {
+                    sp = unsafe { self.s.as_mut_ptr().add(sb) };
+                    vp = unsafe { self.v.as_mut_ptr().add(vb) };
+                };
+            }
+            debug_assert!(sb + func.ns <= self.s.len() && vb + func.nv <= self.v.len());
             macro_rules! tri {
                 ($e:expr) => {
                     match $e {
@@ -606,7 +649,9 @@ impl Vm {
             }
 
             let err: Value = loop {
-                let ins = code[pc];
+                debug_assert!(pc < code.len());
+                // Every function ends in a return, so pc never runs off the end.
+                let ins = unsafe { *code.get_unchecked(pc) };
                 pc += 1;
                 match ins {
                     I::LoadN { d, v } => s!(d) = b(v),
@@ -616,6 +661,7 @@ impl Vm {
                     I::SubN { d, a, b: bb } => s!(d) = b(n!(a) - n!(bb)),
                     I::MulN { d, a, b: bb } => s!(d) = b(n!(a) * n!(bb)),
                     I::DivN { d, a, b: bb } => s!(d) = b(n!(a) / n!(bb)),
+                    I::ModN { d, a, b: bb } => s!(d) = b(fast_mod(n!(a), n!(bb))),
                     I::AddNK { d, a, k } => s!(d) = b(n!(a) + k),
                     I::NumOp { op, d, a, b: bb } => s!(d) = b(num_op(op, n!(a), n!(bb))),
                     I::LtN { d, a, b: bb } => s!(d) = (n!(a) < n!(bb)) as u64,
@@ -833,7 +879,9 @@ impl Vm {
                     }
                     I::Call { ci } => {
                         self.frames[fi].pc = pc;
-                        match self.do_call(&func, &func.calls[ci as usize], sb, vb) {
+                        let r = self.do_call(func, &func.calls[ci as usize], sb, vb);
+                        refresh!();
+                        match r {
                             Ok(true) => continue 'outer,
                             Ok(false) => {}
                             Err(e) => break e,
@@ -1196,14 +1244,16 @@ impl Vm {
                     I::LoadClass { d, class } => v!(d) = Value::Class(self.prog.classes[class as usize].clone()),
 
                     I::Throw { s } => break v!(s).clone(),
-                    I::TryBegin { catch, exc } => self.frames[fi].handlers.push((catch, exc)),
+                    I::TryBegin { catch, exc } => self.handlers.push((fi, catch, exc)),
                     I::TryEnd => {
-                        self.frames[fi].handlers.pop();
+                        self.handlers.pop();
                     }
                 }
             };
-            // An exception was raised in this frame.
-            self.frames[fi].pc = pc;
+            // An exception was raised in this frame (or, if it already returned, in its caller).
+            if fi < self.frames.len() {
+                self.frames[fi].pc = pc;
+            }
             self.unwind(err, stop)?;
         }
     }

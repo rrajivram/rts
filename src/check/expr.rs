@@ -161,6 +161,9 @@ impl Checker {
                 if self.var_pending[v as usize] {
                     return err(format!("variable '{n}' is used before its declaration"), span);
                 }
+                if let Some(c) = &self.var_const_val[v as usize] {
+                    return Ok(c.clone());
+                }
                 self.note_var_use(v);
                 let key = format!("{v}");
                 let ty = match self.ctx().narrow.get(&key) {

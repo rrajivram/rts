@@ -137,7 +137,8 @@ impl<'a> Codegen<'a> {
     }
 
     fn func(&mut self, fid: FuncId) -> FuncCode {
-        let hf = &self.hir.funcs[fid as usize];
+        let hir: &'a HProgram = self.hir;
+        let hf = &hir.funcs[fid as usize];
         let mut g = FnGen {
             cg: self,
             fid,
@@ -155,6 +156,8 @@ impl<'a> Codegen<'a> {
             loops: Vec::new(),
             tries: Vec::new(),
             opt_exits: Vec::new(),
+            num_regs: HashMap::new(),
+            inline: Vec::new(),
         };
         // Arrival registers: V0 = this, then params in order per file.
         let mut arrivals = Vec::new();
@@ -164,6 +167,25 @@ impl<'a> Codegen<'a> {
                 _ => g.alloc_s(),
             };
             arrivals.push(r);
+        }
+        // Constant registers: every distinct numeric literal is loaded once.
+        let mut nums = Vec::new();
+        for p in &hf.params {
+            if let Some(d) = &p.default {
+                collect_nums_expr(d, &mut nums, hir);
+            }
+        }
+        for st in &hf.body {
+            collect_loop_nums(st, &mut nums, hir);
+        }
+        for v in nums.into_iter().take(128) {
+            let bits = v.to_bits();
+            if g.num_regs.contains_key(&bits) {
+                continue;
+            }
+            let r = g.alloc_s();
+            g.emit(I::LoadN { d: r, v });
+            g.num_regs.insert(bits, r);
         }
         for (i, v) in hf.free.iter().enumerate() {
             g.homes.insert(*v, Home::Up(i as u16));
@@ -188,6 +210,7 @@ impl<'a> Codegen<'a> {
             g.stmt(st);
         }
         g.emit(I::RetUndef);
+        peephole(&mut g.code);
         let name = hf.name.clone();
         FuncCode {
             name,
@@ -222,6 +245,18 @@ struct FnGen<'c, 'a> {
     loops: Vec<LoopCtx>,
     tries: Vec<TryCtx>,
     opt_exits: Vec<Vec<usize>>,
+    /// Numeric literals preloaded into dedicated registers (f64 bits → register).
+    num_regs: HashMap<u64, R>,
+    /// Functions currently being inlined (innermost last).
+    inline: Vec<InlineCtx>,
+}
+
+struct InlineCtx {
+    /// Where `return` stores its value (None: discard).
+    out: Option<Op>,
+    exits: Vec<usize>,
+    try_depth: usize,
+    loop_depth: usize,
 }
 
 impl FnGen<'_, '_> {
@@ -568,17 +603,9 @@ impl FnGen<'_, '_> {
                     continues: vec![],
                     try_depth: self.tries.len(),
                 });
-                let first = if *test_after { Some(self.jump_placeholder()) } else { None };
+                // Rotated loop: test at the bottom, one branch per iteration.
+                let to_test = if *test_after || test.is_none() { None } else { Some(self.jump_placeholder()) };
                 let top = self.here();
-                let mut exits = Vec::new();
-                if let Some(t) = test {
-                    let mm = self.mark();
-                    exits = self.cond_jump(t, false);
-                    self.reset(mm);
-                }
-                if let Some(f) = first {
-                    self.patch_here(f);
-                }
                 self.block(body);
                 let cont = self.here();
                 // Fresh per-iteration bindings for captured loop variables.
@@ -596,13 +623,25 @@ impl FnGen<'_, '_> {
                     self.expr_discard(u);
                     self.reset(mm);
                 }
-                self.emit(I::Jmp { t: top });
+                if let Some(j) = to_test {
+                    self.patch_here(j);
+                }
+                match test {
+                    Some(t) => {
+                        let mm = self.mark();
+                        let back = self.cond_jump(t, true);
+                        self.reset(mm);
+                        for j in back {
+                            self.patch(j, top);
+                        }
+                    }
+                    None => {
+                        self.emit(I::Jmp { t: top });
+                    }
+                }
                 let ctx = self.loops.pop().unwrap();
                 for c in ctx.continues {
                     self.patch(c, cont);
-                }
-                for e in exits {
-                    self.patch_here(e);
                 }
                 for b in ctx.breaks {
                     self.patch_here(b);
@@ -699,6 +738,22 @@ impl FnGen<'_, '_> {
                 self.exit_tries(depth);
                 let j = self.jump_placeholder();
                 self.loops[i].continues.push(j);
+            }
+            HStmt::Return(v) if !self.inline.is_empty() => {
+                let out = self.inline.last().unwrap().out;
+                if let Some(e) = v {
+                    match out {
+                        Some(o) => self.expr_into(e, o),
+                        None => self.expr_discard(e),
+                    }
+                } else if let Some(o) = out {
+                    self.load_default(o);
+                }
+                let depth = self.inline.last().unwrap().try_depth;
+                self.exit_tries(depth);
+                let j = self.jump_placeholder();
+                self.inline.last_mut().unwrap().exits.push(j);
+                self.reset(m);
             }
             HStmt::Return(v) => {
                 let rk = self.cg.hir.funcs[self.fid as usize].ret_kind;
@@ -1016,7 +1071,9 @@ impl FnGen<'_, '_> {
                     let k = self.var_info(*v).kind();
                     self.expr_into(value, Op { k, r });
                 } else {
-                    self.expr(e);
+                    let pr = self.eval_place(place);
+                    let v = self.expr(value);
+                    self.store_place(&pr, v);
                 }
             }
             HK::Seq(es) => {
@@ -1055,6 +1112,46 @@ impl FnGen<'_, '_> {
             self.reset(m);
             return;
         }
+        // Element/field reads straight into the destination.
+        if let HK::Read(p) = &e.kind
+            && !matches!(**p, Place::Var(_))
+        {
+            let m = self.mark();
+            let pr = self.eval_place(p);
+            let direct = match (&pr, d.k) {
+                (PlaceRef::Index { a, i, k: Kind::Num }, Kind::Num) => Some(I::GetIdxN { d: d.r, a: *a, i: *i }),
+                (PlaceRef::Index { a, i, k: Kind::Val }, Kind::Val) => Some(I::GetIdxV { d: d.r, a: *a, i: *i }),
+                (PlaceRef::Field { o, slot, .. }, Kind::Num) => Some(I::GetFieldN { d: d.r, o: *o, i: *slot }),
+                (PlaceRef::Field { o, slot, .. }, Kind::Val) => Some(I::GetField { d: d.r, o: *o, i: *slot }),
+                (PlaceRef::Prop { o, p }, Kind::Val) => Some(I::GetProp { d: d.r, o: *o, p: *p }),
+                (PlaceRef::ArrLen { a }, Kind::Num) => Some(I::ArrLen { d: d.r, a: *a }),
+                (PlaceRef::StrLen { s }, Kind::Num) => Some(I::StrLen { d: d.r, s: *s }),
+                _ => None,
+            };
+            match direct {
+                Some(ins) => {
+                    self.emit(ins);
+                }
+                None => {
+                    let o = self.load_place(&pr, d.k);
+                    let o = self.coerce(o, d.k);
+                    self.mov(d, o);
+                }
+            }
+            self.reset(m);
+            return;
+        }
+        if let HK::Binary(op, a, b) = &e.kind
+            && e.kind() == d.k
+            && !matches!(op, HBin::DynNum(_))
+        {
+            let m = self.mark();
+            let x = self.expr(a);
+            let y = self.expr(b);
+            self.binop_into(*op, x, y, Some(d.r));
+            self.reset(m);
+            return;
+        }
         let m = self.mark();
         let o = self.expr(e);
         let o = self.coerce(o, d.k);
@@ -1068,6 +1165,7 @@ impl FnGen<'_, '_> {
             NumOp::Sub => I::SubN { d, a, b },
             NumOp::Mul => I::MulN { d, a, b },
             NumOp::Div => I::DivN { d, a, b },
+            NumOp::Mod => I::ModN { d, a, b },
             op => I::NumOp { op, d, a, b },
         });
     }
@@ -1083,6 +1181,9 @@ impl FnGen<'_, '_> {
         let k = e.kind();
         match &e.kind {
             HK::Num(v) => {
+                if let Some(r) = self.num_regs.get(&v.to_bits()) {
+                    return Op { k: Kind::Num, r: *r };
+                }
                 let d = self.alloc_s();
                 self.emit(I::LoadN { d, v: *v });
                 Op { k: Kind::Num, r: d }
@@ -1302,6 +1403,14 @@ impl FnGen<'_, '_> {
                 let cur = self.load_place(&pr, operand_kind);
                 let cur = self.coerce(cur, operand_kind);
                 let v = self.expr(value);
+                // `x += e` on a number local computes straight into x's register.
+                if let PlaceRef::Var(var) = pr
+                    && let Home::S(r) = self.home(var)
+                    && operand_kind == Kind::Num
+                    && self.var_info(var).kind() == Kind::Num
+                {
+                    return self.binop_into(*op, cur, v, Some(r));
+                }
                 let res = self.binop_regs(*op, cur, v);
                 self.store_place(&pr, res);
                 res
@@ -1555,18 +1664,23 @@ impl FnGen<'_, '_> {
     }
 
     fn binop_regs(&mut self, op: HBin, x: Op, y: Op) -> Op {
+        self.binop_into(op, x, y, None)
+    }
+
+    /// Binary op; writes into `dst` when given (its kind must match the result kind).
+    fn binop_into(&mut self, op: HBin, x: Op, y: Op, dst: Option<R>) -> Op {
         match op {
             HBin::Num(nop) => {
                 let x = self.coerce(x, Kind::Num);
                 let y = self.coerce(y, Kind::Num);
-                let d = self.alloc_s();
+                let d = dst.unwrap_or_else(|| self.alloc_s());
                 self.num_op(nop, d, x.r, y.r);
                 Op { k: Kind::Num, r: d }
             }
             HBin::NumCmp(c) => {
                 let x = self.coerce(x, Kind::Num);
                 let y = self.coerce(y, Kind::Num);
-                let d = self.alloc_s();
+                let d = dst.unwrap_or_else(|| self.alloc_s());
                 self.emit(match c {
                     CmpOp::Lt => I::LtN { d, a: x.r, b: y.r },
                     CmpOp::Le => I::LeN { d, a: x.r, b: y.r },
@@ -1580,7 +1694,7 @@ impl FnGen<'_, '_> {
             HBin::BoolEq(eq) => {
                 let x = self.coerce(x, Kind::Bool);
                 let y = self.coerce(y, Kind::Bool);
-                let d = self.alloc_s();
+                let d = dst.unwrap_or_else(|| self.alloc_s());
                 self.emit(if eq {
                     I::EqB { d, a: x.r, b: y.r }
                 } else {
@@ -1589,7 +1703,7 @@ impl FnGen<'_, '_> {
                 Op { k: Kind::Bool, r: d }
             }
             HBin::StrictEq(eq) => {
-                let d = self.alloc_s();
+                let d = dst.unwrap_or_else(|| self.alloc_s());
                 if x.k == Kind::Num && y.k == Kind::Num {
                     self.emit(if eq {
                         I::EqN { d, a: x.r, b: y.r }
@@ -1610,7 +1724,7 @@ impl FnGen<'_, '_> {
                 Op { k: Kind::Bool, r: d }
             }
             HBin::LooseEq(eq) => {
-                let d = self.alloc_s();
+                let d = dst.unwrap_or_else(|| self.alloc_s());
                 if x.k == Kind::Num && y.k == Kind::Num {
                     self.emit(if eq {
                         I::EqN { d, a: x.r, b: y.r }
@@ -1627,47 +1741,47 @@ impl FnGen<'_, '_> {
             HBin::Concat => {
                 let x = self.coerce(x, Kind::Val);
                 let y = self.coerce(y, Kind::Val);
-                let d = self.alloc_v();
+                let d = dst.unwrap_or_else(|| self.alloc_v());
                 self.emit(I::Concat { d, a: x.r, b: y.r });
                 Op { k: Kind::Val, r: d }
             }
             HBin::StrCmp(c) => {
                 let x = self.coerce(x, Kind::Val);
                 let y = self.coerce(y, Kind::Val);
-                let d = self.alloc_s();
+                let d = dst.unwrap_or_else(|| self.alloc_s());
                 self.emit(I::StrCmp { op: c, d, a: x.r, b: y.r });
                 Op { k: Kind::Bool, r: d }
             }
             HBin::DynAdd => {
                 let x = self.coerce(x, Kind::Val);
                 let y = self.coerce(y, Kind::Val);
-                let d = self.alloc_v();
+                let d = dst.unwrap_or_else(|| self.alloc_v());
                 self.emit(I::DynAdd { d, a: x.r, b: y.r });
                 Op { k: Kind::Val, r: d }
             }
             HBin::DynNum(nop) => {
                 if x.k == Kind::Num && y.k == Kind::Num {
-                    let d = self.alloc_s();
+                    let d = dst.unwrap_or_else(|| self.alloc_s());
                     self.num_op(nop, d, x.r, y.r);
                     return Op { k: Kind::Num, r: d };
                 }
                 let x = self.coerce(x, Kind::Val);
                 let y = self.coerce(y, Kind::Val);
-                let d = self.alloc_s();
+                let d = dst.unwrap_or_else(|| self.alloc_s());
                 self.emit(I::DynNum { op: nop, d, a: x.r, b: y.r });
                 Op { k: Kind::Num, r: d }
             }
             HBin::DynCmp(c) => {
                 let x = self.coerce(x, Kind::Val);
                 let y = self.coerce(y, Kind::Val);
-                let d = self.alloc_s();
+                let d = dst.unwrap_or_else(|| self.alloc_s());
                 self.emit(I::DynCmp { op: c, d, a: x.r, b: y.r });
                 Op { k: Kind::Bool, r: d }
             }
             HBin::In => {
                 let x = self.coerce(x, Kind::Val);
                 let y = self.coerce(y, Kind::Val);
-                let d = self.alloc_s();
+                let d = dst.unwrap_or_else(|| self.alloc_s());
                 self.emit(I::In { d, k: x.r, o: y.r });
                 Op { k: Kind::Bool, r: d }
             }
@@ -1970,6 +2084,14 @@ impl FnGen<'_, '_> {
             }
             return true;
         }
+        if let Some(t) = this
+            && matches!(n, ArrMap | ArrFilter | ArrForEach | ArrSome | ArrEvery | ArrFind | ArrFindIndex | ArrReduce)
+            && matches!(c.this.as_ref().unwrap().ty.non_null(), Type::Array(_))
+            && plain.len() == if n == ArrReduce { 2 } else { 1 }
+        {
+            self.array_hof(n, t, c, plain, dst);
+            return true;
+        }
         match (n, this) {
             (ArrPush, Some(t)) if plain.len() == 1 && dst.is_none() => {
                 let num_arr = matches!(&c.this.as_ref().unwrap().ty, Type::Array(e) if e.kind() == Kind::Num);
@@ -1994,6 +2116,347 @@ impl FnGen<'_, '_> {
             }
             _ => false,
         }
+    }
+
+    /// `arr.map(f)` and friends as a bytecode loop: the callback is called with
+    /// typed arguments (no boxing for `number[]`), and no native boundary is crossed.
+    fn array_hof(&mut self, n: Native, arr: Op, c: &HCall, args: Vec<&HExpr>, dst: Option<Op>) {
+        use Native::*;
+        let recv_ty = c.this.as_ref().unwrap().ty.non_null();
+        let Type::Array(elem_ty) = &recv_ty else { unreachable!() };
+        let ek = if elem_ty.kind() == Kind::Num { Kind::Num } else { Kind::Val };
+        let elem_kind = elem_ty.kind();
+        let cb = args[0];
+        let (nparams, cb_param_kinds, cb_ret) = match &cb.ty {
+            Type::Func(ft) => (
+                ft.params.len().min(if n == ArrReduce { 4 } else { 3 }),
+                ft.params.iter().map(crate::check::param_arrival).collect::<Vec<_>>(),
+                ft.ret.kind(),
+            ),
+            _ => (if n == ArrReduce { 4 } else { 3 }, vec![], Kind::Val),
+        };
+        let inline_fid = match &cb.kind {
+            HK::Closure(fid) if self.can_inline(*fid) => Some(*fid),
+            _ => None,
+        };
+        let f = match inline_fid {
+            Some(_) => Op { k: Kind::Val, r: 0 },
+            None => {
+                let f = self.expr(cb);
+                self.coerce(f, Kind::Val)
+            }
+        };
+        // Result accumulator.
+        let res_kind = dst.map_or(Kind::Val, |d| d.k);
+        let res = match n {
+            ArrMap | ArrFilter => {
+                let num = matches!(&c_ret_elem(&c.args, n, elem_ty), Some(k) if *k == Kind::Num);
+                let d = self.alloc_v();
+                let num = if n == ArrMap {
+                    // Element kind of the mapped array from the call's static type.
+                    num
+                } else {
+                    ek == Kind::Num
+                };
+                self.emit(I::NewArr { d, num });
+                Some(Op { k: Kind::Val, r: d })
+            }
+            ArrReduce => {
+                let acc = self.alloc(res_kind);
+                self.expr_into(args[1], acc);
+                Some(acc)
+            }
+            _ => None,
+        };
+        let map_num = matches!(n, ArrMap) && {
+            if let Some(d) = dst {
+                let _ = d;
+            }
+            false
+        };
+        let _ = map_num;
+        let len = self.alloc_s();
+        self.emit(I::ArrLen { d: len, a: arr.r });
+        let i = self.alloc_s();
+        self.emit(I::LoadN { d: i, v: 0.0 });
+        let found = match n {
+            ArrSome | ArrEvery | ArrFind | ArrFindIndex => {
+                let d = self.alloc(res_kind);
+                Some(d)
+            }
+            _ => None,
+        };
+        let to_test = self.jump_placeholder();
+        let top = self.here();
+        let m = self.mark();
+        let x = self.alloc(ek);
+        if ek == Kind::Num {
+            self.emit(I::GetIdxN { d: x.r, a: arr.r, i });
+        } else {
+            self.emit(I::GetIdxV { d: x.r, a: arr.r, i });
+        }
+        // Arguments in the callback's parameter kinds (exact for the common case).
+        let mut cargs: Vec<(Kind, R)> = Vec::new();
+        let mut push_arg = |g: &mut Self, idx: usize, o: Op| {
+            let k = cb_param_kinds.get(idx).copied().unwrap_or(o.k);
+            let o = g.coerce(o, k);
+            cargs.push((o.k, o.r));
+        };
+        let base = if n == ArrReduce {
+            push_arg(self, 0, res.unwrap());
+            1
+        } else {
+            0
+        };
+        let xe = self.coerce(x, if elem_kind == Kind::Bool { Kind::Val } else { x.k });
+        if nparams > base {
+            push_arg(self, base, xe);
+        }
+        if nparams > base + 1 {
+            push_arg(self, base + 1, Op { k: Kind::Num, r: i });
+        }
+        if nparams > base + 2 {
+            push_arg(self, base + 2, arr);
+        }
+        let out = match n {
+            ArrForEach => None,
+            ArrReduce => Some(res.unwrap()),
+            ArrMap => Some(self.alloc(if cb_ret == Kind::Num { Kind::Num } else { Kind::Val })),
+            _ => Some(self.alloc(if cb_ret == Kind::Bool { Kind::Bool } else { Kind::Val })),
+        };
+        if let Some(fid) = inline_fid {
+            // The element temp (and reduce's accumulator) can be bound directly.
+            let args: Vec<(Op, bool)> = cargs
+                .iter()
+                .enumerate()
+                .map(|(j, &(k, r))| {
+                    let owned = (j == base && r == xe.r && k == xe.k) || (n == ArrReduce && j == 0 && Some(r) == res.map(|o| o.r));
+                    (Op { k, r }, owned)
+                })
+                .collect();
+            self.inline_call(fid, &args, out);
+        } else {
+            let spread = vec![false; cargs.len()];
+            self.calls.push(CallInfo {
+                target: CallTarget::Value(f.r),
+                this: None,
+                args: cargs,
+                spread,
+                has_spread: false,
+                dst: out.map(|o| (o.k, o.r)),
+                packed_rest: false,
+            });
+            let ci = self.calls.len() as u32 - 1;
+            self.emit(I::Call { ci });
+        }
+        let mut early = None;
+        match n {
+            ArrMap => {
+                let o = out.unwrap();
+                let r = res.unwrap();
+                if o.k == Kind::Num {
+                    self.emit(I::PushN { a: r.r, s: o.r });
+                } else {
+                    self.emit(I::PushV { a: r.r, s: o.r });
+                }
+            }
+            ArrFilter => {
+                let o = out.unwrap();
+                let t = self.truthy(o);
+                let skip = self.emit(I::JmpF { c: t.r, t: 0 });
+                let r = res.unwrap();
+                if x.k == Kind::Num {
+                    self.emit(I::PushN { a: r.r, s: x.r });
+                } else {
+                    self.emit(I::PushV { a: r.r, s: x.r });
+                }
+                self.patch_here(skip);
+            }
+            ArrSome | ArrEvery | ArrFind | ArrFindIndex => {
+                let o = out.unwrap();
+                let t = self.truthy(o);
+                let j = if n == ArrEvery {
+                    self.emit(I::JmpF { c: t.r, t: 0 })
+                } else {
+                    self.emit(I::JmpT { c: t.r, t: 0 })
+                };
+                early = Some((j, x));
+            }
+            _ => {}
+        }
+        self.reset(m);
+        self.emit(I::AddNK { d: i, a: i, k: 1.0 });
+        self.patch_here(to_test);
+        self.emit(I::JCmpN {
+            op: CmpOp::Lt,
+            sense: true,
+            a: i,
+            b: len,
+            t: top,
+        });
+        // Loop finished without an early exit.
+        let fd = found;
+        match n {
+            ArrSome => self.load_bool(fd.unwrap(), false),
+            ArrEvery => self.load_bool(fd.unwrap(), true),
+            ArrFind => {
+                let d = fd.unwrap();
+                match d.k {
+                    Kind::Val => self.emit(I::LoadUndef { d: d.r }),
+                    Kind::Num => self.emit(I::LoadN { d: d.r, v: f64::NAN }),
+                    Kind::Bool => self.emit(I::LoadB { d: d.r, v: false }),
+                };
+            }
+            ArrFindIndex => {
+                let d = fd.unwrap();
+                let o = self.alloc_s();
+                self.emit(I::LoadN { d: o, v: -1.0 });
+                let o = self.coerce(Op { k: Kind::Num, r: o }, d.k);
+                self.mov(d, o);
+            }
+            _ => {}
+        }
+        if let Some((j, x)) = early {
+            let end = self.jump_placeholder();
+            self.patch_here(j);
+            let d = fd.unwrap();
+            match n {
+                ArrSome => self.load_bool(d, true),
+                ArrEvery => self.load_bool(d, false),
+                ArrFind => {
+                    // x's register was released; re-read the element.
+                    let xr = self.alloc(ek);
+                    if ek == Kind::Num {
+                        self.emit(I::GetIdxN { d: xr.r, a: arr.r, i });
+                    } else {
+                        self.emit(I::GetIdxV { d: xr.r, a: arr.r, i });
+                    }
+                    let o = self.coerce(xr, d.k);
+                    self.mov(d, o);
+                }
+                ArrFindIndex => {
+                    let o = self.coerce(Op { k: Kind::Num, r: i }, d.k);
+                    self.mov(d, o);
+                }
+                _ => {}
+            }
+            let _ = x;
+            self.patch_here(end);
+        }
+        if let Some(d) = dst {
+            let r = match n {
+                ArrMap | ArrFilter | ArrReduce => res.unwrap(),
+                ArrSome | ArrEvery | ArrFind | ArrFindIndex => fd.unwrap(),
+                _ => {
+                    let u = self.alloc_v();
+                    self.emit(I::LoadUndef { d: u });
+                    Op { k: Kind::Val, r: u }
+                }
+            };
+            let r = self.coerce(r, d.k);
+            self.mov(d, r);
+        }
+    }
+
+    /// Whether a closure literal can be compiled inline at its call site.
+    fn can_inline(&self, fid: FuncId) -> bool {
+        let hf = &self.cg.hir.funcs[fid as usize];
+        hf.this_var.is_none()
+            && hf.params.iter().all(|p| p.default.is_none() && !p.rest)
+            && self.inline.len() < 4
+            && hf.free.iter().all(|v| self.homes.contains_key(v) || self.cg.globals.contains_key(v))
+    }
+
+    fn load_default(&mut self, o: Op) {
+        match o.k {
+            Kind::Val => self.emit(I::LoadUndef { d: o.r }),
+            Kind::Num => self.emit(I::LoadN { d: o.r, v: f64::NAN }),
+            Kind::Bool => self.emit(I::LoadB { d: o.r, v: false }),
+        };
+    }
+
+    /// Compile function `fid`'s body in place, with `args` bound to its parameters.
+    fn inline_call(&mut self, fid: FuncId, args: &[(Op, bool)], out: Option<Op>) {
+        let hf = &self.cg.hir.funcs[fid as usize];
+        let m = self.mark();
+        for (i, p) in hf.params.iter().enumerate() {
+            let info = self.var_info(p.var).clone();
+            let owned = args.get(i).is_some_and(|a| a.1);
+            let arg = args.get(i).map(|a| a.0);
+            // An argument in a temporary we own can become the parameter's home.
+            if !info.captured
+                && owned
+                && let Some(a) = arg
+                && a.k == info.kind()
+            {
+                self.homes.insert(p.var, if a.k == Kind::Val { Home::V(a.r) } else { Home::S(a.r) });
+                continue;
+            }
+            if info.captured {
+                let c = self.alloc_v();
+                self.emit(I::NewCell { d: c });
+                if let Some(a) = arg {
+                    let a = self.coerce(a, info.kind());
+                    let a = self.coerce(a, Kind::Val);
+                    self.emit(I::CellSet { c, s: a.r });
+                }
+                self.homes.insert(p.var, Home::Cell(c));
+            } else {
+                let h = self.alloc(info.kind());
+                match arg {
+                    Some(a) => {
+                        let a = self.coerce(a, h.k);
+                        self.mov(h, a);
+                    }
+                    None => self.load_default(h),
+                }
+                self.homes.insert(p.var, if h.k == Kind::Val { Home::V(h.r) } else { Home::S(h.r) });
+            }
+        }
+        // A body that is a single `return e` needs no default for falling off the end.
+        let single_return = matches!(&hf.body[..], [HStmt::Block(b, _)] if matches!(&b[..], [HStmt::Return(Some(_))]));
+        if let Some(o) = out
+            && !single_return
+        {
+            self.load_default(o);
+        }
+        self.inline.push(InlineCtx {
+            out,
+            exits: vec![],
+            try_depth: self.tries.len(),
+            loop_depth: self.loops.len(),
+        });
+        let body = hf.body.clone();
+        self.stmts(&body);
+        let ctx = self.inline.pop().unwrap();
+        let _ = ctx.loop_depth;
+        for j in ctx.exits {
+            self.patch_here(j);
+        }
+        self.reset(m);
+    }
+
+    fn truthy(&mut self, o: Op) -> Op {
+        match o.k {
+            Kind::Bool => o,
+            Kind::Num => {
+                let d = self.alloc_s();
+                self.emit(I::TruthyN { d, s: o.r });
+                Op { k: Kind::Bool, r: d }
+            }
+            Kind::Val => {
+                let d = self.alloc_s();
+                self.emit(I::TruthyV { d, s: o.r });
+                Op { k: Kind::Bool, r: d }
+            }
+        }
+    }
+
+    fn load_bool(&mut self, d: Op, v: bool) {
+        let t = self.alloc_s();
+        self.emit(I::LoadB { d: t, v });
+        let o = self.coerce(Op { k: Kind::Bool, r: t }, d.k);
+        self.mov(d, o);
     }
 
     fn call_with_this(&mut self, c: &HCall, this: Option<R>, dst: Option<Op>) {
@@ -2102,6 +2565,7 @@ impl FnGen<'_, '_> {
             target,
             this,
             args,
+            has_spread: spread.iter().any(|x| *x),
             spread,
             dst: dst.map(|d| (d.k, d.r)),
             packed_rest: rest_at.is_some(),
@@ -2110,4 +2574,220 @@ impl FnGen<'_, '_> {
         let ci = self.calls.len() as u32 - 1;
         self.emit(I::Call { ci });
     }
+}
+
+// ───────────── HIR walkers ─────────────
+
+/// Numeric literals used inside loops (worth a dedicated register).
+fn collect_loop_nums(s: &HStmt, out: &mut Vec<f64>, hir: &HProgram) {
+    match s {
+        HStmt::Loop { .. } | HStmt::ForOf { .. } | HStmt::ForIn { .. } => collect_nums_stmt(s, out, hir),
+        HStmt::Block(ss, _) => ss.iter().for_each(|s| collect_loop_nums(s, out, hir)),
+        HStmt::If(_, a, b) => a.iter().chain(b.iter()).for_each(|s| collect_loop_nums(s, out, hir)),
+        HStmt::Try { block, handler, finalizer, .. } => {
+            block.iter().chain(handler.iter()).for_each(|s| collect_loop_nums(s, out, hir));
+            if let Some(f) = finalizer {
+                f.iter().for_each(|s| collect_loop_nums(s, out, hir));
+            }
+        }
+        HStmt::Switch { cases, .. } => cases.iter().for_each(|(_, b)| b.iter().for_each(|s| collect_loop_nums(s, out, hir))),
+        HStmt::Labeled(_, b) => collect_loop_nums(b, out, hir),
+        _ => {}
+    }
+}
+
+fn collect_nums_stmt(s: &HStmt, out: &mut Vec<f64>, hir: &HProgram) {
+    match s {
+        HStmt::Expr(e) | HStmt::Throw(e) => collect_nums_expr(e, out, hir),
+        HStmt::Init(_, e) | HStmt::Return(e) => {
+            if let Some(e) = e {
+                collect_nums_expr(e, out, hir)
+            }
+        }
+        HStmt::MakeClosure(..) | HStmt::Break(_) | HStmt::Continue(_) => {}
+        HStmt::Block(ss, _) => ss.iter().for_each(|s| collect_nums_stmt(s, out, hir)),
+        HStmt::If(c, a, b) => {
+            collect_nums_expr(c, out, hir);
+            a.iter().chain(b.iter()).for_each(|s| collect_nums_stmt(s, out, hir));
+        }
+        HStmt::Loop { test, body, update, .. } => {
+            if let Some(t) = test {
+                collect_nums_expr(t, out, hir);
+            }
+            if let Some(u) = update {
+                collect_nums_expr(u, out, hir);
+            }
+            body.iter().for_each(|s| collect_nums_stmt(s, out, hir));
+        }
+        HStmt::ForOf { iter, body, .. } | HStmt::ForIn { obj: iter, body, .. } => {
+            collect_nums_expr(iter, out, hir);
+            body.iter().for_each(|s| collect_nums_stmt(s, out, hir));
+        }
+        HStmt::Try { block, handler, finalizer, .. } => {
+            block.iter().chain(handler.iter()).for_each(|s| collect_nums_stmt(s, out, hir));
+            if let Some(f) = finalizer {
+                f.iter().for_each(|s| collect_nums_stmt(s, out, hir));
+            }
+        }
+        HStmt::Switch { disc, cases, .. } => {
+            collect_nums_expr(disc, out, hir);
+            for (t, b) in cases {
+                if let Some(t) = t {
+                    collect_nums_expr(t, out, hir);
+                }
+                b.iter().for_each(|s| collect_nums_stmt(s, out, hir));
+            }
+        }
+        HStmt::Labeled(_, b) => collect_nums_stmt(b, out, hir),
+    }
+}
+
+fn collect_nums_place(p: &Place, out: &mut Vec<f64>, hir: &HProgram) {
+    match p {
+        Place::Var(_) => {}
+        Place::Field { obj, .. } | Place::Prop { obj, .. } | Place::ArrLen { obj, .. } | Place::StrLen { obj, .. } => {
+            collect_nums_expr(obj, out, hir)
+        }
+        Place::Index { obj, index: k, .. } | Place::DynIndex { obj, key: k, .. } => {
+            collect_nums_expr(obj, out, hir);
+            collect_nums_expr(k, out, hir);
+        }
+    }
+}
+
+fn collect_nums_elems(es: &[HElem], out: &mut Vec<f64>, hir: &HProgram) {
+    for e in es {
+        match e {
+            HElem::Expr(x) | HElem::Spread(x) => collect_nums_expr(x, out, hir),
+        }
+    }
+}
+
+fn collect_nums_expr(e: &HExpr, out: &mut Vec<f64>, hir: &HProgram) {
+    match &e.kind {
+        HK::Num(v) => {
+            if !out.iter().any(|x| x.to_bits() == v.to_bits()) {
+                out.push(*v)
+            }
+        }
+        HK::Read(p) => collect_nums_place(p, out, hir),
+        HK::Array(es) | HK::New { args: es, .. } | HK::NewBuiltin(_, es) => collect_nums_elems(es, out, hir),
+        HK::Object(ps) => {
+            for p in ps {
+                match p {
+                    HProp::Init(_, x) | HProp::Spread(x) => collect_nums_expr(x, out, hir),
+                }
+            }
+        }
+        HK::Unary(_, x) | HK::Cast(x) | HK::OptChain(x) | HK::InstanceOf(x, _) => collect_nums_expr(x, out, hir),
+        HK::Binary(_, a, b) | HK::Logical(_, a, b) | HK::Delete(a, b) => {
+            collect_nums_expr(a, out, hir);
+            collect_nums_expr(b, out, hir);
+        }
+        HK::Cond(a, b, c) => {
+            collect_nums_expr(a, out, hir);
+            collect_nums_expr(b, out, hir);
+            collect_nums_expr(c, out, hir);
+        }
+        HK::Assign(p, v) | HK::Compound(p, _, v) | HK::LogicalAssign(p, _, v) => {
+            collect_nums_place(p, out, hir);
+            collect_nums_expr(v, out, hir);
+        }
+        HK::Update { place, .. } => collect_nums_place(place, out, hir),
+        HK::Call(c) => {
+            if let Callee::Value(f) = &c.callee {
+                collect_nums_expr(f, out, hir);
+            }
+            if let Some(t) = &c.this {
+                collect_nums_expr(t, out, hir);
+            }
+            collect_nums_elems(&c.args, out, hir);
+        }
+        HK::Seq(es) => es.iter().for_each(|x| collect_nums_expr(x, out, hir)),
+        // Closure bodies may be inlined into this frame.
+        HK::Closure(f) => {
+            for st in &hir.funcs[*f as usize].body {
+                collect_nums_stmt(st, out, hir);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Element kind of `arr.map(f)`'s result, from the callback's static return type.
+fn c_ret_elem(args: &[HElem], n: Native, _elem: &Type) -> Option<Kind> {
+    if n != Native::ArrMap {
+        return None;
+    }
+    match args.first() {
+        Some(HElem::Expr(e)) => match &e.ty {
+            Type::Func(ft) => Some(ft.ret.kind()),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn jump_target(i: &mut I) -> Option<&mut u32> {
+    match i {
+        I::Jmp { t }
+        | I::JmpT { t, .. }
+        | I::JmpF { t, .. }
+        | I::JCmpN { t, .. }
+        | I::JmpTV { t, .. }
+        | I::JmpFV { t, .. }
+        | I::JmpNullish { t, .. }
+        | I::JmpNotNullish { t, .. } => Some(t),
+        I::TryBegin { catch, .. } => Some(catch),
+        _ => None,
+    }
+}
+
+/// Remove unconditional jumps to the next instruction and thread jumps to jumps.
+fn peephole(code: &mut Vec<I>) {
+    // Thread: a jump whose target is an unconditional jump goes straight to its target.
+    for i in 0..code.len() {
+        let mut ins = code[i];
+        if let Some(t) = jump_target(&mut ins) {
+            let mut tgt = *t;
+            let mut hops = 0;
+            while let I::Jmp { t: next } = code[tgt as usize] {
+                if next == tgt || hops > 8 {
+                    break;
+                }
+                tgt = next;
+                hops += 1;
+            }
+            *t = tgt;
+            code[i] = ins;
+        }
+    }
+    let keep: Vec<bool> = code
+        .iter()
+        .enumerate()
+        .map(|(i, ins)| !matches!(ins, I::Jmp { t } if *t as usize == i + 1))
+        .collect();
+    if keep.iter().all(|k| *k) {
+        return;
+    }
+    let mut new_index = Vec::with_capacity(code.len() + 1);
+    let mut n = 0u32;
+    for k in &keep {
+        new_index.push(n);
+        if *k {
+            n += 1;
+        }
+    }
+    new_index.push(n);
+    let mut out = Vec::with_capacity(n as usize);
+    for (i, mut ins) in code.drain(..).enumerate() {
+        if !keep[i] {
+            continue;
+        }
+        if let Some(t) = jump_target(&mut ins) {
+            *t = new_index[*t as usize];
+        }
+        out.push(ins);
+    }
+    *code = out;
 }

@@ -564,6 +564,15 @@ impl Checker {
                                         let k = format!("{v}");
                                         self.ctx_mut().narrow.remove(&k);
                                     }
+                                    if *kind == VarKind::Const
+                                        && matches!(h.kind, HK::Num(_) | HK::Str(_) | HK::Bool(_))
+                                        && matches!(
+                                            ty,
+                                            Type::Number | Type::String | Type::Boolean | Type::NumLit(_) | Type::StrLit(_) | Type::BoolLit(_)
+                                        )
+                                    {
+                                        self.var_const_val[v as usize] = Some(h.clone().cast(ty.clone()));
+                                    }
                                     out.push(HStmt::Init(v, Some(h.cast(ty))));
                                 }
                                 None => {

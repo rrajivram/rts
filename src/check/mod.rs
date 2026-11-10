@@ -195,6 +195,10 @@ pub struct Checker {
     pub vars: Vec<VarInfo>,
     pub var_pending: Vec<bool>,
     pub var_const: Vec<bool>,
+    /// Module-level variable referenced from a function other than main.
+    pub var_outside_main: Vec<bool>,
+    /// `const` with a literal initializer: reads are replaced by the literal.
+    pub var_const_val: Vec<Option<HExpr>>,
     pub funcs: Vec<FuncDef>,
     pub classes: Vec<ClassDef>,
     pub ifaces: Vec<IfaceDef>,
@@ -243,6 +247,8 @@ pub fn check_program(prelude: &[ast::Stmt], program: &[ast::Stmt]) -> CResult<HP
         vars: Vec::new(),
         var_pending: Vec::new(),
         var_const: Vec::new(),
+        var_outside_main: Vec::new(),
+        var_const_val: Vec::new(),
         funcs: Vec::new(),
         classes: Vec::new(),
         ifaces: Vec::new(),
@@ -300,9 +306,18 @@ pub fn check_program(prelude: &[ast::Stmt], program: &[ast::Stmt]) -> CResult<HP
     let all: Vec<ast::Stmt> = prelude.iter().chain(program.iter()).cloned().collect();
     let body = c.check_block_in(&all, module.clone())?;
     c.stack.pop();
+    // Module variables only used by top-level code live in main's registers.
+    let mut demoted = Vec::new();
+    for v in module.decls.borrow().iter() {
+        let i = *v as usize;
+        if c.vars[i].owner.is_none() && !c.var_outside_main[i] {
+            c.vars[i].owner = Some(MAIN);
+            demoted.push(*v);
+        }
+    }
     c.funcs[MAIN as usize].hir = Some(HFunc {
         name: "<main>".into(),
-        body,
+        body: vec![HStmt::Block(body, demoted)],
         ..Default::default()
     });
     c.funcs[MAIN as usize].state = State::Done;
@@ -339,6 +354,8 @@ impl Checker {
         let id = self.vars.len() as VarId;
         self.var_pending.push(ty.is_none());
         self.var_const.push(is_const);
+        self.var_outside_main.push(false);
+        self.var_const_val.push(None);
         self.vars.push(VarInfo {
             name,
             ty: ty.unwrap_or(Type::Any),
@@ -387,8 +404,13 @@ impl Checker {
     /// captures and threads the variable through intermediate closures.
     pub fn note_var_use(&mut self, v: VarId) {
         let owner = self.vars[v as usize].owner;
-        let Some(owner) = owner else { return };
         let cur = self.ctx().func;
+        let Some(owner) = owner else {
+            if cur != MAIN {
+                self.var_outside_main[v as usize] = true;
+            }
+            return;
+        };
         if cur == owner {
             return;
         }

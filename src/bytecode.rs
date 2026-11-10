@@ -21,6 +21,7 @@ pub enum I {
     SubN { d: R, a: R, b: R },
     MulN { d: R, a: R, b: R },
     DivN { d: R, a: R, b: R },
+    ModN { d: R, a: R, b: R },
     /// `d = a + k`
     AddNK { d: R, a: R, k: f64 },
     NumOp { op: NumOp, d: R, a: R, b: R },
@@ -152,6 +153,7 @@ pub struct CallInfo {
     pub args: Vec<(Kind, R)>,
     /// Arguments contain spread markers: (Val, reg) entries flagged here are spread.
     pub spread: Vec<bool>,
+    pub has_spread: bool,
     pub dst: Option<(Kind, R)>,
     /// The caller already packed rest arguments into an array.
     pub packed_rest: bool,
