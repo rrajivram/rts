@@ -201,8 +201,6 @@ impl Parser {
     /// Run `f`; if it fails, rewind and return None.
     fn try_parse<T>(&mut self, f: impl FnOnce(&mut Self) -> PResult<T>) -> Option<T> {
         let save = self.pos;
-        let saved_toks: Option<Vec<Token>> = None;
-        let _ = saved_toks;
         // expect_gt may split a token in place; snapshot the few tokens it could touch.
         let snapshot: Vec<(usize, Token)> = (save..(save + 64).min(self.toks.len()))
             .map(|i| (i, self.toks[i].clone()))
@@ -1247,7 +1245,6 @@ impl Parser {
     /// Try to parse an arrow function at the current position.
     fn try_arrow(&mut self) -> PResult<Option<Expr>> {
         let start = self.span();
-        let mut is_async = false;
         if self.is_kw("async") && !self.toks[self.pos + 1].nl_before && matches!(self.tok_at(1), Tok::Ident(_) | Tok::P("(") | Tok::P("<")) {
             // `async x => …` or `async (…) => …`
             let save = self.pos;
@@ -1256,8 +1253,6 @@ impl Parser {
                 let ExprKind::Func(f) = e.kind else { unreachable!() };
                 let mut f = (*f).clone();
                 f.is_async = true;
-                is_async = true;
-                let _ = is_async;
                 return Ok(Some(Self::mk(ExprKind::Func(Rc::new(f)), start.to(e.span))));
             }
             self.pos = save;

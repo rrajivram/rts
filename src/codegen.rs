@@ -32,7 +32,7 @@ enum Home {
 /// An evaluated assignment target.
 enum PlaceRef {
     Var(VarId),
-    Field { o: R, slot: u16, k: Kind },
+    Field { o: R, slot: u16 },
     Prop { o: R, p: u32 },
     Index { a: R, i: R, k: Kind },
     Dyn { o: R, k: R },
@@ -1836,11 +1836,7 @@ impl FnGen<'_, '_> {
                 let o = self.expr(obj);
                 let o = self.coerce(o, Kind::Val);
                 self.opt_check(o, *opt);
-                PlaceRef::Field {
-                    o: o.r,
-                    slot: *slot as u16,
-                    k: Kind::Val,
-                }
+                PlaceRef::Field { o: o.r, slot: *slot as u16 }
             }
             Place::Prop { obj, name, opt } => {
                 let o = self.expr(obj);
