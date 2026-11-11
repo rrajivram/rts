@@ -1,0 +1,18 @@
+const date = /(?<y>\d{4})-(?<m>\d{2})-(?<d>\d{2})/;
+const m = date.exec("on 2024-03-15!");
+console.log(m);
+console.log(m?.groups?.y, m?.index, "2024-03-15".replace(date, "$<d>/$<m>/$<y>"));
+console.log("a-b_c d".split(/[-_ ]/), "one  two".split(/(\s+)/), "".split(/,/));
+console.log("Hello World".replace(/o/g, "0"), "aaa".replace(/a/, "b"), "x".replace(/(y)?x/, "[$1]"));
+console.log("camelCaseString".replace(/([A-Z])/g, (c: string) => "_" + c.toLowerCase()));
+console.log("price: $10, $20".match(/\$\d+/g), "nope".match(/\d/), "abc".search(/c/));
+const g = /\w+/g;
+let r: RegExpExecArray | null;
+while ((r = g.exec("hi there you")) !== null) console.log(r[0], g.lastIndex);
+console.log(/^[\w.+-]+@\w+\.\w{2,}$/.test("a.b+c@site.org"), /colou?r/i.test("COLOR"));
+console.log([..."a1b22c333".matchAll(/(\d+)/g)].map((x) => x[1]));
+console.log(/(\w)\1/.test("hello"), /foo(?=bar)/.exec("foobar")?.[0], /(?<!\$)\b\d+/.exec("$5 7")?.[0]);
+const re = new RegExp("ab+c", "gi");
+console.log(re, re.source, re.flags, re.global, String(/x\/y/));
+console.log("tab\there".replace(/\t/, "->"), "multi\nline".match(/^line$/m)?.[0], /a.c/s.test("a\nc"));
+console.log("café crème".replace(/é/g, "e"), "x".padStart(3, "ab"));

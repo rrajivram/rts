@@ -271,6 +271,10 @@ pub enum HElem {
 pub enum HProp {
     Init(Name, HExpr),
     Spread(HExpr),
+    /// `[key]: value`
+    Computed(HExpr, HExpr),
+    /// `get name() {}` / `set name(v) {}` (closures)
+    Accessor { name: Name, get: Option<HExpr>, set: Option<HExpr> },
 }
 
 #[derive(Debug, Clone)]
@@ -354,6 +358,9 @@ pub enum HK {
     Yield(Box<HExpr>),
     /// `yield* x`
     YieldStar(Box<HExpr>),
+    /// Run statements, then evaluate the expression (class expressions'
+    /// static initializers).
+    StmtExpr(Vec<HStmt>, Box<HExpr>),
 }
 
 impl HExpr {

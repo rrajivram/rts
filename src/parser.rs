@@ -27,6 +27,10 @@ pub struct Parser {
     pos: usize,
     /// Inside a `for (...` head: `in` is not a binary operator.
     no_in: bool,
+    /// Counter for naming static blocks.
+    static_blocks: u32,
+    /// Parsing a conditional type's `extends` clause.
+    no_conditional: bool,
 }
 
 const RESERVED: &[&str] = &[
@@ -42,6 +46,8 @@ impl Parser {
             toks,
             pos: 0,
             no_in: false,
+            static_blocks: 0,
+            no_conditional: false,
         }
     }
 
@@ -110,6 +116,7 @@ impl Parser {
             Tok::BigInt(n) => format!("bigint {n}n"),
             Tok::Str(_) => "string".into(),
             Tok::Template { .. } => "template literal".into(),
+            Tok::Regex { .. } => "regular expression".into(),
             Tok::Ident(n) => format!("'{n}'"),
             Tok::P(p) => format!("'{p}'"),
             Tok::Eof => "end of input".into(),
@@ -472,7 +479,12 @@ impl Parser {
                     return Ok(s);
                 }
                 if self.is_kw("global") || self.is_kw("module") || self.is_kw("namespace") {
-                    return self.err("ambient modules/namespaces are not supported");
+                    // Ambient declarations describe types only: skip them.
+                    while !self.is("{") && !self.at_eof() {
+                        self.bump();
+                    }
+                    self.block_body()?;
+                    return Ok(StmtKind::Empty);
                 }
                 // declare function/class: parse and treat as a declaration with no body.
                 self.statement_kind()
@@ -610,8 +622,11 @@ impl Parser {
                 Ok(StmtKind::Empty)
             }
             "with" => self.err("'with' is not supported"),
-            "namespace" | "module" if matches!(self.tok_at(1), Tok::Ident(_) | Tok::Str(_)) => {
-                self.err("namespaces are not supported yet")
+            "namespace" | "module" if matches!(self.tok_at(1), Tok::Ident(_)) && self.is_at(2, "{") => {
+                self.bump();
+                let name = self.ident()?;
+                let body = self.block_body()?;
+                Ok(StmtKind::Namespace { name, body })
             }
             _ => self.expr_statement(),
         }
@@ -1037,7 +1052,28 @@ impl Parser {
                 "static" => {
                     if self.is_at(1, "{") {
                         self.bump();
-                        return Ok(ClassMember::StaticBlock(self.block_body()?));
+                        let span = self.span();
+                        let body = self.block_body()?;
+                        // A static block runs like a static method called once, when the class is defined.
+                        self.static_blocks += 1;
+                        let name: Name = format!("\u{1}static{}", self.static_blocks).into();
+                        let func = Function {
+                            name: Some(name.clone()),
+                            tparams: vec![],
+                            params: vec![],
+                            ret: None,
+                            body: Some(Body::Block(body)),
+                            is_arrow: false,
+                            is_async: false,
+                            is_generator: false,
+                            span,
+                        };
+                        return Ok(ClassMember::Method {
+                            name,
+                            func: Rc::new(func),
+                            is_static: true,
+                            kind: MethodKind::Method,
+                        });
                     }
                     is_static = true
                 }
@@ -1119,9 +1155,24 @@ impl Parser {
             return Ok(t);
         }
         let t = self.union_type()?;
-        // Conditional types are parsed and rejected.
-        if self.is_kw("extends") && !self.nl_before() {
-            return self.err("conditional types are not supported");
+        if self.is_kw("extends") && !self.nl_before() && !self.no_conditional {
+            self.bump();
+            // In the `extends` clause, a nested `extends` is a constraint on `infer`.
+            let saved = self.no_conditional;
+            self.no_conditional = true;
+            let extends = self.type_expr();
+            self.no_conditional = saved;
+            let extends = extends?;
+            self.expect("?")?;
+            let then = self.type_expr()?;
+            self.expect(":")?;
+            let otherwise = self.type_expr()?;
+            return Ok(TypeExpr::Conditional {
+                check: Box::new(t),
+                extends: Box::new(extends),
+                then: Box::new(then),
+                otherwise: Box::new(otherwise),
+            });
         }
         Ok(t)
     }
@@ -1167,10 +1218,60 @@ impl Parser {
                 self.bump();
                 t = TypeExpr::Array(Box::new(t));
             } else {
-                return self.err("indexed access types are not supported");
+                self.bump();
+                let saved = self.no_conditional;
+                self.no_conditional = false;
+                let k = self.type_expr();
+                self.no_conditional = saved;
+                let k = k?;
+                self.expect("]")?;
+                t = TypeExpr::Indexed(Box::new(t), Box::new(k));
             }
         }
         Ok(t)
+    }
+
+    /// `{ [K in …` or `{ readonly [K in …` / `{ -readonly [K in …`
+    fn is_mapped_type(&self) -> bool {
+        let mut i = 1;
+        if matches!(self.tok_at(i), Tok::P("+") | Tok::P("-")) {
+            i += 1;
+        }
+        if self.is_kw_at(i, "readonly") {
+            i += 1;
+        }
+        self.is_at(i, "[") && matches!(self.tok_at(i + 1), Tok::Ident(_)) && self.is_kw_at(i + 2, "in")
+    }
+
+    fn mapped_type(&mut self) -> PResult<TypeExpr> {
+        self.expect("{")?;
+        let _ = self.eat("+") || self.eat("-");
+        self.eat_kw("readonly");
+        self.expect("[")?;
+        let param = self.ident()?;
+        self.expect_kw("in")?;
+        let keys = self.type_expr()?;
+        let rename = if self.eat_kw("as") { Some(Box::new(self.type_expr()?)) } else { None };
+        self.expect("]")?;
+        let optional = if self.eat("-") {
+            self.expect("?")?;
+            Some(false)
+        } else {
+            self.eat("+");
+            if self.eat("?") { Some(true) } else { None }
+        };
+        self.expect(":")?;
+        let value = self.type_expr()?;
+        self.eat(";");
+        self.eat(",");
+        self.expect("}")?;
+        Ok(TypeExpr::Mapped {
+            param,
+            keys: Box::new(keys),
+            rename,
+            value: Box::new(value),
+            optional,
+        })
     }
 
     fn type_args(&mut self) -> PResult<Vec<TypeExpr>> {
@@ -1199,7 +1300,21 @@ impl Parser {
                 self.expect(")")?;
                 Ok(t)
             }
+            Tok::P("{") if self.is_mapped_type() => self.mapped_type(),
             Tok::P("{") => Ok(TypeExpr::Object(self.type_members()?)),
+            Tok::Template { exprs, .. } if !exprs.is_empty() => {
+                self.bump();
+                Ok(TypeExpr::TemplateLit)
+            }
+            Tok::Ident(n) if &*n == "infer" && matches!(self.tok_at(1), Tok::Ident(_)) => {
+                self.bump();
+                let name = self.ident()?;
+                if self.is_kw("extends") && self.no_conditional {
+                    self.bump();
+                    self.postfix_type()?;
+                }
+                Ok(TypeExpr::Infer(name))
+            }
             Tok::P("[") => {
                 self.bump();
                 let mut elems = Vec::new();
@@ -1839,8 +1954,38 @@ impl Parser {
             } else if self.is("!") && !self.nl_before() && !self.is_at(1, "=") {
                 self.bump();
                 e = Self::mk(ExprKind::NonNull(Box::new(e)), start.to(self.prev_span()));
-            } else if matches!(self.tok(), Tok::Template { .. }) && !self.nl_before() {
-                return self.err("tagged templates are not supported");
+            } else if let Tok::Template { quasis, exprs } = self.tok().clone() {
+                // tag`a${x}b` → tag(<strings array>, x)
+                self.bump();
+                let tspan = start.to(self.prev_span());
+                let lit = |kind: ExprKind| ArrayElem::Expr(Self::mk(kind, tspan));
+                let mut strings = vec![lit(ExprKind::Num(quasis.len() as f64))];
+                strings.extend(quasis.iter().map(|q| lit(ExprKind::Str(q.clone()))));
+                strings.extend(quasis.iter().map(|q| lit(ExprKind::Str(q.clone()))));
+                let template_object = Self::mk(
+                    ExprKind::Call {
+                        callee: Box::new(Self::mk(ExprKind::Ident("\u{1}templateObject".into()), tspan)),
+                        targs: vec![],
+                        args: strings,
+                        optional: false,
+                    },
+                    tspan,
+                );
+                let mut args = vec![ArrayElem::Expr(template_object)];
+                for toks in exprs {
+                    let mut sub = Parser::new(toks);
+                    let x = sub.expr()?;
+                    args.push(ArrayElem::Expr(x));
+                }
+                e = Self::mk(
+                    ExprKind::Call {
+                        callee: Box::new(e),
+                        targs: vec![],
+                        args,
+                        optional: false,
+                    },
+                    tspan,
+                );
             } else {
                 break;
             }
@@ -1924,6 +2069,10 @@ impl Parser {
                 self.bump();
                 Ok(Self::mk(ExprKind::Str(s), start))
             }
+            Tok::Regex { pattern, flags } => {
+                self.bump();
+                Ok(Self::mk(ExprKind::Regex(pattern, flags), start))
+            }
             Tok::Template { quasis, exprs } => {
                 self.bump();
                 let mut es = Vec::new();
@@ -2000,6 +2149,11 @@ impl Parser {
                     Ok(Self::mk(ExprKind::Class(Rc::new(c)), start.to(self.prev_span())))
                 }
                 "new" => self.new_expr(),
+                // `import.meta` and `import("x")`: rewritten by the module loader.
+                "import" if self.is_at(1, ".") || self.is_at(1, "(") => {
+                    self.bump();
+                    Ok(Self::mk(ExprKind::Ident(n), start))
+                }
                 _ if RESERVED.contains(&&*n) => self.err(format!("unexpected keyword '{n}'")),
                 _ => {
                     self.bump();
@@ -2035,7 +2189,22 @@ impl Parser {
                     }
                 }
                 if kind != MethodKind::Method {
-                    return self.err("getters/setters are not supported yet");
+                    let ksp = self.span();
+                    let key = match self.well_known_symbol_key() {
+                        Some(k) => k,
+                        None => self.prop_name()?,
+                    };
+                    let f = self.function_rest(Some(key.clone()), ksp, false, false)?;
+                    props.push(ObjProp::Accessor {
+                        key,
+                        is_get: kind == MethodKind::Get,
+                        func: Rc::new(f),
+                    });
+                    if !self.eat(",") {
+                        self.expect("}")?;
+                        break;
+                    }
+                    continue;
                 }
                 let is_generator = self.eat("*");
                 let ksp = self.span();

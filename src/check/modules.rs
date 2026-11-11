@@ -9,7 +9,7 @@ use std::rc::Rc;
 use crate::ast::*;
 use crate::error::Span;
 use crate::hir::*;
-use crate::module::{ExportTarget, Exports, ModuleGraph, import_of, ImportOf};
+use crate::module::{CJS_EXPORTS, ExportTarget, Exports, ModuleGraph, import_of, ImportOf};
 
 use super::*;
 
@@ -28,12 +28,19 @@ impl Checker {
         for m in 0..n {
             prepared.push(prepare(g, &exports, m)?);
         }
-        let scopes: Vec<Rc<Scope>> = (0..n).map(|_| Scope::new(Some(self.module.clone()), None)).collect();
+        let mut scopes: Vec<Rc<Scope>> = Vec::with_capacity(n);
+        for m in &g.modules {
+            // A namespace block sees the names of the module it is written in.
+            let parent = m.parent.map_or_else(|| self.module.clone(), |p| scopes[p].clone());
+            scopes.push(Scope::new(Some(parent), None));
+        }
         self.module_scopes = scopes.clone();
 
+        let typed = !self.erase;
         let mut classes = vec![Vec::new(); n];
         for &m in &g.order {
             self.enter_module(&scopes[m]);
+            self.erase = !typed || g.modules[m].is_js;
             classes[m] = self.hoist_types(&prepared[m].stmts, &scopes[m])?;
         }
         for &m in &g.order {
@@ -49,6 +56,7 @@ impl Checker {
         let mut funcs = vec![Vec::new(); n];
         for &m in &g.order {
             self.enter_module(&scopes[m]);
+            self.erase = !typed || g.modules[m].is_js;
             funcs[m] = self.hoist_values(&prepared[m].stmts, &scopes[m], &mut hoisted)?;
         }
         for &m in &g.order {
@@ -89,12 +97,14 @@ impl Checker {
         let mut body = hoisted;
         for &m in &g.order {
             self.enter_module(&scopes[m]);
+            self.erase = !typed || g.modules[m].is_js;
             let stmts = std::mem::take(&mut prepared[m].stmts);
             let hs = self.check_hoisted(&stmts, Vec::new(), std::mem::take(&mut funcs[m]), std::mem::take(&mut classes[m]))?;
             body.extend(hs);
         }
         let global = self.module.clone();
         self.enter_module(&global);
+        self.erase = !typed;
         Ok(body)
     }
 
@@ -143,8 +153,26 @@ fn prepare(g: &ModuleGraph, exports: &Exports, m: usize) -> CResult<Prepared> {
     let mut bindings = Vec::new();
     let mut namespaces: Vec<(Name, usize)> = Vec::new();
     let mut stmts = Vec::new();
+    // (local name, alias of the CommonJS module's exports, property)
+    let mut cjs_named: Vec<(Name, Name, Name)> = Vec::new();
     for s in &module.stmts {
         match &s.kind {
+            StmtKind::Import(d) if g.modules[module.deps[&d.from]].is_cjs => {
+                // Importing CommonJS: the default (and a namespace) is
+                // `module.exports`; named imports are its properties.
+                let dep = module.deps[&d.from];
+                let exports = ExportTarget::Local(dep, CJS_EXPORTS.into());
+                for local in d.default.iter().chain(d.namespace.iter()) {
+                    bindings.push((local.clone(), exports.clone(), d.span, false));
+                }
+                if !d.named.is_empty() {
+                    let alias: Name = format!("\u{1}cjs{dep}").into();
+                    bindings.push((alias.clone(), exports.clone(), d.span, false));
+                    for spec in &d.named {
+                        cjs_named.push((spec.local.clone(), alias.clone(), spec.imported.clone()));
+                    }
+                }
+            }
             StmtKind::Import(d) => {
                 let dep = module.deps[&d.from];
                 if let Some(local) = &d.default {
@@ -232,8 +260,94 @@ fn prepare(g: &ModuleGraph, exports: &Exports, m: usize) -> CResult<Prepared> {
             }
         });
     }
+    // `require("x")`, `import("x")` and `import.meta`.
+    let mut required: Vec<(Name, ExportTarget)> = Vec::new();
+    let file = module.path.clone();
+    visit_exprs_mut(&mut stmts, &mut |e| {
+        let span = e.span;
+        let mk = |kind: ExprKind| Expr { kind, span };
+        match &e.kind {
+            ExprKind::Call { callee, args, .. }
+                if matches!(&callee.kind, ExprKind::Ident(n) if &**n == "require" || &**n == "import")
+                    && let [ArrayElem::Expr(Expr { kind: ExprKind::Str(spec), .. })] = &args[..]
+                    && let Some(&dep) = module.deps.get(spec) =>
+            {
+                let is_import = matches!(&callee.kind, ExprKind::Ident(n) if &**n == "import");
+                let alias: Name = format!("\u{1}req{dep}").into();
+                let target = if g.modules[dep].is_cjs { ExportTarget::Local(dep, CJS_EXPORTS.into()) } else { ExportTarget::Namespace(dep) };
+                if !required.iter().any(|(a, _)| *a == alias) {
+                    required.push((alias.clone(), target));
+                }
+                let value = mk(ExprKind::Ident(alias));
+                e.kind = if is_import {
+                    // import("x") → Promise.resolve(<namespace>)
+                    ExprKind::Call {
+                        callee: Box::new(mk(ExprKind::Member {
+                            obj: Box::new(mk(ExprKind::Ident("Promise".into()))),
+                            prop: "resolve".into(),
+                            optional: false,
+                        })),
+                        targs: vec![],
+                        args: vec![ArrayElem::Expr(value)],
+                        optional: false,
+                    }
+                } else {
+                    value.kind
+                };
+            }
+            ExprKind::Member { obj, prop, .. } if &**prop == "meta" && matches!(&obj.kind, ExprKind::Ident(n) if &**n == "import") => {
+                let dir = std::path::Path::new(&file).parent().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default();
+                let field = |k: &str, v: String| ObjProp::Init {
+                    key: PropKey::Name(k.into()),
+                    value: mk(ExprKind::Str(v.into())),
+                };
+                e.kind = ExprKind::Object(vec![
+                    field("url", format!("file://{file}")),
+                    field("filename", file.clone()),
+                    field("dirname", dir),
+                ]);
+            }
+            ExprKind::Ident(n) => {
+                if let Some((_, alias, prop)) = cjs_named.iter().find(|(l, _, _)| l == n) {
+                    e.kind = ExprKind::Member {
+                        obj: Box::new(mk(ExprKind::Ident(alias.clone()))),
+                        prop: prop.clone(),
+                        optional: false,
+                    };
+                }
+            }
+            _ => {}
+        }
+    });
+    for (alias, target) in required {
+        bindings.push((alias, target, Span::default(), false));
+    }
+    if module.is_cjs {
+        stmts = wrap_commonjs(stmts, &file);
+    }
     let _ = ImportOf::Namespace;
     Ok(Prepared { stmts, bindings })
+}
+
+/// A CommonJS module's body, with `module`, `exports`, `__filename` and
+/// `__dirname` defined first and `module.exports` captured last.
+fn wrap_commonjs(body: Vec<Stmt>, file: &str) -> Vec<Stmt> {
+    let dir = std::path::Path::new(file).parent().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default();
+    let head = format!(
+        "var module: any = {{ exports: {{}} }}; var exports: any = module.exports; const __filename = {:?}; const __dirname = {:?};",
+        file, dir
+    );
+    let tail = format!("const {} = module.exports;", "__rts_cjs_exports");
+    let parse = |src: &str| crate::parser::parse_program(crate::lexer::tokenize(src).expect("wrapper lexes")).expect("wrapper parses");
+    let mut out = parse(&head);
+    out.extend(body);
+    let mut t = parse(&tail);
+    // Rename to the hidden name programs can't spell.
+    if let StmtKind::Var { decls, .. } = &mut t[0].kind {
+        decls[0].pat = Pattern::Ident(CJS_EXPORTS.into(), Span::default());
+    }
+    out.extend(t);
+    out
 }
 
 fn declares(s: &Stmt, name: &str) -> bool {

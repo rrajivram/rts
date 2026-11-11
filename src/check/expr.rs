@@ -24,6 +24,13 @@ impl Checker {
         let span = e.span;
         Ok(match &e.kind {
             ExprKind::Await(x) => self.check_await(x, want, e.span)?,
+            ExprKind::Regex(src, flags) => {
+                if let Err(m) = crate::runtime::regexp::RegExp::new(src, flags) {
+                    return err(m, e.span);
+                }
+                let args = vec![HElem::Expr(HExpr::str(src)), HElem::Expr(HExpr::str(flags))];
+                self.native_call(Native::RegexNew, None, args, Type::RegExp)
+            }
             ExprKind::Yield { arg, delegate } => self.check_yield(arg.as_deref(), *delegate, e.span)?,
             ExprKind::Num(v) => HExpr::num(*v),
             ExprKind::BigInt(v) => HExpr::new(HK::BigInt(*v), Type::BigInt),
@@ -38,7 +45,7 @@ impl Checker {
             ExprKind::Array(elems) => self.check_array(elems, want, span)?,
             ExprKind::Object(props) => self.check_object(props, want, span)?,
             ExprKind::Func(f) => self.check_func_expr(f, want)?,
-            ExprKind::Class(_) => return err("class expressions are not supported yet", span),
+            ExprKind::Class(c) => self.check_class_expr(c, span)?,
             ExprKind::Unary(op, x) => self.check_unary(*op, x, span)?,
             ExprKind::Update { inc, prefix, target } => {
                 let place = self.check_place(target)?;
@@ -192,6 +199,61 @@ impl Checker {
         Ok(HExpr::new(HK::Yield(Box::new(h)), t))
     }
 
+    /// `class { … }` as an expression: declared in a scope of its own.
+    fn check_class_expr(&mut self, c: &Rc<crate::ast::ClassDecl>, span: Span) -> CResult<HExpr> {
+        let name: Name = c.name.clone().unwrap_or_else(|| "".into());
+        let scope = Scope::new(Some(self.ctx().scope.clone()), self.ctx().scope.owner);
+        let cid = self.declare_class(&name, c.clone(), &scope)?;
+        let saved = self.ctx().scope.clone();
+        self.ctx_mut().scope = scope.clone();
+        let r = (|| -> CResult<Vec<HStmt>> {
+            let mut decl = (**c).clone();
+            decl.name = Some(name.clone());
+            let stmt = crate::ast::Stmt {
+                kind: crate::ast::StmtKind::Class(Rc::new(decl)),
+                span,
+            };
+            let init = self.check_stmt(&stmt, None)?;
+            self.check_class_members(cid)?;
+            Ok(init)
+        })();
+        self.ctx_mut().scope = saved;
+        let init = r?;
+        let class_ref = HExpr::new(HK::ClassRef(cid), Type::ClassCtor(cid));
+        if init.is_empty() {
+            return Ok(class_ref);
+        }
+        // Static initializers run when the expression is evaluated.
+        Ok(HExpr::new(HK::StmtExpr(init, Box::new(class_ref)), Type::ClassCtor(cid)))
+    }
+
+    /// An enum used as a value: its run-time object (numeric members also
+    /// map back from value to name).
+    fn enum_object(&mut self, eid: u32, span: Span) -> CResult<HExpr> {
+        let members = self.enums[eid as usize].members.clone();
+        let mut props = Vec::new();
+        let lit = |kind: ExprKind| Expr { kind, span };
+        for (m, v) in &members {
+            if let EnumVal::Num(x) = v {
+                props.push(ObjProp::Init {
+                    key: PropKey::Name(crate::runtime::num_to_string(*x).into()),
+                    value: lit(ExprKind::Str(m.clone())),
+                });
+            }
+        }
+        for (m, v) in &members {
+            props.push(ObjProp::Init {
+                key: PropKey::Name(m.clone()),
+                value: lit(match v {
+                    EnumVal::Num(x) => ExprKind::Num(*x),
+                    EnumVal::Str(s) => ExprKind::Str(s.clone()),
+                }),
+            });
+        }
+        let h = self.check_expr(&lit(ExprKind::Object(props)), None)?;
+        Ok(h)
+    }
+
     fn check_template(&mut self, quasis: &[Name], exprs: &[Expr]) -> CResult<HExpr> {
         if exprs.is_empty() {
             return Ok(HExpr::new(HK::Str(quasis[0].clone()), Type::StrLit(quasis[0].clone())));
@@ -230,7 +292,6 @@ impl Checker {
             "undefined" => return Ok(HExpr::undefined()),
             "NaN" => return Ok(HExpr::num(f64::NAN)),
             "Infinity" => return Ok(HExpr::num(f64::INFINITY)),
-            "arguments" => return err("'arguments' is not supported; use rest parameters", span),
             _ => {}
         }
         match self.lookup_val(n) {
@@ -265,7 +326,7 @@ impl Checker {
                 Ok(HExpr::read(Place::Var(v), ty))
             }
             Some(VB::Class(c)) => Ok(HExpr::new(HK::ClassRef(c), Type::ClassCtor(c))),
-            Some(VB::Enum(_)) => err(format!("enum '{n}' can only be used to access its members"), span),
+            Some(VB::Enum(eid)) => self.enum_object(eid, span),
             Some(VB::Builtin(ns)) => match ns {
                 BuiltinNs::String => Ok(HExpr::new(HK::NativeFn(Native::StringFn), Type::Func(global_fn_type(Native::StringFn)))),
                 BuiltinNs::Number => Ok(HExpr::new(HK::NativeFn(Native::NumberFn), Type::Func(global_fn_type(Native::NumberFn)))),
@@ -274,6 +335,8 @@ impl Checker {
             },
             Some(VB::NativeFn(f)) => Ok(HExpr::new(HK::NativeFn(f), Type::Func(global_fn_type(f)))),
             Some(VB::Namespace(m)) => self.namespace_object(m, span),
+            None if &**n == "process" => Ok(self.native_call(Native::ProcessObject, None, vec![], Type::Any)),
+            None if &**n == "globalThis" => Ok(self.native_call(Native::GlobalThis, None, vec![], Type::Any)),
             None => err(format!("cannot find name '{n}'"), span),
         }
     }
@@ -368,15 +431,58 @@ impl Checker {
         let keep_literals = want.is_some();
         let mut hs = Vec::new();
         let mut out_props: Vec<Prop> = Vec::new();
+        let mut computed: Vec<Type> = Vec::new();
         for p in props {
             match p {
+                ObjProp::Accessor { key, is_get, func } => {
+                    let this_ty = want.cloned().unwrap_or(Type::Any);
+                    let scope = self.ctx().scope.clone();
+                    let fid = self.new_func(key.clone(), Some(func.clone()), FnKind::ObjMethod, None, None, scope, Some(this_ty));
+                    self.ensure_checked(fid)?;
+                    let ft = self.func_type(fid)?;
+                    let ty = if *is_get { ft.ret.clone() } else { ft.params.first().map_or(Type::Any, |p| p.ty.clone()) };
+                    let closure = HExpr::new(HK::Closure(fid), Type::Func(ft));
+                    // Merge with the other half of a get/set pair.
+                    let existing = hs.iter_mut().find_map(|h| match h {
+                        HProp::Accessor { name, get, set } if name == key => Some((get, set)),
+                        _ => None,
+                    });
+                    match existing {
+                        Some((get, set)) => {
+                            if *is_get {
+                                *get = Some(closure);
+                            } else {
+                                *set = Some(closure);
+                            }
+                        }
+                        None => {
+                            let (get, set) = if *is_get { (Some(closure), None) } else { (None, Some(closure)) };
+                            hs.push(HProp::Accessor { name: key.clone(), get, set });
+                        }
+                    }
+                    if !out_props.iter().any(|q| &q.name == key) || *is_get {
+                        out_props.retain(|q| &q.name != key);
+                        out_props.push(Prop {
+                            name: key.clone(),
+                            ty,
+                            optional: false,
+                        });
+                    }
+                }
                 ObjProp::Init { key, value } => {
                     let name = match key {
                         PropKey::Name(n) => n.clone(),
                         PropKey::Computed(k) => match &k.kind {
                             ExprKind::Str(s) => s.clone(),
                             ExprKind::Num(n) => crate::runtime::num_to_string(*n).into(),
-                            _ => return err("computed property names are not supported yet", k.span),
+                            _ => {
+                                // A key known only at run time: the object gets an index signature.
+                                let hk = self.check_expr(k, None)?;
+                                let hv = self.check_expr(value, None)?;
+                                computed.push(hv.ty.widen());
+                                hs.push(HProp::Computed(hk, hv));
+                                continue;
+                            }
                         },
                     };
                     let ctx = want_obj
@@ -424,11 +530,17 @@ impl Checker {
             }
         }
         let _ = span;
+        let index = if computed.is_empty() {
+            None
+        } else {
+            computed.extend(out_props.iter().map(|p| p.ty.clone()));
+            Some(Type::union(computed))
+        };
         Ok(HExpr::new(
             HK::Object(hs),
             Type::Object(Rc::new(ObjType {
                 props: out_props,
-                index: None,
+                index,
                 call: None,
             })),
         ))
@@ -692,7 +804,7 @@ impl Checker {
                 ExprKind::Ident(n) => match self.lookup_val(n) {
                     Some(VB::Class(c)) => Ok(HExpr::new(HK::InstanceOf(Box::new(ha), c), Type::Boolean)),
                     Some(VB::Builtin(BuiltinNs::Array)) => Ok(self.native_call(Native::ArrIsArray, None, vec![HElem::Expr(ha)], Type::Boolean)),
-                    Some(VB::Builtin(BuiltinNs::Promise | BuiltinNs::MapCtor | BuiltinNs::SetCtor | BuiltinNs::Object)) | None
+                    Some(VB::Builtin(BuiltinNs::Promise | BuiltinNs::MapCtor | BuiltinNs::SetCtor | BuiltinNs::Object | BuiltinNs::RegExp)) | None
                         if matches!(&**n, "Promise" | "Map" | "Set" | "Object" | "Function" | "Date" | "RegExp" | "Symbol") =>
                     {
                         let args = vec![HElem::Expr(ha), HElem::Expr(HExpr::str(n))];
@@ -902,7 +1014,7 @@ impl Checker {
                     });
                 }
                 Some(VB::Class(cid)) => return self.static_member(cid, prop, span),
-                None if matches!(&**n, "Date" | "performance" | "process") => {
+                None if matches!(&**n, "performance") => {
                     return err(format!("'{n}.{prop}' is only supported as a call"), span);
                 }
                 _ => {}
@@ -942,7 +1054,16 @@ impl Checker {
 
     /// `h.prop` for an already-checked receiver.
     pub fn member_read(&mut self, h: HExpr, prop: &Name, opt: bool, span: Span) -> CResult<HExpr> {
-        let t = h.ty.non_null();
+        let t = self.norm(&h.ty.non_null());
+        if let Type::Deferred(_) = t {
+            return Ok(HExpr::read(Place::Prop { obj: h, name: prop.clone(), opt }, Type::Any));
+        }
+        // `T extends { length: number }`: read through the constraint.
+        if let Type::Param(id) = &t
+            && let Some(c) = self.tparams[*id as usize].constraint.clone()
+        {
+            return self.member_read(h.cast(c), prop, opt, span);
+        }
         let wrap_opt = |ty: Type| if opt { Type::union([ty, Type::Undefined]) } else { ty };
         match &t {
             Type::Any => return Ok(HExpr::read(Place::Prop { obj: h, name: prop.clone(), opt }, Type::Any)),
@@ -952,6 +1073,22 @@ impl Checker {
             }
             Type::String | Type::StrLit(_) if &**prop == "length" => {
                 return Ok(HExpr::read(Place::StrLen { obj: h, opt }, wrap_opt(Type::Number)));
+            }
+            // Properties added to a function object (`assert.ok = ok`).
+            Type::Func(_) if !matches!(&**prop, "bind" | "call" | "apply") => {
+                return Ok(HExpr::read(Place::Prop { obj: h, name: prop.clone(), opt }, Type::Any));
+            }
+            Type::RegExp => {
+                let ty = match &**prop {
+                    "lastIndex" => Type::Number,
+                    "source" | "flags" => Type::String,
+                    "global" | "sticky" | "ignoreCase" | "multiline" | "unicode" | "dotAll" => Type::Boolean,
+                    _ => return err(format!("property '{prop}' does not exist on type 'RegExp'"), span),
+                };
+                return Ok(HExpr::read(Place::Prop { obj: h, name: prop.clone(), opt }, wrap_opt(ty)));
+            }
+            Type::Symbol if &**prop == "description" => {
+                return Ok(HExpr::read(Place::Prop { obj: h, name: prop.clone(), opt }, Type::union([Type::String, Type::Undefined])));
             }
             Type::Map(..) | Type::Set(_) if &**prop == "size" => {
                 let n = if matches!(t, Type::Map(..)) { Native::MapSize } else { Native::SetSize };
@@ -1070,7 +1207,13 @@ impl Checker {
     }
 
     fn index_read_opt(&mut self, h: HExpr, hi: HExpr, opt: bool, span: Span) -> CResult<HExpr> {
-        let t = h.ty.non_null();
+        let t = self.norm(&h.ty.non_null());
+        // Generic indexing (`obj[k]` with `k: K extends keyof T`): `T[K]`.
+        if matches!(t, Type::Param(_) | Type::Deferred(_)) || matches!(self.norm(&hi.ty), Type::Param(_)) {
+            let ty = self.norm(&Type::Deferred(Rc::new(Deferred::Index(t.clone(), hi.ty.clone()))));
+            let key = hi.cast(Type::Any);
+            return Ok(HExpr::read(Place::DynIndex { obj: h.cast(Type::Any), key, opt }, wrap_opt_ty(opt, ty)));
+        }
         let wrap_opt = |ty: Type| if opt { Type::union([ty, Type::Undefined]) } else { ty };
         let numeric = hi.ty.is_numeric();
         match &t {
@@ -1127,6 +1270,20 @@ impl Checker {
             ExprKind::Super => return self.check_super_call(args, span),
             ExprKind::Paren(inner) if matches!(inner.kind, ExprKind::Member { .. }) => {
                 return self.check_call(inner, targs, args, opt, span);
+            }
+            ExprKind::Member { obj, prop, .. } if opt && !matches!(obj.kind, ExprKind::Super) => {
+                // `o.f?.()`: call only if `o.f` isn't nullish.
+                match self.check_expr(callee, None) {
+                    Ok(f) => return self.value_call(f, None, args, &explicit, opt, span),
+                    Err(e) => {
+                        // A built-in method (always present): an ordinary call.
+                        let recv = self.check_expr(obj, None)?;
+                        if self.builtin_method(&recv.ty.non_null(), prop).is_none() {
+                            return Err(e);
+                        }
+                        return self.method_call(recv, prop, false, args, &explicit, callee.span, span);
+                    }
+                }
             }
             ExprKind::Member { obj, prop, optional } => {
                 if let ExprKind::Super = obj.kind {
@@ -1192,6 +1349,10 @@ impl Checker {
                     let (hargs, ret, _) = self.check_args(&ft, args, &explicit, span)?;
                     return Ok(self.native_call(nat, None, hargs, ret));
                 }
+                Some(VB::Builtin(BuiltinNs::Symbol)) => {
+                    let hargs = self.untyped_args(args)?;
+                    return Ok(self.native_call(Native::SymbolFn, None, hargs, Type::Symbol));
+                }
                 Some(VB::Builtin(BuiltinNs::Array)) => {
                     let (hargs, _, _) = self.check_args(&global_fn_type(Native::ArrNew), args, &[], span)?;
                     return Ok(HExpr::new(HK::NewBuiltin(Native::ArrNew, hargs), Type::array(Type::Any)));
@@ -1245,7 +1406,7 @@ impl Checker {
         Ok(self.native_call(Native::ArrFrom, None, hargs, ret))
     }
 
-    fn direct_call(
+    pub fn direct_call(
         &mut self,
         f: FuncId,
         closure: Option<VarId>,
@@ -1693,9 +1854,31 @@ impl Checker {
         for t in targs {
             explicit.push(self.resolve_type(t)?);
         }
-        let ExprKind::Ident(n) = &callee.kind else {
-            return err("'new' is only supported with a class name", callee.span);
+        // A class held in a variable or reached through an expression:
+        // statically a known class, so construct it directly.
+        let as_class = match &callee.kind {
+            ExprKind::Ident(n) => !matches!(self.lookup_val(n), Some(VB::Var(_)) | None),
+            _ => false,
         };
+        if !as_class {
+            let h = self.check_expr(callee, None)?;
+            if let Type::ClassCtor(cid) = h.ty {
+                let hidden: Name = format!("\u{1}class{cid}").into();
+                self.module.vals.borrow_mut().insert(hidden.clone(), VB::Class(cid));
+                let alias = Expr {
+                    kind: ExprKind::Ident(hidden),
+                    span: callee.span,
+                };
+                return self.check_new(&alias, targs, args, want, span);
+            }
+            if let ExprKind::Ident(n) = &callee.kind
+                && self.lookup_val(n).is_none()
+            {
+                return err(format!("'{n}' is not a constructor (or is not supported yet)"), callee.span);
+            }
+            return err(format!("'new' needs a class; this expression has type '{}'", self.show(&h.ty)), callee.span);
+        }
+        let ExprKind::Ident(n) = &callee.kind else { unreachable!() };
         match self.lookup_val(n) {
             Some(VB::Class(cid)) => {
                 self.ensure_class(cid)?;
@@ -1721,6 +1904,10 @@ impl Checker {
                 let (hargs, _, subst) = self.check_args(&ft, args, &ex, span)?;
                 let targs: Vec<Type> = tps.iter().map(|t| subst.get(t).cloned().unwrap_or(Type::Any)).collect();
                 Ok(HExpr::new(HK::New { class: cid, args: hargs }, Type::Class(cid, targs.into())))
+            }
+            Some(VB::Builtin(BuiltinNs::RegExp)) => {
+                let hargs = self.untyped_args(args)?;
+                Ok(HExpr::new(HK::NewBuiltin(Native::RegexNew, hargs), Type::RegExp))
             }
             Some(VB::Builtin(BuiltinNs::Promise)) => {
                 let mut t = explicit.first().cloned();
@@ -1826,6 +2013,10 @@ impl Checker {
     }
 }
 
+fn wrap_opt_ty(opt: bool, ty: Type) -> Type {
+    if opt { Type::union([ty, Type::Undefined]) } else { ty }
+}
+
 pub fn contains_param(t: &Type) -> bool {
     match t {
         Type::Param(_) => true,
@@ -1834,6 +2025,9 @@ pub fn contains_param(t: &Type) -> bool {
         Type::Map(k, v) => contains_param(k) || contains_param(v),
         Type::Func(f) => f.params.iter().any(|p| contains_param(&p.ty)) || contains_param(&f.ret),
         Type::Object(o) => o.props.iter().any(|p| contains_param(&p.ty)),
+        Type::Promise(t) => contains_param(t),
+        Type::Iter(it) => contains_param(&it.yield_ty) || contains_param(&it.return_ty),
+        Type::Deferred(_) => true,
         _ => false,
     }
 }

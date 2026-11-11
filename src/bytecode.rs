@@ -344,6 +344,10 @@ pub enum Instruction {
     /// End the innermost `try` block.
     TryEnd,
 
+    /// Define accessor property `property` on a plain object (`getter` and
+    /// `setter` may be undefined).
+    DefineAccessor { object: ValSlot, property: u32, getter: ValSlot, setter: ValSlot },
+
     // ── iteration ──
     /// `output = value[Symbol.iterator]()` (generators and arrays iterate natively).
     GetIterator { value: ValSlot, output: ValSlot },
@@ -507,3 +511,4 @@ pub struct Program {
     pub range_error_class: Option<u32>,
     pub syntax_error_class: Option<u32>,
 }
+

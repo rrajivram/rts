@@ -92,6 +92,7 @@ pub enum BuiltinNs {
     SetCtor,
     Promise,
     Symbol,
+    RegExp,
 }
 
 /// Which iteration interface an `Iter` type is. They differ only in what
@@ -148,9 +149,24 @@ pub enum Type {
     Set(Rc<Type>),
     Builtin(BuiltinNs),
     Symbol,
+    RegExp,
     /// `Promise<T>` (never a promise of a promise: see `Type::promise`).
     Promise(Rc<Type>),
     Iter(Rc<IterType>),
+    /// A type computed from type parameters, evaluated once they are known
+    /// (see `Checker::norm`). Unevaluated, it behaves like `any`.
+    Deferred(Rc<Deferred>),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum Deferred {
+    KeyOf(Type),
+    /// `T[K]`
+    Index(Type, Type),
+    /// `{ [P in keys]: value }`; `param` is bound to each key in turn.
+    Mapped { param: TParamId, keys: Type, value: Type, optional: Option<bool> },
+    /// `check extends ext ? then : otherwise`, with `infer` parameters.
+    Cond { check: Type, ext: Type, then: Type, otherwise: Type, infers: Vec<TParamId> },
 }
 
 impl Type {
@@ -328,6 +344,10 @@ impl Type {
     }
 }
 
+fn d_<N: TypeNames>(t: &Type, n: &N) -> String {
+    format!("{}", Disp(t, n))
+}
+
 /// Display needs class/enum names; the checker supplies them.
 pub trait TypeNames {
     fn class_name(&self, id: ClassId) -> String;
@@ -414,6 +434,15 @@ impl<N: TypeNames> fmt::Display for Disp<'_, N> {
             Type::Set(t) => write!(f, "Set<{}>", d(t)),
             Type::Builtin(b) => write!(f, "{b:?}"),
             Type::Symbol => write!(f, "symbol"),
+            Type::Deferred(d) => match &**d {
+                Deferred::KeyOf(t) => write!(f, "keyof {}", d_(t, n)),
+                Deferred::Index(o, k) => write!(f, "{}[{}]", d_(o, n), d_(k, n)),
+                Deferred::Mapped { keys, value, .. } => write!(f, "{{ [P in {}]: {} }}", d_(keys, n), d_(value, n)),
+                Deferred::Cond { check, ext, then, otherwise, .. } => {
+                    write!(f, "{} extends {} ? {} : {}", d_(check, n), d_(ext, n), d_(then, n), d_(otherwise, n))
+                }
+            },
+            Type::RegExp => write!(f, "RegExp"),
             Type::Promise(t) => write!(f, "Promise<{}>", d(t)),
             Type::Iter(it) => {
                 let name = match it.kind {

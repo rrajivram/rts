@@ -33,6 +33,27 @@ pub enum TypeExpr {
     TypeOf(Name, Span),
     /// `keyof T`
     KeyOf(Box<TypeExpr>),
+    /// `T[K]`
+    Indexed(Box<TypeExpr>, Box<TypeExpr>),
+    /// `{ [K in Keys as N]?: V }` (`optional`/`readonly`: Some(true) adds, Some(false) removes)
+    Mapped {
+        param: Name,
+        keys: Box<TypeExpr>,
+        rename: Option<Box<TypeExpr>>,
+        value: Box<TypeExpr>,
+        optional: Option<bool>,
+    },
+    /// `C extends E ? T : F`
+    Conditional {
+        check: Box<TypeExpr>,
+        extends: Box<TypeExpr>,
+        then: Box<TypeExpr>,
+        otherwise: Box<TypeExpr>,
+    },
+    /// `infer U` (inside a conditional type's `extends`)
+    Infer(Name),
+    /// A template literal type: `` `id-${number}` ``
+    TemplateLit,
 }
 
 #[derive(Debug, Clone)]
@@ -133,6 +154,8 @@ pub enum ObjProp {
     /// `key: value`, shorthand `key` (value = Ident), and methods (value = Func).
     Init { key: PropKey, value: Expr },
     Spread(Expr),
+    /// `get key() {}` (is_get) or `set key(v) {}`
+    Accessor { key: Name, is_get: bool, func: Rc<Function> },
 }
 
 #[derive(Debug, Clone)]
@@ -141,6 +164,8 @@ pub enum ExprKind {
     /// `123n`
     BigInt(i128),
     Str(Name),
+    /// `/pattern/flags`
+    Regex(Name, Name),
     Template {
         quasis: Vec<Name>,
         exprs: Vec<Expr>,
@@ -391,6 +416,8 @@ pub enum StmtKind {
     Empty,
     Import(Rc<ImportDecl>),
     Export(Rc<ExportDecl>),
+    /// `namespace X { … }` (becomes a module of its own; see `module.rs`).
+    Namespace { name: Name, body: Vec<Stmt> },
 }
 
 // ───────────────────────────── modules ─────────────────────────────
@@ -534,6 +561,7 @@ fn visit_stmt(s: &mut Stmt, f: &mut dyn FnMut(&mut Expr)) {
                 }
             }
         }
+        StmtKind::Namespace { body, .. } => visit_exprs_mut(body, f),
         StmtKind::Break(_) | StmtKind::Continue(_) | StmtKind::Empty | StmtKind::Import(_) => {}
     }
 }
@@ -625,6 +653,7 @@ pub fn visit_expr(e: &mut Expr, f: &mut dyn FnMut(&mut Expr)) {
                         visit_expr(value, f);
                     }
                     ObjProp::Spread(x) => visit_expr(x, f),
+                    ObjProp::Accessor { func, .. } => visit_function(Rc::make_mut(func), f),
                 }
             }
         }
@@ -665,6 +694,7 @@ pub fn visit_expr(e: &mut Expr, f: &mut dyn FnMut(&mut Expr)) {
         ExprKind::Num(_)
         | ExprKind::BigInt(_)
         | ExprKind::Str(_)
+        | ExprKind::Regex(..)
         | ExprKind::Bool(_)
         | ExprKind::Null
         | ExprKind::This

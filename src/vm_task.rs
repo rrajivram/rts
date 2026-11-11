@@ -73,7 +73,7 @@ impl Vm {
     /// coroutine. `pc` is where it will continue.
     pub(super) fn suspend_top(&mut self, pc: usize) -> Frame {
         let fr = self.frames.pop().unwrap();
-        let co = fr.co.clone().expect("suspending a frame that is not a coroutine");
+        let co = self.pop_co(self.frames.len()).expect("suspending a frame that is not a coroutine");
         let f = fr.func.get();
         let fi = self.frames.len();
         let mut st = co.st.borrow_mut();
@@ -123,7 +123,10 @@ impl Vm {
             Some(top) => (top.scalar_base + top.func.get().scalar_slots, top.value_base + top.func.get().value_slots),
             None => (0, 0),
         };
-        self.ensure(sb, vb, &func);
+        if let Err(e) = self.ensure(sb, vb, &func) {
+            co.st.borrow_mut().status = CoStatus::Done;
+            return Err(e);
+        }
         self.scalars[sb..sb + scalars.len()].copy_from_slice(&scalars);
         for (i, v) in values.into_iter().enumerate() {
             self.values[vb + i] = v;
@@ -148,8 +151,8 @@ impl Vm {
             value_base: vb,
             closure,
             ret: Ret::Native,
-            co: Some(co.clone()),
         });
+        self.co_frames.push((fi, co.clone()));
         let r = self.run(fi);
         let mut st = co.st.borrow_mut();
         match r {
@@ -552,8 +555,8 @@ impl Vm {
                             Ok(v) => self.resolve_promise(&r, v),
                             Err(e) => self.reject_promise(&r, e),
                         }
-                    } else if let Err(e) = outcome {
-                        return Err(e);
+                    } else {
+                        outcome?;
                     }
                 }
                 Reaction::Resume(co) => {
@@ -843,6 +846,7 @@ pub fn call_task_native(vm: &mut Vm, n: Native, this: Value, args: Vec<Value>) -
                 "Map" => matches!(v, Value::Map(_)),
                 "Set" => matches!(v, Value::Set(_)),
                 "Function" => is_callable(&v),
+                "RegExp" => matches!(v, Value::Regex(_)),
                 "Object" => !matches!(v, Value::Undef | Value::Null | Value::Bool(_) | Value::Num(_) | Value::Str(_) | Value::BigInt(_) | Value::Symbol(_)),
                 _ => false,
             })
@@ -975,4 +979,116 @@ pub fn call_task_native(vm: &mut Vm, n: Native, this: Value, args: Vec<Value>) -
         }
         _ => unreachable!("not a task native: {n:?}"),
     })
+}
+
+/// What the run loop does after an instruction handled out of line.
+pub(super) enum Flow {
+    Next,
+    Jump(usize),
+    /// The top frame changed: reload it.
+    Switch,
+    /// The run loop's base frame finished or suspended.
+    Return,
+}
+
+impl Vm {
+    /// Instructions kept out of the interpreter loop so it stays small:
+    /// iteration, suspension, accessors. `pc` is the next instruction.
+    #[inline(never)]
+    pub(super) fn exec_extended(&mut self, fi: usize, pc: usize, sb: usize, vb: usize, stop: usize) -> Result<Flow, Value> {
+        let func = self.frames[fi].func.get();
+        let ins = func.code[pc - 1];
+        let val = |vm: &Vm, r: ValSlot| vm.values[vb + r.index()].clone();
+        let leave = |vm: &mut Vm, ret: Ret, out: Value| -> Result<Flow, Value> {
+            vm.deliver(ret, out)?;
+            Ok(if vm.frames.len() <= stop { Flow::Return } else { Flow::Switch })
+        };
+        match ins {
+            Instruction::DefineAccessor { object, property, getter, setter } => {
+                let site = &func.property_sites[property as usize];
+                let args = vec![val(self, object), Value::Str(JsStr::new(&*site.name)), val(self, getter), val(self, setter)];
+                call_native(self, Native::ObjDefineAccessor, Value::Undef, args)?;
+            }
+            Instruction::GetIterator { value, output } => {
+                let it = self.get_iterator(&val(self, value))?;
+                self.values[vb + output.index()] = it;
+            }
+            Instruction::GetAsyncIterator { value, output, is_sync } => {
+                let (it, sync) = self.get_async_iterator(&val(self, value))?;
+                self.values[vb + output.index()] = it;
+                self.scalars[sb + is_sync.index()] = sync as u64;
+            }
+            Instruction::IteratorStep { iterator, output, to } => match self.iterator_step(&val(self, iterator))? {
+                Some(x) => self.values[vb + output.index()] = x,
+                None => return Ok(Flow::Jump(to as usize)),
+            },
+            Instruction::IteratorNextResult { iterator, output } => {
+                let r = self.iterator_next_result(&val(self, iterator))?;
+                self.values[vb + output.index()] = r;
+            }
+            Instruction::UnpackIteratorResult { result, output, to } => match self.unpack_result(&val(self, result))? {
+                Some(x) => self.values[vb + output.index()] = x,
+                None => return Ok(Flow::Jump(to as usize)),
+            },
+            Instruction::IteratorClose { iterator } => self.iterator_close(&val(self, iterator))?,
+            Instruction::IteratorResume { iterator, mode, value, output, done } => {
+                let m = match from_bits(self.scalars[sb + mode.index()]) as u8 {
+                    0 => Resume::Next,
+                    1 => Resume::Throw,
+                    _ => Resume::Return,
+                };
+                let (x, d) = self.iterator_resume(&val(self, iterator), m, val(self, value))?;
+                self.values[vb + output.index()] = x;
+                self.scalars[sb + done.index()] = d as u64;
+            }
+            Instruction::CreateGenerator => {
+                let kind = if func.is_async { CoKind::AsyncGenerator } else { CoKind::Generator };
+                let co = Coroutine::new(kind, func.id, self.frames[fi].closure.clone());
+                self.co_frames.push((fi, co.clone()));
+                let fr = self.suspend_top(pc);
+                co.st.borrow_mut().status = CoStatus::Start;
+                return leave(self, fr.ret, Value::Gen(co));
+            }
+            Instruction::StartAsync => {
+                let co = Coroutine::new(CoKind::Async, func.id, self.frames[fi].closure.clone());
+                {
+                    let mut st = co.st.borrow_mut();
+                    st.status = CoStatus::Running;
+                    st.promise = Some(Promise::new());
+                }
+                self.co_frames.push((fi, co));
+            }
+            Instruction::Yield { value, .. } => {
+                let x = val(self, value);
+                let co = self.frame_co(fi).expect("yield outside a generator");
+                let fr = self.suspend_top(pc);
+                let out = if co.kind == CoKind::AsyncGenerator {
+                    let req = co.st.borrow_mut().queue.pop_front();
+                    if let Some((_, _, p)) = req {
+                        self.resolve_promise(&p, iter_result(x, false));
+                    }
+                    Value::Undef
+                } else {
+                    x
+                };
+                return leave(self, fr.ret, out);
+            }
+            Instruction::Await { value, .. } => {
+                let x = val(self, value);
+                let co = self.frame_co(fi).expect("await outside an async function");
+                let p = self.promise_of(x);
+                let fr = self.suspend_top(pc);
+                co.st.borrow_mut().awaiting = true;
+                self.promise_react(&p, Reaction::Resume(co.clone()));
+                // The first `await` of an async call returns its promise to the caller.
+                let out = match &co.st.borrow().promise {
+                    Some(p) => Value::Promise(p.clone()),
+                    None => Value::Undef,
+                };
+                return leave(self, fr.ret, out);
+            }
+            _ => unreachable!("not an extended instruction"),
+        }
+        Ok(Flow::Next)
+    }
 }

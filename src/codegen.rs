@@ -1568,6 +1568,12 @@ impl FnGen<'_, '_> {
                 self.emit(Instruction::LoadConstant { output: ValSlot(d), constant: kk });
                 Op { k: Kind::Val, r: d }
             }
+            HK::StmtExpr(stmts, x) => {
+                for st in stmts {
+                    self.stmt(st);
+                }
+                self.expr(x)
+            }
             HK::Await(x) => {
                 let v = self.expr(x);
                 let v = self.coerce(v, Kind::Val);
@@ -1682,6 +1688,35 @@ impl FnGen<'_, '_> {
                                 let o = self.expr(x);
                                 let o = self.coerce(o, Kind::Val);
                                 self.emit(Instruction::SpreadIntoObject { object: ValSlot(d), source: ValSlot(o.r) });
+                            }
+                            HProp::Computed(k, x) => {
+                                let k = self.expr(k);
+                                let k = self.coerce(k, Kind::Val);
+                                let o = self.expr(x);
+                                let o = self.coerce(o, Kind::Val);
+                                self.emit(Instruction::WriteDynamic { object: ValSlot(d), key: ValSlot(k.r), value: ValSlot(o.r) });
+                            }
+                            HProp::Accessor { name, get, set } => {
+                                let slot = |g: &mut Self, f: &Option<HExpr>| match f {
+                                    Some(f) => {
+                                        let o = g.expr(f);
+                                        g.coerce(o, Kind::Val).r
+                                    }
+                                    None => {
+                                        let r = g.alloc_v();
+                                        g.emit(Instruction::LoadUndefined { output: ValSlot(r) });
+                                        r
+                                    }
+                                };
+                                let getter = slot(self, get);
+                                let setter = slot(self, set);
+                                let ps = self.prop_site(name);
+                                self.emit(Instruction::DefineAccessor {
+                                    object: ValSlot(d),
+                                    property: ps,
+                                    getter: ValSlot(getter),
+                                    setter: ValSlot(setter),
+                                });
                             }
                         }
                         self.reset(m);
@@ -3236,11 +3271,12 @@ fn collect_nums_expr(e: &HExpr, out: &mut Vec<f64>, hir: &HProgram) {
         HK::Object(ps) => {
             for p in ps {
                 match p {
-                    HProp::Init(_, x) | HProp::Spread(x) => collect_nums_expr(x, out, hir),
+                    HProp::Init(_, x) | HProp::Spread(x) | HProp::Computed(_, x) => collect_nums_expr(x, out, hir),
+                    HProp::Accessor { .. } => {}
                 }
             }
         }
-        HK::Unary(_, x) | HK::Cast(x) | HK::OptChain(x) | HK::InstanceOf(x, _) | HK::Await(x) | HK::Yield(x) | HK::YieldStar(x) => {
+        HK::StmtExpr(_, x) | HK::Unary(_, x) | HK::Cast(x) | HK::OptChain(x) | HK::InstanceOf(x, _) | HK::Await(x) | HK::Yield(x) | HK::YieldStar(x) => {
             collect_nums_expr(x, out, hir)
         }
         HK::Binary(_, a, b) | HK::Logical(_, a, b) | HK::Delete(a, b) => {

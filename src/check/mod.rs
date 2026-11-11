@@ -108,6 +108,8 @@ pub struct FuncDef {
     pub free: Vec<VarId>,
     pub this_ty: Option<Type>,
     pub span: Span,
+    /// Checked without types (declared in a JavaScript file, or `--no-types`).
+    pub erase: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -140,6 +142,8 @@ pub struct ClassDef {
     pub resolved: bool,
     pub is_abstract: bool,
     pub prelude_error: bool,
+    /// Declared in a JavaScript file (or `--no-types`): fields are `any`.
+    pub erase: bool,
 }
 
 pub struct IfaceDef {
@@ -313,6 +317,7 @@ pub fn check_program(prelude: &[ast::Stmt], program: &crate::module::ModuleGraph
         free: vec![],
         this_ty: None,
         span: Span::default(),
+        erase,
     });
     c.stack.push(FnCtx {
         func: MAIN,
@@ -557,10 +562,41 @@ impl Checker {
             TypeExpr::BoolLit(b) => Type::BoolLit(*b),
             TypeExpr::KeyOf(t) => {
                 let t = self.resolve_type_in(t, scope)?;
-                match self.obj_view(&t) {
-                    Some(o) if o.index.is_none() => Type::union(o.props.iter().map(|p| Type::StrLit(p.name.clone()))),
-                    _ => Type::String,
-                }
+                self.norm(&Type::Deferred(Rc::new(Deferred::KeyOf(t))))
+            }
+            TypeExpr::Indexed(o, k) => {
+                let o = self.resolve_type_in(o, scope)?;
+                let k = self.resolve_type_in(k, scope)?;
+                self.norm(&Type::Deferred(Rc::new(Deferred::Index(o, k))))
+            }
+            TypeExpr::TemplateLit => Type::String,
+            TypeExpr::Infer(name) => match self.lookup_type_in(scope, name) {
+                Some(TB::TParam(id)) => Type::Param(id),
+                _ => Type::Any,
+            },
+            TypeExpr::Mapped { param, keys, rename, value, optional } => {
+                let keys = self.resolve_type_in(keys, scope)?;
+                let ms = Scope::new(Some(scope.clone()), scope.owner);
+                let id = self.new_tparam(param, None);
+                ms.types.borrow_mut().insert(param.clone(), TB::TParam(id));
+                let _ = rename;
+                let value = self.resolve_type_in(value, &ms)?;
+                self.norm(&Type::Deferred(Rc::new(Deferred::Mapped { param: id, keys, value, optional: *optional })))
+            }
+            TypeExpr::Conditional { check, extends, then, otherwise } => {
+                let check = self.resolve_type_in(check, scope)?;
+                // `infer X` declares X for the true branch.
+                let cs = Scope::new(Some(scope.clone()), scope.owner);
+                let mut infers = Vec::new();
+                collect_infers(extends, &mut |n| {
+                    let id = self.new_tparam(n, None);
+                    cs.types.borrow_mut().insert(n.into(), TB::TParam(id));
+                    infers.push(id);
+                });
+                let ext = self.resolve_type_in(extends, &cs)?;
+                let then = self.resolve_type_in(then, &cs)?;
+                let otherwise = self.resolve_type_in(otherwise, scope)?;
+                self.norm(&Type::Deferred(Rc::new(Deferred::Cond { check, ext, then, otherwise, infers })))
             }
             TypeExpr::TypeOf(name, span) => {
                 // Only simple variables are supported.
@@ -647,8 +683,10 @@ impl Checker {
             "never" => Type::Never,
             "object" | "Object" | "Function" | "this" => Type::Any,
             "Array" | "ReadonlyArray" => Type::array(arg(0)),
-            "Map" | "ReadonlyMap" => Type::Map(Rc::new(arg(0)), Rc::new(arg(1))),
-            "Set" | "ReadonlySet" => Type::Set(Rc::new(arg(0))),
+            "Map" | "ReadonlyMap" | "WeakMap" => Type::Map(Rc::new(arg(0)), Rc::new(arg(1))),
+            "Set" | "ReadonlySet" | "WeakSet" => Type::Set(Rc::new(arg(0))),
+            "TemplateStringsArray" => Type::Any,
+            "PropertyKey" => Type::union([Type::String, Type::Number, Type::Symbol]),
             "Record" => Type::Object(Rc::new(ObjType {
                 props: match arg(0) {
                     Type::Union(ts) if ts.iter().all(|t| matches!(t, Type::StrLit(_))) => ts
@@ -704,6 +742,8 @@ impl Checker {
             "Promise" | "PromiseLike" => Type::promise(arg(0)),
             "Awaited" => arg(0).awaited(),
             "symbol" | "Symbol" => Type::Symbol,
+            "RegExp" => Type::RegExp,
+            "RegExpMatchArray" | "RegExpExecArray" => Type::Any,
             "Generator" | "AsyncGenerator" => Type::iter(IterKind::Generator, name.starts_with("Async"), arg(0), arg(1), arg(2)),
             "Iterator" | "AsyncIterator" => Type::iter(IterKind::Iterator, name.starts_with("Async"), arg(0), arg(1), arg(2)),
             "IterableIterator" | "AsyncIterableIterator" | "IteratorObject" | "ArrayIterator" | "MapIterator" | "SetIterator" => {
@@ -757,7 +797,135 @@ impl Checker {
             .enumerate()
             .map(|(i, t)| (*t, targs.get(i).cloned().unwrap_or(Type::Any)))
             .collect();
-        Ok(self.subst(&base, &map))
+        let t = self.subst(&base, &map);
+        Ok(self.norm(&t))
+    }
+
+    /// Evaluate deferred types (`keyof`, `T[K]`, mapped and conditional
+    /// types) whose parameters are now known; leave the rest deferred.
+    pub fn norm(&mut self, t: &Type) -> Type {
+        match t {
+            Type::Deferred(d) => self.eval_deferred(d).unwrap_or_else(|| t.clone()),
+            Type::Union(ts) => {
+                if !ts.iter().any(|t| matches!(t, Type::Deferred(_))) {
+                    return t.clone();
+                }
+                let ts = ts.clone();
+                Type::union(ts.iter().map(|t| self.norm(t)))
+            }
+            t => t.clone(),
+        }
+    }
+
+    fn eval_deferred(&mut self, d: &Deferred) -> Option<Type> {
+        use crate::check::expr::contains_param;
+        match d {
+            Deferred::KeyOf(t) => {
+                let t = self.norm(t);
+                if contains_param(&t) {
+                    return None;
+                }
+                Some(match &t {
+                    Type::Any => Type::union([Type::String, Type::Number, Type::Symbol]),
+                    Type::Array(_) | Type::Tuple(_) => Type::Number,
+                    t => match self.obj_view(t) {
+                        Some(o) if o.index.is_none() => Type::union(o.props.iter().map(|p| Type::StrLit(p.name.clone()))),
+                        _ => Type::String,
+                    },
+                })
+            }
+            Deferred::Index(o, k) => {
+                let (o, k) = (self.norm(o), self.norm(k));
+                if contains_param(&o) || contains_param(&k) {
+                    return None;
+                }
+                let mut out = Vec::new();
+                for key in k.members() {
+                    out.push(match (&o, &key) {
+                        (Type::Any, _) => Type::Any,
+                        (Type::Array(e), Type::Number | Type::NumLit(_)) => (**e).clone(),
+                        (Type::Tuple(ts), Type::NumLit(i)) => ts.get(*i as usize).cloned().unwrap_or(Type::Undefined),
+                        (Type::Tuple(ts), Type::Number) => Type::union(ts.iter().cloned()),
+                        (_, Type::StrLit(name)) => {
+                            let ov = self.obj_view(&o)?;
+                            match ov.prop(name) {
+                                Some(p) => p.ty.clone(),
+                                None => ov.index.clone().unwrap_or(Type::Any),
+                            }
+                        }
+                        (_, Type::String | Type::Number) => self.obj_view(&o).and_then(|ov| ov.index.clone()).unwrap_or(Type::Any),
+                        _ => Type::Any,
+                    });
+                }
+                Some(Type::union(out))
+            }
+            Deferred::Mapped { param, keys, value, optional } => {
+                // `[K in keyof T]` keeps each property's `?` unless modified.
+                let source = match keys {
+                    Type::Deferred(d) => match &**d {
+                        Deferred::KeyOf(t) => {
+                            let t = self.norm(t);
+                            self.obj_view(&t)
+                        }
+                        _ => None,
+                    },
+                    _ => None,
+                };
+                let keys = self.norm(keys);
+                if contains_param(&keys) {
+                    return None;
+                }
+                let mut props = Vec::new();
+                let mut index = None;
+                for key in keys.members() {
+                    let map: FxHashMap<TParamId, Type> = [(*param, key.clone())].into_iter().collect();
+                    let v = self.subst(value, &map);
+                    let v = self.norm(&v);
+                    match key {
+                        Type::StrLit(name) => {
+                            let was = source.as_ref().and_then(|o| o.prop(&name)).is_some_and(|p| p.optional);
+                            let opt = optional.unwrap_or(was);
+                            let v = if *optional == Some(false) { v.non_null() } else { v };
+                            props.push(Prop {
+                                name,
+                                ty: if opt && *optional == Some(true) { Type::union([v, Type::Undefined]) } else { v },
+                                optional: opt,
+                            });
+                        }
+                        Type::NumLit(n) => props.push(Prop {
+                            name: crate::runtime::num_to_string(n).into(),
+                            ty: v,
+                            optional: *optional == Some(true),
+                        }),
+                        _ => index = Some(v),
+                    }
+                }
+                Some(Type::Object(Rc::new(ObjType { props, index, call: None })))
+            }
+            Deferred::Cond { check, ext, then, otherwise, infers } => {
+                let check = self.norm(check);
+                if contains_param(&check) {
+                    return None;
+                }
+                if matches!(check, Type::Any) {
+                    return Some(Type::union([then.clone(), otherwise.clone()]));
+                }
+                // Distributes over unions.
+                let mut out = Vec::new();
+                for c in check.members() {
+                    let mut sub: FxHashMap<TParamId, Type> = FxHashMap::default();
+                    self.infer(ext, &c, infers, &mut sub);
+                    for i in infers {
+                        sub.entry(*i).or_insert(Type::Unknown);
+                    }
+                    let ext_c = self.subst(ext, &sub);
+                    let ext_c = self.norm(&ext_c);
+                    let branch = if self.assignable(&c, &ext_c) { self.subst(then, &sub) } else { otherwise.clone() };
+                    out.push(self.norm(&branch));
+                }
+                Some(Type::union(out))
+            }
+        }
     }
 
     pub fn iface_obj(&mut self, id: u32) -> Rc<ObjType> {
@@ -807,6 +975,10 @@ impl Checker {
 
     /// Structural view of a type (object literal types, interfaces, classes).
     pub fn obj_view(&mut self, t: &Type) -> Option<Rc<ObjType>> {
+        if let Type::Deferred(_) = t {
+            let n = self.norm(t);
+            return if matches!(n, Type::Deferred(_)) { None } else { self.obj_view(&n) };
+        }
         match t {
             Type::Object(o) => Some(o.clone()),
             Type::Iface(id, args) => {
@@ -907,6 +1079,23 @@ impl Checker {
             Type::Map(k, v) => Type::Map(Rc::new(self.subst(k, map)), Rc::new(self.subst(v, map))),
             Type::Set(k) => Type::Set(Rc::new(self.subst(k, map))),
             Type::Promise(t) => Type::promise(self.subst(t, map)),
+            Type::Deferred(d) => Type::Deferred(Rc::new(match &**d {
+                Deferred::KeyOf(t) => Deferred::KeyOf(self.subst(t, map)),
+                Deferred::Index(o, k) => Deferred::Index(self.subst(o, map), self.subst(k, map)),
+                Deferred::Mapped { param, keys, value, optional } => Deferred::Mapped {
+                    param: *param,
+                    keys: self.subst(keys, map),
+                    value: self.subst(value, map),
+                    optional: *optional,
+                },
+                Deferred::Cond { check, ext, then, otherwise, infers } => Deferred::Cond {
+                    check: self.subst(check, map),
+                    ext: self.subst(ext, map),
+                    then: self.subst(then, map),
+                    otherwise: self.subst(otherwise, map),
+                    infers: infers.clone(),
+                },
+            })),
             Type::Iter(it) => Type::iter(
                 it.kind,
                 it.is_async,
@@ -940,6 +1129,14 @@ impl Checker {
     pub fn assignable(&mut self, src: &Type, dst: &Type) -> bool {
         if src == dst {
             return true;
+        }
+        if matches!(src, Type::Deferred(_)) || matches!(dst, Type::Deferred(_)) {
+            let (s, d) = (self.norm(src), self.norm(dst));
+            // Still unknown: allowed, as with `any`.
+            if matches!(s, Type::Deferred(_)) || matches!(d, Type::Deferred(_)) {
+                return true;
+            }
+            return self.assignable(&s, &d);
         }
         match (src, dst) {
             (_, Type::Any) | (Type::Any, _) | (_, Type::Unknown) | (Type::Never, _) => return true,
@@ -1124,6 +1321,7 @@ impl Checker {
         let id = self.funcs.len() as FuncId;
         let span = ast.as_ref().map_or(Span::default(), |a| a.span);
         let parent = scope.owner;
+        let ast = ast.map(with_arguments_object);
         self.funcs.push(FuncDef {
             name,
             ast,
@@ -1141,6 +1339,7 @@ impl Checker {
             free: vec![],
             this_ty,
             span,
+            erase: self.erase,
         });
         id
     }
@@ -1155,14 +1354,17 @@ impl Checker {
         let s = Scope::new(Some(base.clone()), Some(f));
         let mut ids = Vec::new();
         if let Some(a) = fd.ast.clone() {
+            // Declare them all first: a constraint may name another (`K extends keyof T`).
             for tp in &a.tparams {
-                let c = match &tp.constraint {
-                    Some(c) => Some(self.resolve_type_in(c, &base)?),
-                    None => None,
-                };
-                let id = self.new_tparam(&tp.name, c);
+                let id = self.new_tparam(&tp.name, None);
                 s.types.borrow_mut().insert(tp.name.clone(), TB::TParam(id));
                 ids.push(id);
+            }
+            for (tp, id) in a.tparams.iter().zip(&ids) {
+                if let Some(c) = &tp.constraint {
+                    let c = self.resolve_type_in(c, &s)?;
+                    self.tparams[*id as usize].constraint = Some(c);
+                }
             }
         }
         let fd = &mut self.funcs[f as usize];
@@ -1210,7 +1412,7 @@ impl Checker {
             if p.optional && p.default.is_none() {
                 ty = Type::union([ty, Type::Undefined]);
             }
-            if self.erase {
+            if self.funcs[f as usize].erase {
                 ty = if p.rest { Type::array(Type::Any) } else { Type::Any };
             }
             out.push(FParam {
@@ -1258,7 +1460,7 @@ impl Checker {
             self.funcs[f as usize].ret = Some(Type::Void);
             return Ok(Type::Void);
         }
-        if self.erase {
+        if self.funcs[f as usize].erase {
             self.funcs[f as usize].ret = Some(Type::Any);
             return Ok(Type::Any);
         }
@@ -1304,7 +1506,9 @@ impl Checker {
             return Ok(());
         }
         self.funcs[f as usize].state = State::Checking;
+        let saved = std::mem::replace(&mut self.erase, self.funcs[f as usize].erase);
         let r = self.check_func_body(f);
+        self.erase = saved;
         self.funcs[f as usize].state = State::Done;
         r
     }
@@ -1627,6 +1831,13 @@ impl Checker {
             return Ok(());
         }
         self.classes[cid as usize].resolved = true;
+        let saved_erase = std::mem::replace(&mut self.erase, self.classes[cid as usize].erase);
+        let r = self.ensure_class_inner(cid);
+        self.erase = saved_erase;
+        r
+    }
+
+    fn ensure_class_inner(&mut self, cid: ClassId) -> CResult<()> {
         let decl = self.classes[cid as usize].decl.clone();
         let cscope = self.classes[cid as usize].cscope.clone();
         let tparams = self.classes[cid as usize].tparams.clone();
@@ -1988,6 +2199,121 @@ impl Checker {
             range_error_class,
         })
     }
+}
+
+/// Names introduced by `infer X` in a conditional type's `extends` clause.
+fn collect_infers(t: &TypeExpr, f: &mut dyn FnMut(&str)) {
+    match t {
+        TypeExpr::Infer(n) => f(n),
+        TypeExpr::Array(x) | TypeExpr::KeyOf(x) => collect_infers(x, f),
+        TypeExpr::Tuple(ts) | TypeExpr::Union(ts) | TypeExpr::Intersection(ts) => ts.iter().for_each(|x| collect_infers(x, f)),
+        TypeExpr::Ref { args, .. } => args.iter().for_each(|x| collect_infers(x, f)),
+        TypeExpr::Func { params, ret, .. } => {
+            params.iter().filter_map(|p| p.ty.as_ref()).for_each(|x| collect_infers(x, f));
+            collect_infers(ret, f);
+        }
+        TypeExpr::Object(ms) => {
+            for m in ms {
+                if let ast::TypeMember::Prop { ty, .. } = m {
+                    collect_infers(ty, f);
+                }
+            }
+        }
+        TypeExpr::Indexed(a, b) => {
+            collect_infers(a, f);
+            collect_infers(b, f);
+        }
+        _ => {}
+    }
+}
+
+/// A non-arrow function that reads `arguments` gets a hidden rest parameter
+/// and `const arguments = [p1, p2, ...rest]` at the top of its body.
+fn with_arguments_object(f: Rc<ast::Function>) -> Rc<ast::Function> {
+    use ast::*;
+    if f.is_arrow || !matches!(f.body, Some(Body::Block(_))) {
+        return f;
+    }
+    let mut uses = false;
+    let mut body = match &f.body {
+        Some(Body::Block(b)) => b.clone(),
+        _ => unreachable!(),
+    };
+    // Only this function's own `arguments` (arrows inherit it, functions don't).
+    fn scan(stmts: &mut [Stmt], uses: &mut bool) {
+        visit_exprs_mut(stmts, &mut |e| {
+            if let ExprKind::Ident(n) = &e.kind
+                && &**n == "arguments"
+            {
+                *uses = true;
+            }
+            if let ExprKind::Func(g) = &e.kind
+                && !g.is_arrow
+            {
+                // Hide nested functions from the scan.
+                e.kind = ExprKind::Null;
+            }
+        });
+    }
+    let mut probe = body.clone();
+    probe.retain(|s| !matches!(s.kind, StmtKind::Func(_) | StmtKind::Class(_)));
+    scan(&mut probe, &mut uses);
+    if !uses || !f.params.iter().all(|p| matches!(p.pat, Pattern::Ident(..))) {
+        return f;
+    }
+    let span = f.span;
+    let mut f2 = (*f).clone();
+    let mut elems: Vec<ArrayElem> = Vec::new();
+    for p in &f2.params {
+        let Pattern::Ident(n, _) = &p.pat else { unreachable!() };
+        let id = Expr {
+            kind: ExprKind::Ident(n.clone()),
+            span,
+        };
+        elems.push(if p.rest { ArrayElem::Spread(id) } else { ArrayElem::Expr(id) });
+    }
+    if !f2.params.iter().any(|p| p.rest) {
+        let rest: Name = "\u{1}args".into();
+        f2.params.push(Param {
+            pat: Pattern::Ident(rest.clone(), span),
+            ty: Some(TypeExpr::Array(Box::new(TypeExpr::Ref {
+                name: "any".into(),
+                args: vec![],
+                span,
+            }))),
+            optional: false,
+            default: None,
+            rest: true,
+            property: false,
+            span,
+        });
+        elems.push(ArrayElem::Spread(Expr {
+            kind: ExprKind::Ident(rest),
+            span,
+        }));
+    }
+    let decl = Stmt {
+        kind: StmtKind::Var {
+            kind: VarKind::Const,
+            decls: vec![VarDeclarator {
+                pat: Pattern::Ident("arguments".into(), span),
+                ty: Some(TypeExpr::Array(Box::new(TypeExpr::Ref {
+                    name: "any".into(),
+                    args: vec![],
+                    span,
+                }))),
+                init: Some(Expr {
+                    kind: ExprKind::Array(elems),
+                    span,
+                }),
+            }],
+            declare: false,
+        },
+        span,
+    };
+    body.insert(0, decl);
+    f2.body = Some(Body::Block(body));
+    Rc::new(f2)
 }
 
 /// `IteratorResult<T, TReturn>`: `{ done: false, value: T } | { done: true, value: TReturn }`.

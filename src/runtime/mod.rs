@@ -4,6 +4,7 @@
 
 pub mod bigint;
 pub mod natives;
+pub mod regexp;
 pub mod task;
 
 use std::cell::RefCell;
@@ -71,17 +72,21 @@ pub enum ArrStore {
 #[derive(Debug)]
 pub struct Array {
     pub store: RefCell<ArrStore>,
+    /// Named properties of the array (regex match results' `index`, `input`).
+    pub props: RefCell<Option<Rc<Object>>>,
 }
 
 impl Array {
     pub fn new_num(v: Vec<f64>) -> Rc<Array> {
         Rc::new(Array {
             store: RefCell::new(ArrStore::Num(v)),
+            props: RefCell::new(None),
         })
     }
     pub fn new_val(v: Vec<Value>) -> Rc<Array> {
         Rc::new(Array {
             store: RefCell::new(ArrStore::Val(v)),
+            props: RefCell::new(None),
         })
     }
     pub fn len(&self) -> usize {
@@ -155,6 +160,9 @@ pub struct Shape {
     pub keys: Vec<Rc<str>>,
     map: FxHashMap<Rc<str>, u32>,
     transitions: RefCell<FxHashMap<Rc<str>, Rc<Shape>>>,
+    /// Objects of this shape have no prototype (`Object.create(null)`,
+    /// regex match `groups`); only printing cares.
+    pub null_proto: bool,
 }
 
 impl Shape {
@@ -164,6 +172,16 @@ impl Shape {
             keys,
             map,
             transitions: Default::default(),
+            null_proto: false,
+        })
+    }
+    pub fn new_null_proto(keys: Vec<Rc<str>>) -> Rc<Shape> {
+        let map = keys.iter().enumerate().map(|(i, k)| (k.clone(), i as u32)).collect();
+        Rc::new(Shape {
+            keys,
+            map,
+            transitions: Default::default(),
+            null_proto: true,
         })
     }
     pub fn lookup(&self, name: &str) -> Option<u32> {
@@ -279,6 +297,8 @@ impl ClassRt {
 pub struct Closure {
     pub func: u32,
     pub caps: Box<[Rc<RefCell<Value>>]>,
+    /// Properties assigned to the function (`assert.ok = ok`).
+    pub props: RefCell<Option<Rc<Object>>>,
 }
 
 /// Hash key with SameValueZero semantics (for Map and Set).
@@ -350,6 +370,9 @@ pub enum Value {
     Promise(Rc<task::Promise>),
     /// A built-in iterator (`arr.values()`, `map.entries()`, …).
     Iter(Rc<task::NativeIter>),
+    Regex(Rc<regexp::RegExp>),
+    /// The slot of an accessor property (never a variable's value).
+    Accessor(Rc<task::Accessor>),
 }
 
 const _: () = assert!(std::mem::size_of::<Value>() == 16);
@@ -390,6 +413,8 @@ impl Value {
             Value::Gen(g) => Rc::as_ptr(g) as *const () as usize,
             Value::Promise(p) => Rc::as_ptr(p) as *const () as usize,
             Value::Iter(i) => Rc::as_ptr(i) as *const () as usize,
+            Value::Regex(r) => Rc::as_ptr(r) as *const () as usize,
+            Value::Accessor(a) => Rc::as_ptr(a) as *const () as usize,
             _ => 0,
         }
     }
@@ -457,6 +482,11 @@ impl Value {
                 1 => a.get(0).to_number(),
                 _ => f64::NAN,
             },
+            // A Date is its time value.
+            Value::Obj(o) if o.class.as_ref().is_some_and(|c| &*c.name == "Date") => match o.get("t") {
+                Some(Value::Num(t)) => t,
+                _ => f64::NAN,
+            },
             _ => f64::NAN,
         }
     }
@@ -517,17 +547,13 @@ impl Value {
             Value::Gen(_) => "[object Generator]".into(),
             Value::Promise(_) => "[object Promise]".into(),
             Value::Iter(i) => format!("[object {}]", i.kind),
+            Value::Regex(r) => r.display(),
+            Value::Accessor(_) => "[Getter/Setter]".into(),
             Value::Class(c) => format!("class {} {{ }}", c.name),
             Value::Map(_) => "[object Map]".into(),
             Value::Set(_) => "[object Set]".into(),
             Value::Cell(c) => c.borrow().to_display(),
         }
-    }
-}
-
-impl Value {
-    fn to_display_with(self, f: impl FnOnce(&Value) -> String) -> String {
-        f(&self)
     }
 }
 
@@ -539,6 +565,23 @@ pub fn symbol_key_display(key_body: &str) -> String {
         _ => key_body,
     };
     format!("Symbol({desc})")
+}
+
+/// `Date.prototype.toISOString` for time `t` (ms since the epoch).
+pub fn iso_time(t: f64) -> String {
+    let days = (t / 86400000.0).floor() as i64;
+    let rem = (t - days as f64 * 86400000.0) as i64;
+    let z = days + 719468;
+    let era = z.div_euclid(146097);
+    let doe = z - era * 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + i64::from(m <= 2);
+    let year = if (0..=9999).contains(&y) { format!("{y:04}") } else { format!("{}{:06}", if y < 0 { "-" } else { "+" }, y.abs()) };
+    format!("{year}-{m:02}-{d:02}T{:02}:{:02}:{:02}.{:03}Z", rem / 3600000, rem / 60000 % 60, rem / 1000 % 60, rem % 1000)
 }
 
 pub fn str_to_number(s: &str) -> f64 {
@@ -619,11 +662,16 @@ pub fn num_to_string(x: f64) -> String {
 /// A port of the parts of Node's `util.inspect` that console.log uses
 /// (breakLength 80, compact 3, depth 2).
 pub fn inspect(v: &Value, funcs: &dyn Fn(u32) -> Rc<str>) -> String {
+    inspect_with_depth(v, funcs, 2)
+}
+
+pub fn inspect_with_depth(v: &Value, funcs: &dyn Fn(u32) -> Rc<str>, max_depth: usize) -> String {
     let mut cx = Insp {
         indent: 0,
         cur_depth: 0,
         seen: Vec::new(),
         funcs,
+        max_depth,
     };
     match v {
         Value::Str(s) => s.s.to_string(),
@@ -636,6 +684,7 @@ struct Insp<'a> {
     cur_depth: usize,
     seen: Vec<usize>,
     funcs: &'a dyn Fn(u32) -> Rc<str>,
+    max_depth: usize,
 }
 
 fn quote_str(s: &str) -> String {
@@ -669,7 +718,7 @@ fn quote_str(s: &str) -> String {
 
 fn key_str(k: &str) -> String {
     if let Some(name) = k.strip_prefix(task::SYMBOL_PREFIX) {
-        return format!("[{}]", symbol_key_display(name));
+        return symbol_key_display(name);
     }
     let ident = !k.is_empty()
         && !k.chars().next().unwrap().is_ascii_digit()
@@ -700,6 +749,11 @@ impl Insp<'_> {
             Value::Class(c) => format!("[class {}]", c.name),
             Value::Symbol(s) => format!("Symbol({})", s.description.as_deref().unwrap_or("")),
             Value::Iter(i) => format!("Object [{}] {{}}", i.kind),
+            Value::Accessor(a) => match (matches!(a.get, Value::Undef), matches!(a.set, Value::Undef)) {
+                (false, false) => "[Getter/Setter]".into(),
+                (false, true) => "[Getter]".into(),
+                _ => "[Setter]".into(),
+            },
             Value::Gen(g) => match g.kind {
                 task::CoKind::AsyncGenerator => "Object [AsyncGenerator] {}".into(),
                 _ => "Object [Generator] {}".into(),
@@ -707,8 +761,8 @@ impl Insp<'_> {
             Value::Promise(p) => {
                 let inner = match &*p.state.borrow() {
                     task::PromiseState::Pending(_) => "<pending>".to_string(),
-                    task::PromiseState::Fulfilled(v) => v.clone().to_display_with(|v| self.value(v, depth + 1)),
-                    task::PromiseState::Rejected(v) => format!("<rejected> {}", v.clone().to_display_with(|v| self.value(v, depth + 1))),
+                    task::PromiseState::Fulfilled(v) => self.value(&v.clone(), depth + 1),
+                    task::PromiseState::Rejected(v) => format!("<rejected> {}", self.value(&v.clone(), depth + 1)),
                 };
                 format!("Promise {{ {inner} }}")
             }
@@ -729,7 +783,15 @@ impl Insp<'_> {
         if self.seen.contains(&id) {
             return "[Circular *1]".into();
         }
-        if depth > 2 {
+        // A Date prints as its ISO time.
+        if let Value::Obj(o) = v
+            && let Some(c) = &o.class
+            && &*c.name == "Date"
+            && let Some(Value::Num(t)) = o.get("t")
+        {
+            return if t.is_nan() { "Invalid Date".into() } else { iso_time(t) };
+        }
+        if depth > self.max_depth {
             return match v {
                 Value::Arr(_) => "[Array]".into(),
                 Value::Obj(o) => match &o.class {
@@ -751,6 +813,14 @@ impl Insp<'_> {
                 if vals.len() > 100 {
                     out.push(format!("... {} more item{}", vals.len() - 100, if vals.len() - 100 > 1 { "s" } else { "" }));
                 }
+                if let Some(p) = &*a.props.borrow() {
+                    self.indent += 2;
+                    for k in p.keys() {
+                        let x = p.get(&k).unwrap_or(Value::Undef);
+                        out.push(format!("{}: {}", key_str(&k), self.value(&x, depth + 1)));
+                    }
+                    self.indent -= 2;
+                }
                 let numeric = vals.iter().all(|x| matches!(x, Value::Num(_)));
                 (String::new(), ("[", "]"), out, true, numeric)
             }
@@ -760,14 +830,14 @@ impl Insp<'_> {
                     (inner.shape.keys.clone(), inner.vals.clone())
                 };
                 self.indent += 2;
-                let out: Vec<String> = keys
-                    .iter()
-                    .zip(vals.iter())
-                    .map(|(k, x)| format!("{}: {}", key_str(k), self.value(x, depth + 1)))
-                    .collect();
+                // Symbol keys print after the others.
+                let mut pairs: Vec<(&Rc<str>, &Value)> = keys.iter().zip(vals.iter()).collect();
+                pairs.sort_by_key(|(k, _)| task::is_symbol_key(k));
+                let out: Vec<String> = pairs.into_iter().map(|(k, x)| format!("{}: {}", key_str(k), self.value(x, depth + 1))).collect();
                 self.indent -= 2;
                 let base = match &o.class {
                     Some(c) => c.name.to_string(),
+                    None if o.inner.borrow().shape.null_proto => "[Object: null prototype]".to_string(),
                     None => String::new(),
                 };
                 (base, ("{", "}"), out, false, false)

@@ -208,3 +208,11 @@ impl NativeIter {
         self.items[i.min(self.items.len())..].to_vec()
     }
 }
+
+/// An accessor property of a plain object (`{ get x() {…} }`), stored in the
+/// property's slot. Reading or writing the property calls `get` / `set`.
+#[derive(Debug)]
+pub struct Accessor {
+    pub get: Value,
+    pub set: Value,
+}

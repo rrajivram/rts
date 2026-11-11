@@ -70,12 +70,25 @@ natives! {
     ClearTimeout = "clearTimeout", QueueMicrotask = "queueMicrotask", NextTick = "nextTick",
     FunctionBind = "bind", FunctionCall = "call", FunctionApply = "apply",
     SymbolWellKnown = "", IsInstanceOfBuiltin = "",
+    RegexNew = "RegExp", RegexTest = "test", RegexExec = "exec", StrMatch = "match", StrMatchAll = "matchAll",
+    StrSearch = "search", ObjRest = "", ObjDefineAccessor = "", SymbolToString = "toString",
+    TemplateObject = "", StructuredClone = "structuredClone", ArrToSorted = "toSorted",
+    ArrToReversed = "toReversed", ArrWith = "with", GlobalThis = "",
+    // Node (src/node/natives.rs)
+    ProcessObject = "", ProcessExit = "exit", ProcessCwd = "cwd", ProcessChdir = "chdir", StdoutWrite = "write",
+    StderrWrite = "write", HrtimeBigint = "bigint", FsReadFile = "readFileSync", FsWriteFile = "writeFileSync",
+    FsAppendFile = "appendFileSync", FsExists = "existsSync", FsMkdir = "mkdirSync", FsReaddir = "readdirSync",
+    FsStat = "statSync", FsUnlink = "unlinkSync", FsRm = "rmSync", FsRename = "renameSync", FsCopy = "copyFileSync",
+    FsRealpath = "realpathSync", OsInfo = "", UtilFormat = "format", UtilInspect = "inspect", EnvObject = "",
+    DateNowMs = "now", DateOffset = "", DateZoneName = "", DateParse = "parse", DeepEqual = "isDeepStrictEqual",
+    ObjectIs = "is", EncodeUriComponent = "encodeURIComponent", EncodeUri = "encodeURI",
+    DecodeUriComponent = "decodeURIComponent", DecodeUri = "decodeURI", NoOp = "",
 }
 
 impl Native {
     /// Implemented in `vm_task.rs` (generators, promises, timers, functions).
     pub fn is_task(self) -> bool {
-        (self as u16) >= (Native::GenNext as u16)
+        (Native::GenNext as u16..=Native::IsInstanceOfBuiltin as u16).contains(&(self as u16))
     }
 }
 
@@ -406,7 +419,8 @@ fn contains_bigint(v: &Value, depth: usize) -> bool {
 pub fn json_stringify(v: &Value, indent: &str, cur: &str, out: &mut String) -> bool {
     match v {
         Value::Undef | Value::Func(_) | Value::Native(_) | Value::Class(_) | Value::Bound(_) | Value::Symbol(_) => return false,
-        Value::Gen(_) | Value::Promise(_) | Value::Iter(_) => out.push_str("{}"),
+        Value::Gen(_) | Value::Promise(_) | Value::Iter(_) | Value::Regex(_) => out.push_str("{}"),
+        Value::Accessor(_) => return false,
         // JSON.stringify checks for BigInts (a TypeError) before getting here.
         Value::BigInt(n) => out.push_str(&n.to_string()),
         Value::Null => out.push_str("null"),
@@ -445,6 +459,10 @@ pub fn json_stringify(v: &Value, indent: &str, cur: &str, out: &mut String) -> b
             }
             out.push(']');
         }
+        Value::Obj(o) if o.class.as_ref().is_some_and(|c| &*c.name == "Date") => match o.get("t") {
+            Some(Value::Num(t)) if t.is_finite() => json_quote(&iso_time(t), out),
+            _ => out.push_str("null"),
+        },
         Value::Obj(o) => {
             let (keys, vals) = {
                 let i = o.inner.borrow();
@@ -667,6 +685,9 @@ fn object_keys(o: &Object) -> Vec<Rc<str>> {
     let mut ints: Vec<(u32, Rc<str>)> = Vec::new();
     let mut rest = Vec::new();
     for k in keys {
+        if task::is_symbol_key(&k) {
+            continue;
+        }
         match k.parse::<u32>() {
             Ok(n) if n.to_string() == *k => ints.push((n, k)),
             _ => rest.push(k),
@@ -716,12 +737,9 @@ pub fn call_native(vm: &mut Vm, n: Native, this: Value, args: Vec<Value>) -> NRe
     }
     Ok(match n {
         n if n.is_task() => return crate::vm::call_task_native(vm, n, this, args),
+        n if (n as u16) >= (ProcessObject as u16) => return crate::node::natives::call_more(vm, n, args),
         ConsoleLog | ConsoleError | ConsoleWarn => {
-            let line = args
-                .iter()
-                .map(|a| vm.inspect(a))
-                .collect::<Vec<_>>()
-                .join(" ");
+            let line = crate::node::natives::format_args(vm, &args);
             if n == ConsoleLog {
                 vm.print(&line);
             } else {
@@ -755,7 +773,8 @@ pub fn call_native(vm: &mut Vm, n: Native, this: Value, args: Vec<Value>) -> NRe
         IsFinite => Value::Bool(num(&args, 0).is_finite()),
         StringFn => match args.first() {
             None => Value::str(""),
-            Some(v) => Value::Str(v.to_js_string()),
+            Some(Value::Symbol(sym)) => Value::str(format!("Symbol({})", sym.description.as_deref().unwrap_or(""))),
+            Some(v) => Value::Str(vm.to_string_value(v)?),
         },
         NumberFn => Value::Num(args.first().map_or(0.0, |v| v.to_number())),
         BooleanFn => Value::Bool(arg(&args, 0).truthy()),
@@ -943,6 +962,7 @@ pub fn call_native(vm: &mut Vm, n: Native, this: Value, args: Vec<Value>) -> NRe
             };
             let parts: Vec<Value> = match args.first() {
                 None | Some(Value::Undef) => vec![Value::Str(s.clone())],
+                Some(Value::Regex(re)) => regex_split(re, &s),
                 Some(sep) => {
                     let sep = sep.to_js_string();
                     if sep.s.is_empty() {
@@ -980,6 +1000,14 @@ pub fn call_native(vm: &mut Vm, n: Native, this: Value, args: Vec<Value>) -> NRe
                     Value::str(format!("{}{pad}", s.s))
                 }
             }
+        }
+        StrReplace | StrReplaceAll if matches!(args.first(), Some(Value::Regex(_))) => {
+            let Some(Value::Regex(re)) = args.first() else { unreachable!() };
+            if n == StrReplaceAll && !re.global {
+                return te(vm, "replaceAll must be called with a global RegExp".into());
+            }
+            let s = this_str(&this);
+            regex_replace(vm, re, &s, &arg(&args, 1))?
         }
         StrReplace | StrReplaceAll => {
             let s = this_str(&this);
@@ -1146,6 +1174,34 @@ pub fn call_native(vm: &mut Vm, n: Native, this: Value, args: Vec<Value>) -> NRe
             Value::str(s)
         }
         ArrToString => Value::str(this.to_display()),
+        ArrToSorted | ArrToReversed | ArrWith => {
+            let a = arr_of(&this).or_else(|m| te(vm, m))?;
+            let copy = Value::Arr(make_array(a.to_vec()));
+            match n {
+                ArrToSorted => call_native(vm, ArrSort, copy, args)?,
+                ArrToReversed => call_native(vm, ArrReverse, copy, vec![])?,
+                _ => {
+                    let len = a.len();
+                    let i = int_arg(&args, 0, 0.0);
+                    let i = if i < 0.0 { len as f64 + i } else { i };
+                    if i < 0.0 || i >= len as f64 {
+                        return Err(vm.range_error(format!("Invalid index : {}", num_to_string(int_arg(&args, 0, 0.0)))));
+                    }
+                    set_dyn(&copy, &Value::Num(i), arg(&args, 1));
+                    copy
+                }
+            }
+        }
+        StructuredClone => deep_clone(&arg(&args, 0)),
+        GlobalThis => {
+            let names = ["setTimeout", "setInterval", "clearTimeout", "clearInterval", "queueMicrotask", "structuredClone"];
+            let fns = [SetTimeout, SetInterval, ClearTimeout, ClearTimeout, QueueMicrotask, StructuredClone];
+            Value::Obj(Object::new(
+                Shape::new(names.iter().map(|n| Rc::from(*n)).collect()),
+                fns.iter().map(|f| Value::Native(*f)).collect(),
+                None,
+            ))
+        }
         ArrReverse => {
             let a = arr_of(&this).or_else(|m| te(vm, m))?;
             match &mut *a.store.borrow_mut() {
@@ -1520,11 +1576,215 @@ pub fn call_native(vm: &mut Vm, n: Native, this: Value, args: Vec<Value>) -> NRe
                 .map_or(0.0, |d| d.as_millis() as f64),
         ),
         PerfNow => Value::Num(vm.start.elapsed().as_secs_f64() * 1000.0),
+        RegexNew => {
+            let (src, flags) = match (arg(&args, 0), arg(&args, 1)) {
+                (Value::Regex(r), Value::Undef) => (r.source.to_string(), r.flags.to_string()),
+                (Value::Regex(r), f) => (r.source.to_string(), f.to_js_string().s.to_string()),
+                (s, Value::Undef) => (if matches!(s, Value::Undef) { String::new() } else { s.to_js_string().s.to_string() }, String::new()),
+                (s, f) => (s.to_js_string().s.to_string(), f.to_js_string().s.to_string()),
+            };
+            match regexp::RegExp::new(&src, &flags) {
+                Ok(r) => Value::Regex(Rc::new(r)),
+                Err(m) => return Err(vm.syntax_error(m)),
+            }
+        }
+        RegexTest | RegexExec => {
+            let Value::Regex(re) = &this else {
+                return te(vm, format!("RegExp.prototype.{} called on incompatible receiver", n.name()));
+            };
+            let s = arg(&args, 0).to_js_string();
+            let m = regexp::exec(re, &s);
+            match (n, m) {
+                (RegexTest, m) => Value::Bool(m.is_some()),
+                (_, Some(m)) => regexp::match_array(re, &s, &m),
+                (_, None) => Value::Null,
+            }
+        }
+        StrMatch => {
+            let s = this_str(&this);
+            let re = match arg(&args, 0) {
+                Value::Regex(r) => r,
+                v => Rc::new(regexp::RegExp::new(&v.to_js_string().s, "").map_err(|m| vm.syntax_error(m))?),
+            };
+            if re.global {
+                let mut out = Vec::new();
+                let mut at = 0;
+                while let Some(m) = re.match_at(&s.s, at) {
+                    let (a, b) = m.groups[0].unwrap();
+                    out.push(Value::str(&s.s[a..b]));
+                    at = if a == b { b + s.s[b..].chars().next().map_or(1, |c| c.len_utf8()) } else { b };
+                }
+                re.last_index.set(0);
+                if out.is_empty() { Value::Null } else { Value::Arr(Array::new_val(out)) }
+            } else {
+                match re.match_at(&s.s, 0) {
+                    Some(m) => regexp::match_array(&re, &s, &m),
+                    None => Value::Null,
+                }
+            }
+        }
+        StrMatchAll => {
+            let s = this_str(&this);
+            let re = match arg(&args, 0) {
+                Value::Regex(r) if !r.global => return te(vm, "String.prototype.matchAll called with a non-global RegExp argument".into()),
+                Value::Regex(r) => r,
+                v => Rc::new(regexp::RegExp::new(&v.to_js_string().s, "g").map_err(|m| vm.syntax_error(m))?),
+            };
+            let mut out = Vec::new();
+            let mut at = 0;
+            while let Some(m) = re.match_at(&s.s, at) {
+                let (a, b) = m.groups[0].unwrap();
+                out.push(regexp::match_array(&re, &s, &m));
+                at = if a == b { b + s.s[b..].chars().next().map_or(1, |c| c.len_utf8()) } else { b };
+                if at > s.s.len() {
+                    break;
+                }
+            }
+            Value::Iter(task::NativeIter::new("RegExp String Iterator", out))
+        }
+        StrSearch => {
+            let s = this_str(&this);
+            let re = match arg(&args, 0) {
+                Value::Regex(r) => r,
+                v => Rc::new(regexp::RegExp::new(&v.to_js_string().s, "").map_err(|m| vm.syntax_error(m))?),
+            };
+            match re.match_at(&s.s, 0) {
+                Some(m) => Value::Num(regexp::utf16_of(&s.s, m.groups[0].unwrap().0) as f64),
+                None => Value::Num(-1.0),
+            }
+        }
+        SymbolToString => match &this {
+            Value::Symbol(sym) => Value::str(format!("Symbol({})", sym.description.as_deref().unwrap_or(""))),
+            _ => Value::Undef,
+        },
+        TemplateObject => {
+            // (n, cooked strings…, raw strings…): the strings array of a tagged template.
+            let n = arg(&args, 0).to_number() as usize;
+            let cooked = Array::new_val(args[1..1 + n].to_vec());
+            let raw = Value::Arr(Array::new_val(args[1 + n..].to_vec()));
+            *cooked.props.borrow_mut() = Some(Object::new(Shape::new(vec!["raw".into()]), vec![raw], None));
+            Value::Arr(cooked)
+        }
+        ObjRest => {
+            let src = arg(&args, 0);
+            let skip: Vec<Rc<JsStr>> = args[1..].iter().map(|k| k.to_js_string()).collect();
+            let mut keys = Vec::new();
+            let mut vals = Vec::new();
+            for k in keys_of(&src) {
+                let ks = k.to_js_string();
+                if skip.iter().any(|s| s.s == ks.s) {
+                    continue;
+                }
+                vals.push(get_dyn(&src, &k));
+                keys.push(Rc::<str>::from(&*ks.s));
+            }
+            Value::Obj(Object::new(Shape::new(keys), vals, None))
+        }
+        ObjDefineAccessor => {
+            // (object, name, getter, setter): merge with an existing accessor.
+            let Value::Obj(o) = arg(&args, 0) else { unreachable!() };
+            let name: Rc<str> = (&*arg(&args, 1).to_js_string().s).into();
+            let (mut get, mut set) = (arg(&args, 2), arg(&args, 3));
+            if let Some(Value::Accessor(a)) = o.get(&name) {
+                if matches!(get, Value::Undef) {
+                    get = a.get.clone();
+                }
+                if matches!(set, Value::Undef) {
+                    set = a.set.clone();
+                }
+            }
+            o.set(&name, Value::Accessor(Rc::new(task::Accessor { get, set })));
+            Value::Undef
+        }
         _ => unreachable!(),
     })
 }
 
 /// Build an array, choosing numeric storage when every element is a number.
+fn regex_split(re: &regexp::RegExp, s: &Rc<JsStr>) -> Vec<Value> {
+    let text = &s.s;
+    if text.is_empty() {
+        return if re.match_at(text, 0).is_some() { vec![] } else { vec![Value::Str(s.clone())] };
+    }
+    let mut out = Vec::new();
+    let (mut last, mut at) = (0usize, 0usize);
+    while at < text.len() {
+        let Some(m) = re.match_at(text, at) else { break };
+        let (ms, me) = m.groups[0].unwrap();
+        if me == ms && ms >= text.len() {
+            break;
+        }
+        if me == last || (me == ms && ms == last) {
+            at = ms + text[ms..].chars().next().map_or(1, |c| c.len_utf8());
+            if me == ms {
+                continue;
+            }
+        }
+        out.push(Value::str(&text[last..ms]));
+        for g in &m.groups[1..] {
+            out.push(g.map_or(Value::Undef, |(a, b)| Value::str(&text[a..b])));
+        }
+        last = me;
+        at = if me == ms { me + text[me..].chars().next().map_or(1, |c| c.len_utf8()) } else { me };
+    }
+    out.push(Value::str(&text[last..]));
+    out
+}
+
+fn regex_replace(vm: &mut Vm, re: &Rc<regexp::RegExp>, s: &Rc<JsStr>, rep: &Value) -> NResult {
+    let text = &s.s;
+    let mut out = String::new();
+    let mut last = 0usize;
+    let mut at = if re.sticky { regexp::byte_of(text, re.last_index.get()) } else { 0 };
+    while let Some(m) = re.match_at(text, at) {
+        let (ms, me) = m.groups[0].unwrap();
+        out.push_str(&text[last..ms]);
+        if crate::vm::is_callable(rep) {
+            let mut a: Vec<Value> = m.groups.iter().map(|g| g.map_or(Value::Undef, |(x, y)| Value::str(&text[x..y]))).collect();
+            a.push(Value::Num(regexp::utf16_of(text, ms) as f64));
+            a.push(Value::Str(s.clone()));
+            let r = vm.call(rep, Value::Undef, a)?;
+            out.push_str(&r.to_js_string().s);
+        } else {
+            out.push_str(&regexp::expand(&rep.to_js_string().s, text, &m, &re.names));
+        }
+        last = me;
+        if !re.global {
+            break;
+        }
+        at = if me == ms { me + text[me..].chars().next().map_or(1, |c| c.len_utf8()) } else { me };
+        if at > text.len() {
+            break;
+        }
+    }
+    if re.global || re.sticky {
+        re.last_index.set(0);
+    }
+    out.push_str(&text[last.min(text.len())..]);
+    Ok(Value::str(out))
+}
+
+/// `structuredClone`: a deep copy of plain data.
+fn deep_clone(v: &Value) -> Value {
+    match v {
+        Value::Arr(a) => Value::Arr(make_array(a.to_vec().iter().map(deep_clone).collect())),
+        Value::Obj(o) if o.class.is_none() => {
+            let keys = o.keys();
+            let vals = keys.iter().map(|k| deep_clone(&o.get(k).unwrap_or(Value::Undef))).collect();
+            Value::Obj(Object::new(Shape::new(keys), vals, None))
+        }
+        Value::Map(m) => {
+            let copy: IndexMap<HKey, Value, rustc_hash::FxBuildHasher> = m.borrow().iter().map(|(k, x)| (HKey(deep_clone(&k.0)), deep_clone(x))).collect();
+            Value::Map(Rc::new(std::cell::RefCell::new(copy)))
+        }
+        Value::Set(s) => {
+            let copy: IndexSet<HKey, rustc_hash::FxBuildHasher> = s.borrow().iter().map(|k| HKey(deep_clone(&k.0))).collect();
+            Value::Set(Rc::new(std::cell::RefCell::new(copy)))
+        }
+        v => v.clone(),
+    }
+}
+
 pub fn make_array(vals: Vec<Value>) -> Rc<Array> {
     if !vals.is_empty() && vals.iter().all(|v| matches!(v, Value::Num(_))) {
         Array::new_num(vals.iter().map(|v| v.to_number()).collect())
@@ -1567,8 +1827,29 @@ pub fn get_dyn(o: &Value, k: &Value) -> Value {
             {
                 return Value::Num(a.len() as f64);
             }
+            if let Some(p) = &*a.props.borrow() {
+                return p.get(&k.to_js_string().s).unwrap_or(Value::Undef);
+            }
             Value::Undef
         }
+        Value::Symbol(sym) if &*k.to_js_string().s == "description" => match &sym.description {
+            Some(d) => Value::Str(JsStr::new(&**d)),
+            None => Value::Undef,
+        },
+        Value::Func(f) => match &*f.props.borrow() {
+            Some(p) => p.get(&k.to_js_string().s).unwrap_or(Value::Undef),
+            None => Value::Undef,
+        },
+        Value::Regex(r) => match &*k.to_js_string().s {
+            "source" => Value::Str(JsStr::new(&*r.source)),
+            "flags" => Value::Str(JsStr::new(&*r.flags)),
+            "lastIndex" => Value::Num(r.last_index.get() as f64),
+            "global" => Value::Bool(r.global),
+            "sticky" => Value::Bool(r.sticky),
+            "ignoreCase" => Value::Bool(r.flags.contains('i')),
+            "multiline" => Value::Bool(r.flags.contains('m')),
+            _ => Value::Undef,
+        },
         Value::Str(s) => {
             if let Some(i) = as_index(k) {
                 return if i < s.len16() { Value::str(s.slice16(i, i + 1)) } else { Value::Undef };
@@ -1607,6 +1888,16 @@ pub fn get_dyn(o: &Value, k: &Value) -> Value {
 /// `obj[key] = v` for dynamic receivers. Returns false if not settable.
 pub fn set_dyn(o: &Value, k: &Value, v: Value) -> bool {
     match o {
+        Value::Func(f) => {
+            let key: Rc<str> = (&*k.to_js_string().s).into();
+            let mut props = f.props.borrow_mut();
+            props.get_or_insert_with(|| Object::new(Shape::new(vec![]), vec![], None)).set(&key, v);
+            true
+        }
+        Value::Regex(r) if &*k.to_js_string().s == "lastIndex" => {
+            r.last_index.set(v.to_number().max(0.0) as usize);
+            true
+        }
         Value::Arr(a) => {
             if let Some(i) = as_index(k) {
                 a.set(i, v);
@@ -1623,6 +1914,7 @@ pub fn set_dyn(o: &Value, k: &Value, v: Value) -> bool {
         Value::Obj(ob) => {
             let key: Rc<str> = match k {
                 Value::Str(s) => (&*s.s).into(),
+                Value::Symbol(sym) => sym.key.clone(),
                 k => k.to_display().into(),
             };
             ob.set(&key, v);
@@ -1640,13 +1932,13 @@ pub fn method_by_name(recv: &Value, name: &str) -> Option<Native> {
             ArrPush, ArrPop, ArrShift, ArrUnshift, ArrSlice, ArrSplice, ArrConcat, ArrJoin, ArrReverse, ArrIndexOf,
             ArrLastIndexOf, ArrIncludes, ArrMap, ArrFilter, ArrForEach, ArrReduce, ArrReduceRight, ArrFind,
             ArrFindIndex, ArrFindLast, ArrFindLastIndex, ArrSome, ArrEvery, ArrSort, ArrFill, ArrAt, ArrFlat,
-            ArrFlatMap, ArrToString, ArrKeys, ArrEntries,
+            ArrFlatMap, ArrToString, ArrKeys, ArrEntries, ArrToSorted, ArrToReversed, ArrWith,
         ],
         Value::Str(_) => &[
             StrCharAt, StrCharCodeAt, StrCodePointAt, StrIndexOf, StrLastIndexOf, StrIncludes, StrStartsWith,
             StrEndsWith, StrSlice, StrSubstring, StrSubstr, StrToUpper, StrToLower, StrTrim, StrTrimStart,
             StrTrimEnd, StrSplit, StrRepeat, StrPadStart, StrPadEnd, StrReplace, StrReplaceAll, StrConcat, StrAt,
-            StrLocaleCompare, StrToString, StrNormalize,
+            StrLocaleCompare, StrToString, StrNormalize, StrMatch, StrMatchAll, StrSearch,
         ],
         Value::Num(_) => &[NumToFixed, NumToString, NumToPrecision],
         Value::BigInt(_) => &[NumToString],
@@ -1655,6 +1947,8 @@ pub fn method_by_name(recv: &Value, name: &str) -> Option<Native> {
         Value::Gen(_) => &[GenNext, GenReturn, GenThrow, IterSelf],
         Value::Iter(_) => &[GenNext, IterSelf],
         Value::Promise(_) => &[PromiseThen, PromiseCatch, PromiseFinally],
+        Value::Regex(_) => &[RegexTest, RegexExec],
+        Value::Symbol(_) => &[SymbolToString],
         Value::Func(_) | Value::Native(_) | Value::Bound(_) => &[FunctionBind, FunctionCall, FunctionApply],
         _ => &[],
     };

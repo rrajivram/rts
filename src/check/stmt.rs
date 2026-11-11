@@ -411,22 +411,28 @@ impl Checker {
             self.ensure_checked(f)?;
         }
         for c in classes {
-            self.ensure_class(c)?;
-            let ms: Vec<FuncId> = {
-                let cd = &self.classes[c as usize];
-                let mut v: Vec<FuncId> = cd.vtable.iter().map(|(_, f)| *f).collect();
-                v.push(cd.ctor);
-                v.extend(cd.statics.values().filter_map(|b| match b {
-                    VB::Func(_, f) => Some(*f),
-                    _ => None,
-                }));
-                v
-            };
-            for f in ms {
-                self.ensure_checked(f)?;
-            }
+            self.check_class_members(c)?;
         }
         Ok(out)
+    }
+
+    /// Make sure a class and all its methods have been checked.
+    pub fn check_class_members(&mut self, c: ClassId) -> CResult<()> {
+        self.ensure_class(c)?;
+        let ms: Vec<FuncId> = {
+            let cd = &self.classes[c as usize];
+            let mut v: Vec<FuncId> = cd.vtable.iter().map(|(_, f)| *f).collect();
+            v.push(cd.ctor);
+            v.extend(cd.statics.values().filter_map(|b| match b {
+                VB::Func(_, f) => Some(*f),
+                _ => None,
+            }));
+            v
+        };
+        for f in ms {
+            self.ensure_checked(f)?;
+        }
+        Ok(())
     }
 
     fn const_eval(&self, e: &Expr, prev: &[(Name, EnumVal)]) -> Option<EnumVal> {
@@ -461,7 +467,7 @@ impl Checker {
         })
     }
 
-    fn declare_class(&mut self, name: &Name, decl: Rc<ast::ClassDecl>, scope: &Rc<Scope>) -> CResult<ClassId> {
+    pub fn declare_class(&mut self, name: &Name, decl: Rc<ast::ClassDecl>, scope: &Rc<Scope>) -> CResult<ClassId> {
         let cid = self.classes.len() as ClassId;
         let cscope = Scope::new(Some(scope.clone()), scope.owner);
         let mut tps = Vec::new();
@@ -488,6 +494,7 @@ impl Checker {
             resolved: false,
             is_abstract: decl.is_abstract,
             prelude_error,
+            erase: self.erase,
         });
         scope.types.borrow_mut().insert(name.clone(), TB::Class(cid));
         scope.vals.borrow_mut().insert(name.clone(), VB::Class(cid));
@@ -513,6 +520,7 @@ impl Checker {
         let span = s.span;
         Ok(match &s.kind {
             StmtKind::Import(_) | StmtKind::Export(_) => return err("import and export are only allowed at the top level of a module", span),
+            StmtKind::Namespace { .. } => return err("namespaces are only supported at the top level of a module", span),
             StmtKind::Empty
             | StmtKind::Func(_)
             | StmtKind::Interface { .. }
@@ -536,6 +544,20 @@ impl Checker {
                     let h = self.check_expr(&e, Some(&ty))?;
                     self.expect_assignable(&h.ty, &ty, e.span)?;
                     out.push(HStmt::Init(v, Some(h.cast(ty))));
+                }
+                // Static blocks (parsed as hidden static methods), in order.
+                let mut blocks: Vec<(Name, VarId, FuncId)> = statics
+                    .iter()
+                    .filter_map(|(n, b)| match b {
+                        VB::Func(v, f) if n.starts_with('\u{1}') => Some((n.clone(), *v, *f)),
+                        _ => None,
+                    })
+                    .collect();
+                blocks.sort_by_key(|(n, _, _)| n[7..].parse::<u32>().unwrap_or(0));
+                for (_, v, f) in blocks {
+                    let this = HExpr::new(HK::ClassRef(cid), Type::ClassCtor(cid));
+                    let call = self.direct_call(f, Some(v), Some(this), &[], &[], span)?;
+                    out.push(HStmt::Expr(call));
                 }
                 out
             }
@@ -1040,14 +1062,26 @@ impl Checker {
                 out.push(HStmt::Init(v, Some(src.cast(ty))));
             }
             Pattern::Object { props, rest, .. } => {
-                if rest.is_some() {
-                    return err("object rest patterns are not supported yet", span);
-                }
                 let tmp = self.stash(src, &mut out);
                 for (key, p, default) in props {
                     let val = self.member_read(tmp.clone(), key, false, span)?;
                     let val = self.with_default(val, default.as_ref())?;
                     out.extend(self.bind_pattern(p, val, kind, Some(span))?);
+                }
+                if let Some(r) = rest {
+                    // `...rest`: a copy without the named properties.
+                    let ty = match self.obj_view(&tmp.ty.non_null()) {
+                        Some(o) => Type::Object(Rc::new(ObjType {
+                            props: o.props.iter().filter(|p| !props.iter().any(|(k, _, _)| *k == p.name)).cloned().collect(),
+                            index: o.index.clone(),
+                            call: None,
+                        })),
+                        None => Type::Any,
+                    };
+                    let mut args = vec![HElem::Expr(tmp.clone())];
+                    args.extend(props.iter().map(|(k, _, _)| HElem::Expr(HExpr::str(k))));
+                    let val = self.native_call(crate::runtime::Native::ObjRest, None, args, ty);
+                    out.extend(self.bind_pattern(r, val, kind, Some(span))?);
                 }
             }
             Pattern::Array { elems, rest, .. } => {

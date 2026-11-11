@@ -20,8 +20,13 @@ pub fn install_globals(module: &Rc<Scope>) {
         ("Boolean", BuiltinNs::Boolean),
         ("Map", BuiltinNs::MapCtor),
         ("Set", BuiltinNs::SetCtor),
+        // Without a tracing collector there is nothing for weak references to
+        // add: a WeakMap is a Map.
+        ("WeakMap", BuiltinNs::MapCtor),
+        ("WeakSet", BuiltinNs::SetCtor),
         ("Promise", BuiltinNs::Promise),
         ("Symbol", BuiltinNs::Symbol),
+        ("RegExp", BuiltinNs::RegExp),
     ] {
         v.insert(n.into(), VB::Builtin(ns));
     }
@@ -38,6 +43,34 @@ pub fn install_globals(module: &Rc<Scope>) {
         ("clearInterval", Native::ClearTimeout),
         ("clearImmediate", Native::ClearTimeout),
         ("queueMicrotask", Native::QueueMicrotask),
+        ("\u{1}templateObject", Native::TemplateObject),
+        ("structuredClone", Native::StructuredClone),
+        ("encodeURIComponent", Native::EncodeUriComponent),
+        ("encodeURI", Native::EncodeUri),
+        ("decodeURIComponent", Native::DecodeUriComponent),
+        ("decodeURI", Native::DecodeUri),
+        // Used by the prelude and src/node/*.ts.
+        ("__rts_now", Native::DateNowMs),
+        ("__rts_date_offset", Native::DateOffset),
+        ("__rts_date_zone_name", Native::DateZoneName),
+        ("__rts_date_parse", Native::DateParse),
+        ("__rts_deep_equal", Native::DeepEqual),
+        ("__rts_format", Native::UtilFormat),
+        ("__rts_inspect", Native::UtilInspect),
+        ("__rts_cwd", Native::ProcessCwd),
+        ("__rts_os_info", Native::OsInfo),
+        ("__rts_fs_read", Native::FsReadFile),
+        ("__rts_fs_write", Native::FsWriteFile),
+        ("__rts_fs_append", Native::FsAppendFile),
+        ("__rts_fs_exists", Native::FsExists),
+        ("__rts_fs_mkdir", Native::FsMkdir),
+        ("__rts_fs_readdir", Native::FsReaddir),
+        ("__rts_fs_stat", Native::FsStat),
+        ("__rts_fs_unlink", Native::FsUnlink),
+        ("__rts_fs_rm", Native::FsRm),
+        ("__rts_fs_rename", Native::FsRename),
+        ("__rts_fs_copy", Native::FsCopy),
+        ("__rts_fs_realpath", Native::FsRealpath),
     ] {
         v.insert(n.into(), VB::NativeFn(f));
     }
@@ -109,10 +142,22 @@ pub fn global_fn_type(n: Native) -> Rc<FuncType> {
         Native::NumberFn => ft(vec![opt("x", any())], num()),
         Native::BooleanFn => ft(vec![opt("x", any())], boolean()),
         Native::BigIntFn => ft(vec![p("x", any())], Type::BigInt),
+        Native::DateNowMs | Native::DateOffset | Native::DateParse => ft(vec![rest("args", any())], num()),
+        Native::DateZoneName | Native::UtilFormat | Native::UtilInspect | Native::ProcessCwd | Native::FsReadFile | Native::FsRealpath => {
+            ft(vec![rest("args", any())], string())
+        }
+        Native::EncodeUriComponent | Native::EncodeUri | Native::DecodeUriComponent | Native::DecodeUri => ft(vec![p("s", any())], string()),
+        Native::DeepEqual | Native::FsExists => ft(vec![rest("args", any())], boolean()),
+        Native::FsReaddir => ft(vec![rest("args", any())], Type::array(string())),
         Native::SetTimeout | Native::SetInterval => ft(vec![p("callback", any()), opt("ms", num()), rest("args", any())], num()),
         Native::SetImmediate => ft(vec![p("callback", any()), rest("args", any())], num()),
         Native::ClearTimeout => ft(vec![opt("id", any())], Type::Void),
         Native::QueueMicrotask => ft(vec![p("callback", Type::func(vec![], Type::Void))], Type::Void),
+        Native::StructuredClone => {
+            let t = Type::Param(0);
+            let _ = t;
+            ft(vec![p("value", any())], any())
+        }
         _ => ft(vec![rest("args", any())], any()),
     }
 }
@@ -206,6 +251,7 @@ impl Checker {
                 _ => None,
             },
             BuiltinNs::Object => match name {
+                "is" => m(ObjectIs, ft(vec![p("a", any()), p("b", any())], boolean())),
                 "keys" => m(ObjKeys, ft(vec![p("o", any())], Type::array(string()))),
                 "values" => m(ObjValues, ft(vec![p("o", any())], Type::array(any()))),
                 "entries" => m(
@@ -312,6 +358,9 @@ impl Checker {
                     "keys" => r(ArrKeys, ft(vec![], Type::array(num()))),
                     "entries" => r(ArrEntries, ft(vec![], Type::array(Type::Tuple(vec![num(), t.clone()].into())))),
                     "toString" => r(ArrToString, ft(vec![], string())),
+                    "toSorted" => r(ArrToSorted, ft(vec![opt("compare", Type::Func(ft(vec![p("a", t.clone()), p("b", t.clone())], num())))], arr.clone())),
+                    "toReversed" => r(ArrToReversed, ft(vec![], arr.clone())),
+                    "with" => r(ArrWith, ft(vec![p("index", num()), p("value", t.clone())], arr.clone())),
                     // reduce is special-cased by the caller (two overloads).
                     "reduce" | "reduceRight" => {
                         let n = if name == "reduce" { ArrReduce } else { ArrReduceRight };
@@ -353,12 +402,15 @@ impl Checker {
                 "trim" => r(StrTrim, ft(vec![], string())),
                 "trimStart" => r(StrTrimStart, ft(vec![], string())),
                 "trimEnd" => r(StrTrimEnd, ft(vec![], string())),
-                "split" => r(StrSplit, ft(vec![opt("sep", string()), opt("limit", num())], Type::array(string()))),
+                "split" => r(StrSplit, ft(vec![opt("sep", any()), opt("limit", num())], Type::array(string()))),
+                "match" => r(StrMatch, ft(vec![p("pattern", any())], any())),
+                "matchAll" => r(StrMatchAll, ft(vec![p("pattern", any())], Type::iter(IterKind::IterableIterator, false, any(), any(), any()))),
+                "search" => r(StrSearch, ft(vec![p("pattern", any())], num())),
                 "repeat" => r(StrRepeat, ft(vec![p("n", num())], string())),
                 "padStart" => r(StrPadStart, ft(vec![p("n", num()), opt("fill", string())], string())),
                 "padEnd" => r(StrPadEnd, ft(vec![p("n", num()), opt("fill", string())], string())),
-                "replace" => r(StrReplace, ft(vec![p("pattern", string()), p("replacement", any())], string())),
-                "replaceAll" => r(StrReplaceAll, ft(vec![p("pattern", string()), p("replacement", any())], string())),
+                "replace" => r(StrReplace, ft(vec![p("pattern", any()), p("replacement", any())], string())),
+                "replaceAll" => r(StrReplaceAll, ft(vec![p("pattern", any()), p("replacement", any())], string())),
                 "concat" => r(StrConcat, ft(vec![rest("parts", any())], string())),
                 "at" => r(StrAt, ft(vec![p("i", num())], Type::union([string(), Type::Undefined]))),
                 "localeCompare" => r(StrLocaleCompare, ft(vec![p("other", string())], num())),
@@ -374,6 +426,16 @@ impl Checker {
             },
             Type::BigInt => match name {
                 "toString" => r(NumToString, ft(vec![opt("radix", num())], string())),
+                _ => None,
+            },
+            Type::Symbol => match name {
+                "toString" => r(SymbolToString, ft(vec![], string())),
+                _ => None,
+            },
+            Type::RegExp => match name {
+                "test" => r(RegexTest, ft(vec![p("s", string())], boolean())),
+                "exec" => r(RegexExec, ft(vec![p("s", string())], any())),
+                "toString" => r(StrToString, ft(vec![], string())),
                 _ => None,
             },
             Type::Promise(t) => {

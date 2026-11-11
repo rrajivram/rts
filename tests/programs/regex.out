@@ -1,0 +1,23 @@
+[
+  '2024-03-15',
+  '2024',
+  '03',
+  '15',
+  index: 3,
+  input: 'on 2024-03-15!',
+  groups: [Object: null prototype] { y: '2024', m: '03', d: '15' }
+]
+2024 3 15/03/2024
+[ 'a', 'b', 'c', 'd' ] [ 'one', '  ', 'two' ] [ '' ]
+Hell0 W0rld baa []
+camel_case_string
+[ '$10', '$20' ] null 2
+hi 2
+there 8
+you 12
+true true
+[ '1', '22', '333' ]
+true foo 7
+/ab+c/gi ab+c gi true /x\/y/
+tab->here line true
+cafe crème abx

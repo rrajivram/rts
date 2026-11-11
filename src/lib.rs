@@ -21,6 +21,9 @@ pub mod vm;
 use error::CompileError;
 
 pub const PRELUDE: &str = include_str!("prelude.ts");
+/// `Date`, added only when some module mentions it (it is large, and every
+/// program would pay to compile it).
+pub const PRELUDE_DATE: &str = include_str!("prelude_date.ts");
 
 /// Compile the program whose entry module is `path` (with source `src`).
 /// Imported modules are loaded from disk. Errors are rendered with their
@@ -29,8 +32,12 @@ pub fn compile_file(path: &std::path::Path, src: String, erase_types: bool) -> R
     let mut sources = error::Sources::default();
     let base = sources.add("<prelude>".into(), PRELUDE.into());
     let r = (|| {
-        let prelude = parser::parse_program(lexer::tokenize_at(PRELUDE, base)?)?;
+        let mut prelude = parser::parse_program(lexer::tokenize_at(PRELUDE, base)?)?;
         let graph = module::load(path, src, &mut sources)?;
+        if sources.files.iter().any(|f| f.src.contains("Date")) {
+            let base = sources.add("<prelude>".into(), PRELUDE_DATE.into());
+            prelude.extend(parser::parse_program(lexer::tokenize_at(PRELUDE_DATE, base)?)?);
+        }
         let hir = check::check_program(&prelude, &graph, erase_types)?;
         Ok(codegen::compile(&hir))
     })();

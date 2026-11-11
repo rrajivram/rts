@@ -17,6 +17,8 @@ pub enum Tok {
         exprs: Vec<Vec<Token>>,
     },
     Ident(Rc<str>),
+    /// `/pattern/flags`
+    Regex { pattern: Rc<str>, flags: Rc<str> },
     /// Punctuator / operator, e.g. "(", "=>", ">>>=".
     P(&'static str),
     Eof,
@@ -141,6 +143,8 @@ impl<'a> Lexer<'a> {
                 Tok::Str(self.string(c)?.into())
             } else if c == b'`' {
                 self.template()?
+            } else if c == b'/' && regex_allowed(out.last().map(|t: &Token| &t.tok)) {
+                self.regex()?
             } else if c.is_ascii_alphabetic() || c == b'_' || c == b'$' || c >= 0x80 {
                 while self.pos < self.src.len() {
                     let c = self.peek(0);
@@ -194,6 +198,39 @@ impl<'a> Lexer<'a> {
             });
             nl = false;
         }
+    }
+
+    /// `/pattern/flags`; the opening `/` is at `pos`.
+    fn regex(&mut self) -> Result<Tok, CompileError> {
+        let start = self.pos;
+        self.pos += 1;
+        let mut in_class = false;
+        loop {
+            match self.peek(0) {
+                0 | b'\n' => return self.err("unterminated regular expression", start),
+                b'\\' => self.pos += 2,
+                b'[' => {
+                    in_class = true;
+                    self.pos += 1;
+                }
+                b']' => {
+                    in_class = false;
+                    self.pos += 1;
+                }
+                b'/' if !in_class => break,
+                _ => self.pos += 1,
+            }
+        }
+        let pattern = &self.text[start + 1..self.pos];
+        self.pos += 1;
+        let fstart = self.pos;
+        while self.peek(0).is_ascii_alphabetic() {
+            self.pos += 1;
+        }
+        Ok(Tok::Regex {
+            pattern: pattern.into(),
+            flags: self.text[fstart..self.pos].into(),
+        })
     }
 
     fn number(&mut self) -> Result<Tok, CompileError> {
@@ -384,5 +421,19 @@ impl<'a> Lexer<'a> {
             cur.push(ch);
             self.pos += ch.len_utf8();
         }
+    }
+}
+
+/// Whether a `/` after this token starts a regular expression (rather than
+/// being division).
+fn regex_allowed(prev: Option<&Tok>) -> bool {
+    match prev {
+        None => true,
+        Some(Tok::P(p)) => !matches!(*p, ")" | "]" | "}" | "++" | "--"),
+        Some(Tok::Ident(k)) => matches!(
+            &**k,
+            "return" | "typeof" | "case" | "do" | "else" | "in" | "instanceof" | "new" | "delete" | "void" | "throw" | "yield" | "await" | "of"
+        ),
+        _ => false,
     }
 }

@@ -1,0 +1,21 @@
+[ 'hello', 'world!' ] true 12 [ 'a.txt' ]
+a.txt .txt rts-node-builtins-test b/c
+../../d /x/z/ {
+  root: '/',
+  dir: '/home/u',
+  base: 'f.tar.gz',
+  ext: '.gz',
+  name: 'f.tar'
+}
+ENOENT true
+false
+data 1
+first only
+data 2
+1 false
+cart has 3.5 items (42%) {"a":1} { a: [Object] }
+a-b extra
+AssertionError ERR_ASSERTION
+string true string true
+2024-02-29T12:30:15.250Z 4 {"d":"2024-02-29T12:30:15.250Z"} 1709209815250 41384750
+NaN 1970-01-01T00:00:00.000Z 86400000

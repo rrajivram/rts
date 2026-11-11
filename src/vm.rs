@@ -15,10 +15,28 @@ use crate::types::Kind;
 #[path = "vm_task.rs"]
 mod task;
 pub use task::{call_task_native, is_callable, iter_result};
+use task::Flow;
 
-use crate::runtime::task::{CoKind, CoStatus, Coroutine, Resume};
+use crate::runtime::task::{CoKind, Coroutine};
 
 const MAX_DEPTH: usize = 10_000;
+
+/// Slot stacks are reserved once and never move, so a running frame's slot
+/// pointers stay valid across calls. The memory is zeroed lazily by the OS:
+/// only pages actually used become resident.
+const SCALAR_STACK: usize = 1 << 22;
+const VALUE_STACK: usize = 1 << 21;
+
+/// `n` value slots, all `undefined` (an all-zero `Value`).
+fn zeroed_values(n: usize) -> Vec<Value> {
+    assert!(matches!(unsafe { std::mem::zeroed::<Value>() }, Value::Undef));
+    let layout = std::alloc::Layout::array::<Value>(n).unwrap();
+    unsafe {
+        let p = std::alloc::alloc_zeroed(layout) as *mut Value;
+        assert!(!p.is_null(), "out of memory");
+        Vec::from_raw_parts(p, n, n)
+    }
+}
 
 /// Where a returning function's result goes.
 #[derive(Debug, Clone, Copy)]
@@ -58,9 +76,6 @@ struct Frame {
     /// The closure being run, whose captured cells `ReadCapture` reads.
     closure: Option<Rc<Closure>>,
     ret: Ret,
-    /// Set for generators and async functions: where the frame's state goes
-    /// when it suspends, and (async) the promise it settles.
-    co: Option<Rc<Coroutine>>,
 }
 
 pub struct Vm {
@@ -81,6 +96,14 @@ pub struct Vm {
     native_ret: Value,
     /// Microtasks and timers.
     lp: task::EventLoop,
+    /// `process.argv` after the executable: the script and its arguments.
+    pub args: Vec<String>,
+    /// The `process` object, created on first use.
+    process: Option<Value>,
+    /// Frames running a generator or async function (frame index and its
+    /// coroutine), innermost last. Kept apart from `Frame` so ordinary calls
+    /// don't pay for it.
+    co_frames: Vec<(usize, Rc<Coroutine>)>,
 }
 
 /// A number slot's contents as an f64, and an f64 as number slot contents.
@@ -224,8 +247,8 @@ impl Vm {
     pub fn new(prog: Program) -> Vm {
         let prog = Rc::new(prog);
         Vm {
-            scalars: vec![0; 1024],
-            values: vec![Value::Undef; 1024],
+            scalars: vec![0; SCALAR_STACK],
+            values: zeroed_values(VALUE_STACK),
             global_scalars: vec![0; prog.global_scalars],
             global_values: vec![Value::Undef; prog.global_values],
             frames: Vec::new(),
@@ -234,6 +257,9 @@ impl Vm {
             start: Instant::now(),
             native_ret: Value::Undef,
             lp: task::EventLoop::default(),
+            args: Vec::new(),
+            process: None,
+            co_frames: Vec::new(),
             prog,
         }
     }
@@ -251,8 +277,75 @@ impl Vm {
         let _ = self.out.flush();
     }
     pub fn inspect(&self, v: &Value) -> String {
+        self.inspect_depth(v, 2)
+    }
+    pub fn inspect_depth(&self, v: &Value, depth: usize) -> String {
         let prog = self.prog.clone();
-        inspect(v, &move |id| prog.funcs[id as usize].name.clone())
+        inspect_with_depth(v, &move |id| prog.funcs[id as usize].name.clone(), depth)
+    }
+    /// Write without a newline (`process.stdout.write`).
+    pub fn write_out(&mut self, s: &str) {
+        let _ = self.out.write_all(s.as_bytes());
+    }
+    pub fn make_error_pub(&mut self, msg: String) -> Value {
+        self.make_error(self.prog.error_class, msg)
+    }
+
+    /// The `process` global.
+    pub fn process_object(&mut self) -> Value {
+        if let Some(p) = &self.process {
+            return p.clone();
+        }
+        let exe = std::env::current_exe().map(|p| p.to_string_lossy().into_owned()).unwrap_or_else(|_| "rts".into());
+        let mut argv = vec![Value::str(exe.clone())];
+        argv.extend(self.args.iter().map(|a| Value::str(a.as_str())));
+        let obj = |keys: &[&str], vals: Vec<Value>| Value::Obj(Object::new(Shape::new(keys.iter().map(|k| Rc::from(*k)).collect()), vals, None));
+        let stdout = obj(&["write", "isTTY", "columns"], vec![Value::Native(Native::StdoutWrite), Value::Bool(false), Value::Num(80.0)]);
+        let stderr = obj(&["write", "isTTY"], vec![Value::Native(Native::StderrWrite), Value::Bool(false)]);
+        let env = call_native(self, Native::EnvObject, Value::Undef, vec![]).unwrap_or(Value::Undef);
+        let versions = obj(&["node", "v8", "rts"], vec![Value::str("22.12.0"), Value::str("12.4.254.21-node.21"), Value::str(env!("CARGO_PKG_VERSION"))]);
+        let hrtime = obj(&["bigint"], vec![Value::Native(Native::HrtimeBigint)]);
+        let p = obj(
+            &[
+                "argv", "env", "platform", "arch", "pid", "version", "versions", "execPath", "exitCode", "cwd", "chdir", "exit",
+                "nextTick", "stdout", "stderr", "hrtime", "on", "once", "off", "emitWarning",
+            ],
+            vec![
+                Value::Arr(natives::make_array(argv)),
+                env,
+                Value::str(crate::node::natives::platform()),
+                Value::str(crate::node::natives::arch()),
+                Value::Num(std::process::id() as f64),
+                Value::str("v22.12.0"),
+                versions,
+                Value::str(exe),
+                Value::Undef,
+                Value::Native(Native::ProcessCwd),
+                Value::Native(Native::ProcessChdir),
+                Value::Native(Native::ProcessExit),
+                Value::Native(Native::NextTick),
+                stdout,
+                stderr,
+                hrtime,
+                Value::Native(Native::NoOp),
+                Value::Native(Native::NoOp),
+                Value::Native(Native::NoOp),
+                Value::Native(Native::NoOp),
+            ],
+        );
+        self.process = Some(p.clone());
+        p
+    }
+
+    /// The exit status: `process.exitCode` if the program set it.
+    pub fn exit_code(&self) -> i32 {
+        match &self.process {
+            Some(Value::Obj(o)) => match o.get("exitCode") {
+                Some(Value::Num(n)) => n as i32,
+                _ => 0,
+            },
+            _ => 0,
+        }
     }
 
     fn make_error(&mut self, class: Option<u32>, msg: String) -> Value {
@@ -288,7 +381,7 @@ impl Vm {
     /// Run the program's main function. Returns the uncaught exception, if any.
     pub fn run_main(&mut self) -> Result<(), Value> {
         let main = self.prog.funcs[self.prog.main as usize].clone();
-        self.ensure(0, 0, &main);
+        self.ensure(0, 0, &main)?;
         self.frames.push(Frame {
             func: FnRef::new(&main),
             pc: 0,
@@ -296,7 +389,6 @@ impl Vm {
             value_base: 0,
             closure: None,
             ret: Ret::Discard,
-            co: None,
         });
         let r = self.run(0).and_then(|()| self.run_event_loop());
         self.flush();
@@ -332,7 +424,7 @@ impl Vm {
             Some(top) => (top.scalar_base + top.func.get().scalar_slots, top.value_base + top.func.get().value_slots),
             None => (0, 0),
         };
-        self.ensure(sb, vb, &func);
+        self.ensure(sb, vb, &func)?;
         self.values[vb] = this;
         if func.rest {
             self.bind_values(&func, sb, vb, args.to_vec())?;
@@ -347,21 +439,17 @@ impl Vm {
             value_base: vb,
             closure,
             ret: Ret::Native,
-            co: None,
         });
         self.run(depth)?;
         Ok(std::mem::take(&mut self.native_ret))
     }
 
-    fn ensure(&mut self, sb: usize, vb: usize, func: &FunctionCode) {
-        let need_s = sb + func.scalar_slots + 1;
-        if self.scalars.len() < need_s {
-            self.scalars.resize(need_s.max(self.scalars.len() * 2), 0);
+    /// Check that a frame for `func` at these bases fits in the slot stacks.
+    fn ensure(&mut self, sb: usize, vb: usize, func: &FunctionCode) -> Result<(), Value> {
+        if sb + func.scalar_slots + 2 > self.scalars.len() || vb + func.value_slots + 1 > self.values.len() {
+            return Err(self.range_error("Maximum call stack size exceeded".into()));
         }
-        let need_v = vb + func.value_slots + 1;
-        if self.values.len() < need_v {
-            self.values.resize(need_v.max(self.values.len() * 2), Value::Undef);
-        }
+        Ok(())
     }
 
     /// Bind boxed argument values to a callee's parameter slots.
@@ -542,7 +630,7 @@ impl Vm {
         }
         let nsb = sb + caller.scalar_slots;
         let nvb = vb + caller.value_slots;
-        self.ensure(nsb, nvb, &func);
+        self.ensure(nsb, nvb, &func)?;
         self.values[nvb] = this.unwrap_or(Value::Undef);
         if ci.has_spread || (func.rest && !ci.packed_rest) {
             let args = self.collect_args(ci, sb, vb)?;
@@ -593,7 +681,6 @@ impl Vm {
                 Some((k, r)) => Ret::ToSlot(k, r),
                 None => Ret::Discard,
             },
-            co: None,
         });
         Ok(true)
     }
@@ -629,6 +716,7 @@ impl Vm {
     }
 
     /// Method lookup by name for dynamic calls.
+    #[inline(never)]
     fn lookup_method(&mut self, recv: &Value, name: &str) -> Result<Value, Value> {
         match recv {
             Value::Obj(o) => {
@@ -642,6 +730,7 @@ impl Vm {
                             return Ok(Value::Func(Rc::new(Closure {
                                 func: *fi,
                                 caps: Box::new([]),
+                                props: Default::default(),
                             })));
                         }
                         k = c.parent.clone();
@@ -653,6 +742,9 @@ impl Vm {
                 "Cannot read properties of {} (reading '{name}')",
                 recv.to_display()
             ))),
+            Value::Func(f) if f.props.borrow().as_ref().is_some_and(|p| p.get(name).is_some()) => {
+                Ok(f.props.borrow().as_ref().unwrap().get(name).unwrap())
+            }
             v => Ok(method_by_name(v, name).map_or(Value::Undef, Value::Native)),
         }
     }
@@ -664,19 +756,23 @@ impl Vm {
         c.methods.get(key.as_str()).copied()
     }
 
+    #[inline(never)]
     fn get_prop_slow(&mut self, recv: &Value, site: &PropertySite) -> Result<Value, Value> {
         let name = &*site.name;
         match recv {
             Value::Obj(o) => {
-                {
+                let found = {
                     let inner = o.inner.borrow();
-                    if let Some(i) = inner.shape.lookup(name) {
+                    inner.shape.lookup(name).map(|i| {
                         *site.cache.entry.borrow_mut() = Some((inner.shape.clone(), i));
-                        return Ok(inner.vals[i as usize].clone());
-                    }
+                        inner.vals[i as usize].clone()
+                    })
+                };
+                if let Some(x) = found {
+                    return self.read_accessor(x, recv);
                 }
                 if let Some(g) = Self::accessor(o, "get", name) {
-                    let f = Value::Func(Rc::new(Closure { func: g, caps: Box::new([]) }));
+                    let f = Value::Func(Rc::new(Closure { func: g, caps: Box::new([]), props: Default::default() }));
                     return self.call(&f, recv.clone(), vec![]);
                 }
                 self.lookup_method(recv, name)
@@ -697,12 +793,21 @@ impl Vm {
         }
     }
 
+    #[inline(never)]
     fn set_prop(&mut self, recv: &Value, site: &PropertySite, val: Value) -> Result<(), Value> {
         match recv {
             Value::Obj(o) if o.inner.borrow().shape.lookup(&site.name).is_none() && Self::accessor(o, "set", &site.name).is_some() => {
                 let s = Self::accessor(o, "set", &site.name).unwrap();
-                let f = Value::Func(Rc::new(Closure { func: s, caps: Box::new([]) }));
+                let f = Value::Func(Rc::new(Closure { func: s, caps: Box::new([]), props: Default::default() }));
                 self.call(&f, recv.clone(), vec![val])?;
+                Ok(())
+            }
+            Value::Obj(o) if matches!(o.get(&site.name), Some(Value::Accessor(_))) => {
+                let Some(Value::Accessor(a)) = o.get(&site.name) else { unreachable!() };
+                if matches!(a.set, Value::Undef) {
+                    return Err(self.type_error(format!("Cannot set property {} of {} which has only a getter", site.name, self.inspect(recv))));
+                }
+                self.call(&a.set, recv.clone(), vec![val])?;
                 Ok(())
             }
             Value::Obj(o) => {
@@ -736,6 +841,36 @@ impl Vm {
         }
     }
 
+    /// ToString, calling a user-defined `toString()` on objects.
+    #[inline(never)]
+    pub fn to_string_value(&mut self, v: &Value) -> Result<Rc<JsStr>, Value> {
+        if let Value::Obj(o) = v {
+            let user = match o.get("toString") {
+                Some(f) => Some(f),
+                None => match &o.class {
+                    Some(_) => self.lookup_method(v, "toString").ok().filter(|f| matches!(f, Value::Func(_))),
+                    None => None,
+                },
+            };
+            if let Some(f) = user.filter(task::is_callable) {
+                return Ok(self.call(&f, v.clone(), vec![])?.to_js_string());
+            }
+        }
+        Ok(v.to_js_string())
+    }
+
+    /// A property slot's value as read: an accessor calls its getter.
+    #[inline(never)]
+    fn read_accessor(&mut self, x: Value, recv: &Value) -> Result<Value, Value> {
+        match x {
+            Value::Accessor(a) => match &a.get {
+                Value::Undef => Ok(Value::Undef),
+                g => self.call(&g.clone(), recv.clone(), vec![]),
+            },
+            x => Ok(x),
+        }
+    }
+
     /// Pop the current frame and deliver its return value. Returns true if the
     /// run loop with base `stop` should exit.
     fn do_return(&mut self, val: Value, stop: usize) -> Result<bool, Value> {
@@ -744,8 +879,8 @@ impl Vm {
         for x in &mut self.values[fr.value_base..fr.value_base + fr.func.get().value_slots] {
             x.release();
         }
-        let val = match &fr.co {
-            Some(co) => self.complete_coroutine(co, Ok(val)),
+        let val = match self.pop_co(self.frames.len()) {
+            Some(co) => self.complete_coroutine(&co, Ok(val)),
             None => val,
         };
         self.deliver(fr.ret, val)?;
@@ -758,7 +893,7 @@ impl Vm {
         if let Some(fr) = self.frames.last()
             && let Ret::ToSlot(rk, d) = fr.ret
             && rk == k
-            && fr.co.is_none()
+            && !self.is_co(self.frames.len() - 1)
         {
             let fr = self.frames.pop().unwrap();
             for x in &mut self.values[fr.value_base..fr.value_base + fr.func.get().value_slots] {
@@ -780,7 +915,7 @@ impl Vm {
     fn do_return_big(&mut self, n: i128, stop: usize) -> Result<bool, Value> {
         if let Some(fr) = self.frames.last()
             && let Ret::ToSlot(Kind::Big, d) = fr.ret
-            && fr.co.is_none()
+            && !self.is_co(self.frames.len() - 1)
         {
             let fr = self.frames.pop().unwrap();
             for x in &mut self.values[fr.value_base..fr.value_base + fr.func.get().value_slots] {
@@ -791,6 +926,23 @@ impl Vm {
             return Ok(self.frames.len() <= stop);
         }
         self.do_return(Value::bigint(n), stop)
+    }
+
+    /// Whether frame `fi` runs a coroutine.
+    #[inline(always)]
+    fn is_co(&self, fi: usize) -> bool {
+        self.co_frames.last().is_some_and(|(i, _)| *i == fi)
+    }
+
+    /// The coroutine of frame `fi` (just popped), if it had one.
+    #[inline(always)]
+    fn pop_co(&mut self, fi: usize) -> Option<Rc<Coroutine>> {
+        if self.is_co(fi) { self.co_frames.pop().map(|(_, c)| c) } else { None }
+    }
+
+    /// The coroutine running in frame `fi`.
+    fn frame_co(&self, fi: usize) -> Option<Rc<Coroutine>> {
+        self.co_frames.last().filter(|(i, _)| *i == fi).map(|(_, c)| c.clone())
     }
 
     /// Find the handler for `err`. Ok(false): continue in the top frame;
@@ -813,7 +965,8 @@ impl Vm {
             for x in &mut self.values[fr.value_base..fr.value_base + fr.func.get().value_slots] {
                 x.release();
             }
-            if let Some(co) = &fr.co
+            let co = self.pop_co(self.frames.len());
+            if let Some(co) = &co
                 && co.kind != CoKind::Generator
             {
                 let out = self.complete_coroutine(co, Err(err));
@@ -838,11 +991,10 @@ impl Vm {
             let vb = self.frames[fi].value_base;
 
             // Slot access is unchecked: codegen guarantees every slot
-            // index is below the function's ns/nv, and `ensure` sized the
-            // stacks before the frame was pushed. The base pointers are
-            // refreshed after anything that can grow the stacks (calls).
-            let mut sp: *mut u64 = unsafe { self.scalars.as_mut_ptr().add(sb) };
-            let mut vp: *mut Value = unsafe { self.values.as_mut_ptr().add(vb) };
+            // index is below the function's ns/nv, and `ensure` checked the
+            // frame fits before it was pushed. The stacks never move.
+            let sp: *mut u64 = unsafe { self.scalars.as_mut_ptr().add(sb) };
+            let vp: *mut Value = unsafe { self.values.as_mut_ptr().add(vb) };
             // `scalar!(slot)`, `value!(slot)`: this frame's slot, read or written.
             // `number!(slot)`: a number slot's f64.
             macro_rules! scalar {
@@ -876,12 +1028,6 @@ impl Vm {
                         *sp.add(i + 1) = ((n as u128) >> 64) as u64;
                     }
                 }};
-            }
-            macro_rules! refresh {
-                () => {
-                    sp = unsafe { self.scalars.as_mut_ptr().add(sb) };
-                    vp = unsafe { self.values.as_mut_ptr().add(vb) };
-                };
             }
             debug_assert!(sb + func.scalar_slots <= self.scalars.len() && vb + func.value_slots <= self.values.len());
             macro_rules! tri {
@@ -1034,7 +1180,18 @@ impl Vm {
                     }
                     Instruction::IsTruthy { output, value } => scalar!(output) = value!(value).truthy() as u64,
                     Instruction::NumberToString { output, value } => value!(output) = Value::str(num_to_string(number!(value))),
-                    Instruction::ToString { output, value } => value!(output) = Value::Str(value!(value).to_js_string()),
+                    Instruction::ToString { output, value } => {
+                        let x = match &value!(value) {
+                            v @ Value::Obj(_) => {
+                                let v = v.clone();
+                                self.frames[fi].pc = pc;
+                                let r = self.to_string_value(&v);
+                                                                tri!(r)
+                            }
+                            v => v.to_js_string(),
+                        };
+                        value!(output) = Value::Str(x)
+                    }
                     Instruction::ToNumber { output, value } => {
                         if let Value::BigInt(_) = value!(value) {
                             break self.bigint_error(bigint::TO_NUMBER);
@@ -1079,7 +1236,12 @@ impl Vm {
                                 Value::str(format!("{}{}", x.to_js_string().s, y.to_js_string().s))
                             }
                             (x @ (Value::Arr(_) | Value::Obj(_)), y) | (x, y @ (Value::Arr(_) | Value::Obj(_))) => {
-                                Value::str(format!("{}{}", x.to_display(), y.to_display()))
+                                let (x, y) = (x.clone(), y.clone());
+                                self.frames[fi].pc = pc;
+                                let a = self.to_string_value(&x);
+                                let b = a.and_then(|a| self.to_string_value(&y).map(|b| (a, b)));
+                                                                let (a, b) = tri!(b);
+                                Value::str(format!("{}{}", a.s, b.s))
                             }
                             (Value::BigInt(_), _) | (_, Value::BigInt(_)) => break self.bigint_error(bigint::MIX),
                             (x, y) => Value::Num(x.to_number() + y.to_number()),
@@ -1200,13 +1362,13 @@ impl Vm {
                         value!(output) = Value::Func(Rc::new(Closure {
                             func: function,
                             caps: cells.into_boxed_slice(),
+                            props: Default::default(),
                         }))
                     }
                     Instruction::Call { site } => {
                         self.frames[fi].pc = pc;
                         let r = self.do_call(func, &func.call_sites[site as usize], sb, vb);
-                        refresh!();
-                        match r {
+                                                match r {
                             Ok(true) => continue 'outer,
                             Ok(false) => {}
                             Err(e) => break e,
@@ -1390,6 +1552,12 @@ impl Vm {
                             Value::Obj(ob) => {
                                 let key = value!(k).to_js_string();
                                 match ob.get(&key.s) {
+                                    Some(Value::Accessor(a)) => {
+                                        let recv = value!(o).clone();
+                                        self.frames[fi].pc = pc;
+                                        let r = self.read_accessor(Value::Accessor(a), &recv);
+                                                                                tri!(r)
+                                    }
                                     Some(x) => x,
                                     None => tri!(self.lookup_method(&value!(o).clone(), &key.s.clone())),
                                 }
@@ -1559,10 +1727,18 @@ impl Vm {
                             _ => None,
                         };
                         let x = match fast {
+                            Some(Value::Accessor(a)) => {
+                                let recv = value!(object).clone();
+                                self.frames[fi].pc = pc;
+                                let r = self.read_accessor(Value::Accessor(a), &recv);
+                                                                tri!(r)
+                            }
                             Some(x) => x,
                             None => {
                                 let recv = value!(object).clone();
-                                tri!(self.get_prop_slow(&recv, site))
+                                self.frames[fi].pc = pc;
+                                let r = self.get_prop_slow(&recv, site);
+                                                                tri!(r)
                             }
                         };
                         value!(output) = x
@@ -1574,7 +1750,7 @@ impl Vm {
                         let x = if let Value::Obj(ob) = &value!(object) {
                             let mut inner = ob.inner.borrow_mut();
                             match &*site.cache.entry.borrow() {
-                                Some((sh, slot)) if Rc::ptr_eq(sh, &inner.shape) => {
+                                Some((sh, slot)) if Rc::ptr_eq(sh, &inner.shape) && !matches!(inner.vals[*slot as usize], Value::Accessor(_)) => {
                                     inner.vals[*slot as usize] = x;
                                     None
                                 }
@@ -1585,7 +1761,9 @@ impl Vm {
                         };
                         if let Some(x) = x {
                             let recv = value!(object).clone();
-                            tri!(self.set_prop(&recv, site, x));
+                            self.frames[fi].pc = pc;
+                            let r = self.set_prop(&recv, site, x);
+                                                        tri!(r);
                         }
                     }
                     Instruction::NewInstance { output, class } => {
@@ -1602,123 +1780,26 @@ impl Vm {
                         self.handlers.pop();
                     }
 
-                    Instruction::GetIterator { value, output } => {
-                        let v = value!(value).clone();
-                        let it = tri!(self.get_iterator(&v));
-                        value!(output) = it
-                    }
-                    Instruction::GetAsyncIterator { value, output, is_sync } => {
-                        let v = value!(value).clone();
-                        let (it, sync) = tri!(self.get_async_iterator(&v));
-                        refresh!();
-                        value!(output) = it;
-                        scalar!(is_sync) = sync as u64
-                    }
-                    Instruction::IteratorStep { iterator, output, to } => {
-                        let it = value!(iterator).clone();
+                    Instruction::DefineAccessor { .. }
+                    | Instruction::GetIterator { .. }
+                    | Instruction::GetAsyncIterator { .. }
+                    | Instruction::IteratorStep { .. }
+                    | Instruction::IteratorNextResult { .. }
+                    | Instruction::UnpackIteratorResult { .. }
+                    | Instruction::IteratorClose { .. }
+                    | Instruction::IteratorResume { .. }
+                    | Instruction::CreateGenerator
+                    | Instruction::StartAsync
+                    | Instruction::Yield { .. }
+                    | Instruction::Await { .. } => {
                         self.frames[fi].pc = pc;
-                        let r = self.iterator_step(&it);
-                        refresh!();
-                        match tri!(r) {
-                            Some(x) => value!(output) = x,
-                            None => pc = to as usize,
+                        let r = self.exec_extended(fi, pc, sb, vb, stop);
+                                                match tri!(r) {
+                            Flow::Next => {}
+                            Flow::Jump(to) => pc = to,
+                            Flow::Switch => continue 'outer,
+                            Flow::Return => return Ok(()),
                         }
-                    }
-                    Instruction::IteratorNextResult { iterator, output } => {
-                        let it = value!(iterator).clone();
-                        self.frames[fi].pc = pc;
-                        let r = self.iterator_next_result(&it);
-                        refresh!();
-                        value!(output) = tri!(r)
-                    }
-                    Instruction::UnpackIteratorResult { result, output, to } => {
-                        let r = value!(result).clone();
-                        let x = self.unpack_result(&r);
-                        refresh!();
-                        match tri!(x) {
-                            Some(x) => value!(output) = x,
-                            None => pc = to as usize,
-                        }
-                    }
-                    Instruction::IteratorClose { iterator } => {
-                        let it = value!(iterator).clone();
-                        self.frames[fi].pc = pc;
-                        let r = self.iterator_close(&it);
-                        refresh!();
-                        tri!(r)
-                    }
-                    Instruction::IteratorResume { iterator, mode, value, output, done } => {
-                        let it = value!(iterator).clone();
-                        let m = match number!(mode) as u8 {
-                            0 => Resume::Next,
-                            1 => Resume::Throw,
-                            _ => Resume::Return,
-                        };
-                        let v = value!(value).clone();
-                        self.frames[fi].pc = pc;
-                        let r = self.iterator_resume(&it, m, v);
-                        refresh!();
-                        let (x, d) = tri!(r);
-                        value!(output) = x;
-                        scalar!(done) = d as u64
-                    }
-                    Instruction::CreateGenerator => {
-                        let kind = if func.is_async { CoKind::AsyncGenerator } else { CoKind::Generator };
-                        let co = Coroutine::new(kind, func.id, self.frames[fi].closure.clone());
-                        self.frames[fi].co = Some(co.clone());
-                        let fr = self.suspend_top(pc);
-                        co.st.borrow_mut().status = CoStatus::Start;
-                        tri!(self.deliver(fr.ret, Value::Gen(co)));
-                        if self.frames.len() <= stop {
-                            return Ok(());
-                        }
-                        continue 'outer;
-                    }
-                    Instruction::StartAsync => {
-                        let co = Coroutine::new(CoKind::Async, func.id, self.frames[fi].closure.clone());
-                        {
-                            let mut st = co.st.borrow_mut();
-                            st.status = CoStatus::Running;
-                            st.promise = Some(crate::runtime::task::Promise::new());
-                        }
-                        self.frames[fi].co = Some(co);
-                    }
-                    Instruction::Yield { value, .. } => {
-                        let x = value!(value).clone();
-                        let co = self.frames[fi].co.clone().expect("yield outside a generator");
-                        let fr = self.suspend_top(pc);
-                        let out = if co.kind == CoKind::AsyncGenerator {
-                            let req = co.st.borrow_mut().queue.pop_front();
-                            if let Some((_, _, p)) = req {
-                                self.resolve_promise(&p, iter_result(x, false));
-                            }
-                            Value::Undef
-                        } else {
-                            x
-                        };
-                        tri!(self.deliver(fr.ret, out));
-                        if self.frames.len() <= stop {
-                            return Ok(());
-                        }
-                        continue 'outer;
-                    }
-                    Instruction::Await { value, .. } => {
-                        let x = value!(value).clone();
-                        let co = self.frames[fi].co.clone().expect("await outside an async function");
-                        let p = self.promise_of(x);
-                        let fr = self.suspend_top(pc);
-                        co.st.borrow_mut().awaiting = true;
-                        self.promise_react(&p, crate::runtime::task::Reaction::Resume(co.clone()));
-                        // The first `await` of an async call returns its promise to the caller.
-                        let out = match &co.st.borrow().promise {
-                            Some(p) => Value::Promise(p.clone()),
-                            None => Value::Undef,
-                        };
-                        tri!(self.deliver(fr.ret, out));
-                        if self.frames.len() <= stop {
-                            return Ok(());
-                        }
-                        continue 'outer;
                     }
                 }
             };

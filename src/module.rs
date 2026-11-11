@@ -22,6 +22,13 @@ pub struct Module {
     pub stmts: Vec<Stmt>,
     /// Import specifier → index of the module it resolves to.
     pub deps: FxHashMap<Name, usize>,
+    /// A `namespace` block: the module it is written in (whose names it sees).
+    pub parent: Option<usize>,
+    /// A JavaScript file: checked without types.
+    pub is_js: bool,
+    /// CommonJS (`require` / `module.exports`): `.cjs`, or `.js` without
+    /// `import`/`export`.
+    pub is_cjs: bool,
 }
 
 pub struct ModuleGraph {
@@ -80,7 +87,13 @@ fn post_order(ms: &[Module], m: usize, seen: &mut [bool], out: &mut Vec<usize>) 
             }
         }
     }
+    // Then modules reached through `require()` / `import()` (in load order).
+    let mut rest: Vec<usize> = ms[m].deps.values().copied().filter(|d| !deps.iter().any(|(_, e)| e == d)).collect();
+    rest.sort();
     for (_, d) in deps {
+        post_order(ms, d, seen, out);
+    }
+    for d in rest {
         post_order(ms, d, seen, out);
     }
     out.push(m);
@@ -132,14 +145,69 @@ impl Loader<'_> {
         let base = self.sources.add(display, src.clone());
         let toks = lexer::tokenize_at(&src, base)?;
         let stmts = parser::parse_program(toks)?;
+        Ok(self.add_parsed(key, stmts, None))
+    }
+
+    /// Add a parsed module. Each `namespace X { … }` in it becomes a module of
+    /// its own, imported as `import * as X`.
+    fn add_parsed(&mut self, key: String, stmts: Vec<Stmt>, parent: Option<usize>) -> usize {
         let i = self.modules.len();
+        let is_js = [".js", ".mjs", ".cjs", ".jsx"].iter().any(|e| key.ends_with(e));
+        let has_esm = stmts.iter().any(|s| matches!(s.kind, StmtKind::Import(_) | StmtKind::Export(_)));
+        let is_cjs = key.ends_with(".cjs") || (key.ends_with(".js") && !has_esm && !key.starts_with("node:"));
+        let (is_js, is_cjs) = match parent {
+            Some(p) => (self.modules[p].is_js, false),
+            None => (is_js, is_cjs),
+        };
         self.modules.push(Module {
             path: key.clone(),
-            stmts,
+            stmts: Vec::new(),
             deps: FxHashMap::default(),
+            parent,
+            is_js,
+            is_cjs,
         });
-        self.by_path.insert(key, i);
-        Ok(i)
+        self.by_path.insert(key.clone(), i);
+        let mut out = Vec::new();
+        for s in stmts {
+            let (exported, inner) = match &s.kind {
+                StmtKind::Export(e) => match &**e {
+                    ExportDecl::Decl(d) if matches!(d.kind, StmtKind::Namespace { .. }) => (true, d.clone()),
+                    _ => (false, s.clone()),
+                },
+                _ => (false, s.clone()),
+            };
+            let StmtKind::Namespace { name, body } = inner.kind else {
+                out.push(s);
+                continue;
+            };
+            let spec: Name = format!("\u{1}ns:{key}#{name}").into();
+            let child = self.add_parsed(spec.to_string(), body, Some(i));
+            self.modules[i].deps.insert(spec.clone(), child);
+            out.push(Stmt {
+                kind: StmtKind::Import(Rc::new(ImportDecl {
+                    default: None,
+                    namespace: Some(name.clone()),
+                    named: vec![],
+                    from: spec,
+                    type_only: false,
+                    span: s.span,
+                })),
+                span: s.span,
+            });
+            if exported {
+                out.push(Stmt {
+                    kind: StmtKind::Export(Rc::new(ExportDecl::Named {
+                        specs: vec![(name.clone(), name)],
+                        from: None,
+                        span: s.span,
+                    })),
+                    span: s.span,
+                });
+            }
+        }
+        self.modules[i].stmts = out;
+        i
     }
 
     fn resolve_deps(&mut self, m: usize) -> Result<(), CompileError> {
@@ -346,6 +414,9 @@ fn pick_condition(v: &Value) -> Option<String> {
     }
 }
 
+/// The variable holding a CommonJS module's `module.exports` after it runs.
+pub const CJS_EXPORTS: &str = "\u{1}exports";
+
 /// What an exported name refers to, found without type checking.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ExportTarget {
@@ -369,6 +440,10 @@ impl Exports {
         for (mi, m) in g.modules.iter().enumerate() {
             let mut t: FxHashMap<Name, ExportTarget> = FxHashMap::default();
             let mut st = Vec::new();
+            if m.is_cjs {
+                // `module.exports` is the default export.
+                t.insert("default".into(), ExportTarget::Local(mi, CJS_EXPORTS.into()));
+            }
             for s in &m.stmts {
                 let StmtKind::Export(e) = &s.kind else { continue };
                 match &**e {

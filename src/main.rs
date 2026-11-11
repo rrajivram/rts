@@ -10,7 +10,13 @@ fn main() -> ExitCode {
     let mut dump = false;
     let mut erase = false;
     let mut path = None;
+    let mut script_args = Vec::new();
     for a in std::env::args().skip(1) {
+        if path.is_some() {
+            // Everything after the script belongs to it (process.argv).
+            script_args.push(a);
+            continue;
+        }
         match a.as_str() {
             "--dump" => dump = true,
             "--no-types" => erase = true,
@@ -40,8 +46,10 @@ fn main() -> ExitCode {
         return ExitCode::SUCCESS;
     }
     let mut vm = Vm::new(prog);
-    match vm.run_main() {
-        Ok(()) => ExitCode::SUCCESS,
+    let abs = std::fs::canonicalize(&path).map(|p| p.to_string_lossy().into_owned()).unwrap_or(path.clone());
+    vm.args = std::iter::once(abs).chain(script_args).collect();
+    let code = match vm.run_main() {
+        Ok(()) => ExitCode::from(vm.exit_code() as u8),
         Err(e) => {
             let msg = match &e {
                 Value::Obj(_) => vm.inspect(&e),
@@ -50,5 +58,8 @@ fn main() -> ExitCode {
             eprintln!("Uncaught {msg}");
             ExitCode::from(1)
         }
-    }
+    };
+    // The process is exiting: skip tearing down the VM's (large) slot stacks.
+    std::mem::forget(vm);
+    code
 }
