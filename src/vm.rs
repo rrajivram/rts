@@ -1,4 +1,4 @@
-//! The interpreter. Frames index into two shared register stacks (scalars and
+//! The interpreter. Frames index into two shared slot stacks (scalars and
 //! values). Calls into JS functions don't recurse in Rust; only natives that
 //! call back into JS (e.g. `arr.map(f)`) start a nested run loop.
 
@@ -14,9 +14,12 @@ use crate::types::Kind;
 
 const MAX_DEPTH: usize = 10_000;
 
+/// Where a returning function's result goes.
 #[derive(Debug, Clone, Copy)]
 enum Ret {
-    Reg(Kind, R),
+    /// Into the caller's slot (of this slot type, at this index).
+    ToSlot(Kind, u16),
+    /// Nowhere (the call's result is unused).
     Discard,
     /// Return to a native caller (`Vm::call`).
     Native,
@@ -25,49 +28,69 @@ enum Ret {
 /// A function of the running program. The program (held by the VM in an
 /// `Rc`) outlives every frame, so frames borrow functions without refcounting.
 #[derive(Debug, Clone, Copy)]
-struct FnRef(*const FuncCode);
+struct FnRef(*const FunctionCode);
 
 impl FnRef {
-    fn new(f: &Rc<FuncCode>) -> FnRef {
+    fn new(f: &Rc<FunctionCode>) -> FnRef {
         FnRef(Rc::as_ptr(f))
     }
     #[inline(always)]
-    fn get<'a>(self) -> &'a FuncCode {
+    fn get<'a>(self) -> &'a FunctionCode {
         unsafe { &*self.0 }
     }
 }
 
+/// A call in progress.
 #[derive(Debug)]
 struct Frame {
     func: FnRef,
+    /// The next instruction to run (saved while the frame is not on top).
     pc: usize,
-    sb: usize,
-    vb: usize,
+    /// Where this frame's slots start in `Vm::scalars` and `Vm::values`.
+    scalar_base: usize,
+    value_base: usize,
+    /// The closure being run, whose captured cells `ReadCapture` reads.
     closure: Option<Rc<Closure>>,
     ret: Ret,
 }
 
 pub struct Vm {
     pub prog: Rc<Program>,
-    s: Vec<u64>,
-    v: Vec<Value>,
-    gs: Vec<u64>,
-    gv: Vec<Value>,
+    /// The number/boolean slots of every frame, one after another (each frame
+    /// uses `scalar_slots` of them from its `scalar_base`).
+    scalars: Vec<u64>,
+    /// The value slots of every frame, likewise.
+    values: Vec<Value>,
+    /// Global variables: numbers/booleans and values.
+    global_scalars: Vec<u64>,
+    global_values: Vec<Value>,
     frames: Vec<Frame>,
-    /// Active try handlers: (frame index, catch pc, exception register).
-    handlers: Vec<(usize, u32, R)>,
+    /// Active try handlers: (frame index, catch pc, exception slot).
+    handlers: Vec<(usize, u32, ValSlot)>,
     out: std::io::BufWriter<std::io::Stdout>,
     pub start: Instant,
     native_ret: Value,
 }
 
+/// A number slot's contents as an f64, and an f64 as number slot contents.
 #[inline(always)]
-fn f(bits: u64) -> f64 {
+fn from_bits(bits: u64) -> f64 {
     f64::from_bits(bits)
 }
 #[inline(always)]
-fn b(x: f64) -> u64 {
+fn bits(x: f64) -> u64 {
     x.to_bits()
+}
+
+/// The BigInt in scalar slots `at` (low half) and `at + 1` (high half).
+#[inline(always)]
+fn read_big(scalars: &[u64], at: usize) -> i128 {
+    (((scalars[at + 1] as u128) << 64) | scalars[at] as u128) as i128
+}
+#[inline(always)]
+fn write_big(scalars: &mut [u64], at: usize, n: i128) {
+    scalars[at] = n as u64;
+    scalars[at + 1] = ((n as u128) >> 64) as u64;
 }
 
 fn num_op(op: NumOp, x: f64, y: f64) -> f64 {
@@ -95,6 +118,42 @@ fn dyn_num(op: NumOp, a: &Value, b: &Value) -> f64 {
         (a, b) => (a.to_number(), b.to_number()),
     };
     if op == NumOp::Mod { fast_mod(x, y) } else { num_op(op, x, y) }
+}
+
+/// `left op right` on two dynamic values, as a Value: numbers, or BigInts
+/// when both are BigInts (a BigInt and anything else is a TypeError).
+fn dyn_numeric(op: NumOp, a: &Value, b: &Value) -> Result<Value, bigint::BigIntError> {
+    match (a, b) {
+        (Value::BigInt(x), Value::BigInt(y)) => bigint::arithmetic(op, **x, **y).map(Value::bigint),
+        (Value::BigInt(_), _) | (_, Value::BigInt(_)) => Err(bigint::MIX),
+        (a, b) => Ok(Value::Num(dyn_num(op, a, b))),
+    }
+}
+
+/// Whether `ordering` satisfies the relational operator `op`.
+fn holds(op: CmpOp, o: std::cmp::Ordering) -> bool {
+    match op {
+        CmpOp::Lt => o.is_lt(),
+        CmpOp::Le => o.is_le(),
+        CmpOp::Gt => o.is_gt(),
+        CmpOp::Ge => o.is_ge(),
+        CmpOp::Eq => o.is_eq(),
+        CmpOp::Ne => o.is_ne(),
+    }
+}
+
+/// `left op right` (`<` etc.) on two dynamic values. BigInts compare exactly
+/// with numbers and with numeric strings; NaN makes it false.
+fn dyn_compare(op: CmpOp, a: &Value, b: &Value) -> bool {
+    match (a, b) {
+        (Value::Str(x), Value::Str(y)) => str_cmp(op, &x.s, &y.s),
+        (Value::BigInt(x), Value::BigInt(y)) => bigint::compare(op, **x, **y),
+        (Value::BigInt(x), Value::Str(s)) => bigint::parse(&s.s).is_some_and(|y| bigint::compare(op, **x, y)),
+        (Value::Str(s), Value::BigInt(y)) => bigint::parse(&s.s).is_some_and(|x| bigint::compare(op, x, **y)),
+        (Value::BigInt(x), b) => bigint::cmp_number(**x, b.to_number()).is_some_and(|o| holds(op, o)),
+        (a, Value::BigInt(y)) => bigint::cmp_number(**y, a.to_number()).is_some_and(|o| holds(op, o.reverse())),
+        (a, b) => cmp(op, a.to_number(), b.to_number()),
+    }
 }
 
 /// `%` with an integer fast path (fmod is slow); same results as JS, including -0.
@@ -154,10 +213,10 @@ impl Vm {
     pub fn new(prog: Program) -> Vm {
         let prog = Rc::new(prog);
         Vm {
-            s: vec![0; 1024],
-            v: vec![Value::Undef; 1024],
-            gs: vec![0; prog.n_gs],
-            gv: vec![Value::Undef; prog.n_gv],
+            scalars: vec![0; 1024],
+            values: vec![Value::Undef; 1024],
+            global_scalars: vec![0; prog.global_scalars],
+            global_values: vec![Value::Undef; prog.global_values],
             frames: Vec::new(),
             handlers: Vec::new(),
             out: std::io::BufWriter::with_capacity(1 << 16, std::io::stdout()),
@@ -202,6 +261,12 @@ impl Vm {
     pub fn range_error(&mut self, msg: String) -> Value {
         self.make_error(self.prog.range_error_class, msg)
     }
+    pub fn bigint_error(&mut self, e: bigint::BigIntError) -> Value {
+        match e {
+            bigint::BigIntError::Range(m) => self.range_error(m.into()),
+            bigint::BigIntError::Type(m) => self.type_error(m.into()),
+        }
+    }
     pub fn syntax_error(&mut self, msg: String) -> Value {
         self.make_error(self.prog.syntax_error_class.or(self.prog.error_class), msg)
     }
@@ -215,8 +280,8 @@ impl Vm {
         self.frames.push(Frame {
             func: FnRef::new(&main),
             pc: 0,
-            sb: 0,
-            vb: 0,
+            scalar_base: 0,
+            value_base: 0,
             closure: None,
             ret: Ret::Discard,
         });
@@ -245,11 +310,11 @@ impl Vm {
             return Err(self.range_error("Maximum call stack size exceeded".into()));
         }
         let (sb, vb) = match self.frames.last() {
-            Some(top) => (top.sb + top.func.get().ns, top.vb + top.func.get().nv),
+            Some(top) => (top.scalar_base + top.func.get().scalar_slots, top.value_base + top.func.get().value_slots),
             None => (0, 0),
         };
         self.ensure(sb, vb, &func);
-        self.v[vb] = this;
+        self.values[vb] = this;
         if func.rest {
             self.bind_values(&func, sb, vb, args.to_vec())?;
         } else {
@@ -259,8 +324,8 @@ impl Vm {
         self.frames.push(Frame {
             func: FnRef::new(&func),
             pc: 0,
-            sb,
-            vb,
+            scalar_base: sb,
+            value_base: vb,
             closure,
             ret: Ret::Native,
         });
@@ -268,19 +333,19 @@ impl Vm {
         Ok(std::mem::take(&mut self.native_ret))
     }
 
-    fn ensure(&mut self, sb: usize, vb: usize, func: &FuncCode) {
-        let need_s = sb + func.ns + 1;
-        if self.s.len() < need_s {
-            self.s.resize(need_s.max(self.s.len() * 2), 0);
+    fn ensure(&mut self, sb: usize, vb: usize, func: &FunctionCode) {
+        let need_s = sb + func.scalar_slots + 1;
+        if self.scalars.len() < need_s {
+            self.scalars.resize(need_s.max(self.scalars.len() * 2), 0);
         }
-        let need_v = vb + func.nv + 1;
-        if self.v.len() < need_v {
-            self.v.resize(need_v.max(self.v.len() * 2), Value::Undef);
+        let need_v = vb + func.value_slots + 1;
+        if self.values.len() < need_v {
+            self.values.resize(need_v.max(self.values.len() * 2), Value::Undef);
         }
     }
 
-    /// Bind boxed argument values to a callee's parameter registers.
-    fn bind_values(&mut self, func: &FuncCode, sb: usize, vb: usize, mut args: Vec<Value>) -> Result<(), Value> {
+    /// Bind boxed argument values to a callee's parameter slots.
+    fn bind_values(&mut self, func: &FunctionCode, sb: usize, vb: usize, mut args: Vec<Value>) -> Result<(), Value> {
         let np = func.params.len();
         if func.rest && np > 0 {
             let rest: Vec<Value> = if args.len() >= np { args.split_off(np - 1) } else { vec![] };
@@ -291,63 +356,77 @@ impl Vm {
         self.bind_slice(func, sb, vb, &args)
     }
 
-    /// Bind argument values (no rest packing) to a callee's parameter registers.
-    fn bind_slice(&mut self, func: &FuncCode, sb: usize, vb: usize, args: &[Value]) -> Result<(), Value> {
+    /// Bind argument values (no rest packing) to a callee's parameter slots.
+    fn bind_slice(&mut self, func: &FunctionCode, sb: usize, vb: usize, args: &[Value]) -> Result<(), Value> {
         let (mut si, mut vi) = (0usize, 1usize);
         for (i, k) in func.params.iter().enumerate() {
             let a = args.get(i);
             match k {
                 Kind::Val => {
-                    self.v[vb + vi] = a.cloned().unwrap_or(Value::Undef);
+                    self.values[vb + vi] = a.cloned().unwrap_or(Value::Undef);
                     vi += 1;
                 }
                 k => {
-                    self.s[sb + si] = match a {
-                        Some(a) => self.unbox(*k, a)?,
-                        None if *k == Kind::Num => b(f64::NAN),
-                        None => 0,
-                    };
-                    si += 1;
+                    match a {
+                        Some(a) => self.unbox_into(*k, a, sb + si)?,
+                        None => self.default_into(*k, sb + si),
+                    }
+                    si += k.width() as usize;
                 }
             }
         }
         Ok(())
     }
 
-    fn unbox(&mut self, k: Kind, v: &Value) -> Result<u64, Value> {
+    /// Store `v` (checked to be of kind `k`) into the scalar slot(s) at `at`.
+    fn unbox_into(&mut self, k: Kind, v: &Value, at: usize) -> Result<(), Value> {
         match (k, v) {
-            (Kind::Num, Value::Num(n)) => Ok(b(*n)),
-            (Kind::Bool, Value::Bool(x)) => Ok(*x as u64),
-            (Kind::Num, v) => Err(self.type_error(format!("expected a number, got {}", describe(v)))),
-            (Kind::Bool, v) => Err(self.type_error(format!("expected a boolean, got {}", describe(v)))),
+            (Kind::Num, Value::Num(n)) => self.scalars[at] = bits(*n),
+            (Kind::Bool, Value::Bool(x)) => self.scalars[at] = *x as u64,
+            (Kind::Big, Value::BigInt(n)) => write_big(&mut self.scalars, at, **n),
+            (Kind::Num, v) => return Err(self.type_error(format!("expected a number, got {}", describe(v)))),
+            (Kind::Bool, v) => return Err(self.type_error(format!("expected a boolean, got {}", describe(v)))),
+            (Kind::Big, v) => return Err(self.type_error(format!("expected a bigint, got {}", describe(v)))),
             (Kind::Val, _) => unreachable!(),
+        }
+        Ok(())
+    }
+
+    /// A missing argument for a scalar parameter.
+    fn default_into(&mut self, k: Kind, at: usize) {
+        match k {
+            Kind::Num => self.scalars[at] = bits(f64::NAN),
+            Kind::Big => write_big(&mut self.scalars, at, 0),
+            _ => self.scalars[at] = 0,
         }
     }
 
-    fn boxed(k: Kind, bits: u64) -> Value {
+    /// The scalar slot(s) at `at`, of kind `k`, as a Value.
+    fn boxed_at(&self, k: Kind, at: usize) -> Value {
         match k {
-            Kind::Num => Value::Num(f(bits)),
-            Kind::Bool => Value::Bool(bits != 0),
+            Kind::Num => Value::Num(from_bits(self.scalars[at])),
+            Kind::Bool => Value::Bool(self.scalars[at] != 0),
+            Kind::Big => Value::bigint(read_big(&self.scalars, at)),
             Kind::Val => unreachable!(),
         }
     }
 
-    /// Read a caller register of the given kind as a Value.
-    fn read_val(&self, k: Kind, r: R, sb: usize, vb: usize) -> Value {
+    /// Read a caller's slot of the given kind as a Value.
+    fn read_val(&self, k: Kind, r: u16, sb: usize, vb: usize) -> Value {
         match k {
-            Kind::Val => self.v[vb + r as usize].clone(),
-            k => Self::boxed(k, self.s[sb + r as usize]),
+            Kind::Val => self.values[vb + r as usize].clone(),
+            k => self.boxed_at(k, sb + r as usize),
         }
     }
 
     // ───────────── calls ─────────────
 
     /// Perform a call. Returns Ok(true) if a JS frame was pushed.
-    fn do_call(&mut self, caller: &FuncCode, ci: &CallInfo, sb: usize, vb: usize) -> Result<bool, Value> {
-        let this = ci.this.map(|r| self.v[vb + r as usize].clone());
+    fn do_call(&mut self, caller: &FunctionCode, ci: &CallSite, sb: usize, vb: usize) -> Result<bool, Value> {
+        let this = ci.this.map(|r| self.values[vb + r.index()].clone());
         let (func, closure) = match &ci.target {
             CallTarget::Direct(fi) => (self.prog.funcs[*fi as usize].clone(), None),
-            CallTarget::Value(r) => match &self.v[vb + *r as usize] {
+            CallTarget::Value(r) => match &self.values[vb + r.index()] {
                 Value::Func(c) => (self.prog.funcs[c.func as usize].clone(), Some(c.clone())),
                 Value::Native(n) => {
                     let n = *n;
@@ -361,7 +440,7 @@ impl Vm {
                     return Err(self.type_error(format!("{d} is not a function")));
                 }
             },
-            CallTarget::Method(slot) => match this.as_ref() {
+            CallTarget::Method { slot, .. } => match this.as_ref() {
                 Some(Value::Obj(o)) if o.class.is_some() => {
                     let fi = o.class.as_ref().unwrap().vtable[*slot as usize];
                     (self.prog.funcs[fi as usize].clone(), None)
@@ -372,8 +451,8 @@ impl Vm {
                 }
                 None => unreachable!(),
             },
-            CallTarget::Prop(p) => 'prop: {
-                let site = &caller.props[*p as usize];
+            CallTarget::Property(p) => 'prop: {
+                let site = &caller.property_sites[*p as usize];
                 let recv = this.clone().unwrap_or(Value::Undef);
                 // Method inline cache: same shape and class as last time → same method.
                 if let Value::Obj(o) = &recv
@@ -422,15 +501,15 @@ impl Vm {
         if self.frames.len() >= MAX_DEPTH {
             return Err(self.range_error("Maximum call stack size exceeded".into()));
         }
-        let nsb = sb + caller.ns;
-        let nvb = vb + caller.nv;
+        let nsb = sb + caller.scalar_slots;
+        let nvb = vb + caller.value_slots;
         self.ensure(nsb, nvb, &func);
-        self.v[nvb] = this.unwrap_or(Value::Undef);
+        self.values[nvb] = this.unwrap_or(Value::Undef);
         if ci.has_spread || (func.rest && !ci.packed_rest) {
             let args = self.collect_args(ci, sb, vb)?;
             self.bind_values(&func, nsb, nvb, args)?;
         } else {
-            // Fast path: copy arguments register to register, converting kinds only on mismatch.
+            // Fast path: copy arguments slot to slot, converting kinds only on mismatch.
             let (mut si, mut vi) = (0usize, 1usize);
             for (i, pk) in func.params.iter().enumerate() {
                 match ci.args.get(i) {
@@ -438,45 +517,48 @@ impl Vm {
                         if ak == *pk {
                             match ak {
                                 Kind::Val => {
-                                    self.v[nvb + vi] = self.v[vb + ar as usize].clone();
+                                    self.values[nvb + vi] = self.values[vb + ar as usize].clone();
                                 }
-                                _ => self.s[nsb + si] = self.s[sb + ar as usize],
+                                Kind::Big => {
+                                    self.scalars[nsb + si] = self.scalars[sb + ar as usize];
+                                    self.scalars[nsb + si + 1] = self.scalars[sb + ar as usize + 1];
+                                }
+                                _ => self.scalars[nsb + si] = self.scalars[sb + ar as usize],
                             }
                         } else if *pk == Kind::Val {
-                            self.v[nvb + vi] = Self::boxed(ak, self.s[sb + ar as usize]);
+                            self.values[nvb + vi] = self.boxed_at(ak, sb + ar as usize);
                         } else {
                             let val = self.read_val(ak, ar, sb, vb);
-                            self.s[nsb + si] = self.unbox(*pk, &val)?;
+                            self.unbox_into(*pk, &val, nsb + si)?;
                         }
                     }
                     None => match pk {
-                        Kind::Val => self.v[nvb + vi] = Value::Undef,
-                        Kind::Num => self.s[nsb + si] = b(f64::NAN),
-                        Kind::Bool => self.s[nsb + si] = 0,
+                        Kind::Val => self.values[nvb + vi] = Value::Undef,
+                        k => self.default_into(*k, nsb + si),
                     },
                 }
                 if *pk == Kind::Val {
                     vi += 1;
                 } else {
-                    si += 1;
+                    si += pk.width() as usize;
                 }
             }
         }
         self.frames.push(Frame {
             func: FnRef::new(&func),
             pc: 0,
-            sb: nsb,
-            vb: nvb,
+            scalar_base: nsb,
+            value_base: nvb,
             closure,
-            ret: match ci.dst {
-                Some((k, r)) => Ret::Reg(k, r),
+            ret: match ci.output {
+                Some((k, r)) => Ret::ToSlot(k, r),
                 None => Ret::Discard,
             },
         });
         Ok(true)
     }
 
-    fn collect_args(&mut self, ci: &CallInfo, sb: usize, vb: usize) -> Result<Vec<Value>, Value> {
+    fn collect_args(&mut self, ci: &CallSite, sb: usize, vb: usize) -> Result<Vec<Value>, Value> {
         let mut out = Vec::with_capacity(ci.args.len());
         for (i, &(k, r)) in ci.args.iter().enumerate() {
             let v = self.read_val(k, r, sb, vb);
@@ -489,19 +571,19 @@ impl Vm {
         Ok(out)
     }
 
-    fn call_native_ci(&mut self, n: Native, ci: &CallInfo, this: Value, sb: usize, vb: usize) -> Result<bool, Value> {
+    fn call_native_ci(&mut self, n: Native, ci: &CallSite, this: Value, sb: usize, vb: usize) -> Result<bool, Value> {
         let args = self.collect_args(ci, sb, vb)?;
         let r = call_native(self, n, this, args)?;
-        if let Some((k, d)) = ci.dst {
+        if let Some((k, d)) = ci.output {
             self.store(k, d, sb, vb, r)?;
         }
         Ok(false)
     }
 
-    fn store(&mut self, k: Kind, d: R, sb: usize, vb: usize, val: Value) -> Result<(), Value> {
+    fn store(&mut self, k: Kind, d: u16, sb: usize, vb: usize, val: Value) -> Result<(), Value> {
         match k {
-            Kind::Val => self.v[vb + d as usize] = val,
-            k => self.s[sb + d as usize] = self.unbox(k, &val)?,
+            Kind::Val => self.values[vb + d as usize] = val,
+            k => self.unbox_into(k, &val, sb + d as usize)?,
         }
         Ok(())
     }
@@ -542,7 +624,7 @@ impl Vm {
         c.methods.get(key.as_str()).copied()
     }
 
-    fn get_prop_slow(&mut self, recv: &Value, site: &PropSite) -> Result<Value, Value> {
+    fn get_prop_slow(&mut self, recv: &Value, site: &PropertySite) -> Result<Value, Value> {
         let name = &*site.name;
         match recv {
             Value::Obj(o) => {
@@ -575,7 +657,7 @@ impl Vm {
         }
     }
 
-    fn set_prop(&mut self, recv: &Value, site: &PropSite, val: Value) -> Result<(), Value> {
+    fn set_prop(&mut self, recv: &Value, site: &PropertySite, val: Value) -> Result<(), Value> {
         match recv {
             Value::Obj(o) if o.inner.borrow().shape.lookup(&site.name).is_none() && Self::accessor(o, "set", &site.name).is_some() => {
                 let s = Self::accessor(o, "set", &site.name).unwrap();
@@ -619,13 +701,13 @@ impl Vm {
     fn do_return(&mut self, val: Value, stop: usize) -> Result<bool, Value> {
         let fr = self.frames.pop().unwrap();
         // Release the frame's references now: deterministic destruction.
-        for x in &mut self.v[fr.vb..fr.vb + fr.func.get().nv] {
+        for x in &mut self.values[fr.value_base..fr.value_base + fr.func.get().value_slots] {
             x.release();
         }
         match fr.ret {
-            Ret::Reg(k, d) => {
+            Ret::ToSlot(k, d) => {
                 let top = self.frames.last().unwrap();
-                let (sb, vb) = (top.sb, top.vb);
+                let (sb, vb) = (top.scalar_base, top.value_base);
                 self.store(k, d, sb, vb, val)?;
             }
             Ret::Discard => {}
@@ -638,18 +720,39 @@ impl Vm {
     #[inline]
     fn do_return_s(&mut self, k: Kind, bits: u64, stop: usize) -> Result<bool, Value> {
         if let Some(fr) = self.frames.last()
-            && let Ret::Reg(rk, d) = fr.ret
+            && let Ret::ToSlot(rk, d) = fr.ret
             && rk == k
         {
             let fr = self.frames.pop().unwrap();
-            for x in &mut self.v[fr.vb..fr.vb + fr.func.get().nv] {
+            for x in &mut self.values[fr.value_base..fr.value_base + fr.func.get().value_slots] {
                 x.release();
             }
             let top = self.frames.last().unwrap();
-            self.s[top.sb + d as usize] = bits;
+            self.scalars[top.scalar_base + d as usize] = bits;
             return Ok(self.frames.len() <= stop);
         }
-        self.do_return(Self::boxed(k, bits), stop)
+        let v = match k {
+            Kind::Num => Value::Num(from_bits(bits)),
+            _ => Value::Bool(bits != 0),
+        };
+        self.do_return(v, stop)
+    }
+
+    /// Like do_return_s for a BigInt.
+    #[inline]
+    fn do_return_big(&mut self, n: i128, stop: usize) -> Result<bool, Value> {
+        if let Some(fr) = self.frames.last()
+            && let Ret::ToSlot(Kind::Big, d) = fr.ret
+        {
+            let fr = self.frames.pop().unwrap();
+            for x in &mut self.values[fr.value_base..fr.value_base + fr.func.get().value_slots] {
+                x.release();
+            }
+            let top = self.frames.last().unwrap();
+            write_big(&mut self.scalars, top.scalar_base + d as usize, n);
+            return Ok(self.frames.len() <= stop);
+        }
+        self.do_return(Value::bigint(n), stop)
     }
 
     fn unwind(&mut self, err: Value, stop: usize) -> Result<(), Value> {
@@ -661,12 +764,12 @@ impl Vm {
                 self.handlers.pop();
                 let fr = &mut self.frames[top];
                 fr.pc = catch as usize;
-                let vb = fr.vb;
-                self.v[vb + exc as usize] = err;
+                let vb = fr.value_base;
+                self.values[vb + exc.index()] = err;
                 return Ok(());
             }
             let fr = self.frames.pop().unwrap();
-            for x in &mut self.v[fr.vb..fr.vb + fr.func.get().nv] {
+            for x in &mut self.values[fr.value_base..fr.value_base + fr.func.get().value_slots] {
                 x.release();
             }
             if self.frames.len() <= stop {
@@ -680,40 +783,59 @@ impl Vm {
     fn run(&mut self, stop: usize) -> Result<(), Value> {
         'outer: loop {
             let fi = self.frames.len() - 1;
-            let func: &FuncCode = self.frames[fi].func.get();
+            let func: &FunctionCode = self.frames[fi].func.get();
             let code = &func.code[..];
             let mut pc = self.frames[fi].pc;
-            let sb = self.frames[fi].sb;
-            let vb = self.frames[fi].vb;
+            let sb = self.frames[fi].scalar_base;
+            let vb = self.frames[fi].value_base;
 
-            // Register access is unchecked: codegen guarantees every register
+            // Slot access is unchecked: codegen guarantees every slot
             // index is below the function's ns/nv, and `ensure` sized the
             // stacks before the frame was pushed. The base pointers are
             // refreshed after anything that can grow the stacks (calls).
-            let mut sp: *mut u64 = unsafe { self.s.as_mut_ptr().add(sb) };
-            let mut vp: *mut Value = unsafe { self.v.as_mut_ptr().add(vb) };
-            macro_rules! s {
+            let mut sp: *mut u64 = unsafe { self.scalars.as_mut_ptr().add(sb) };
+            let mut vp: *mut Value = unsafe { self.values.as_mut_ptr().add(vb) };
+            // `scalar!(slot)`, `value!(slot)`: this frame's slot, read or written.
+            // `number!(slot)`: a number slot's f64.
+            macro_rules! scalar {
                 ($r:expr) => {
-                    *unsafe { &mut *sp.add($r as usize) }
+                    *unsafe { &mut *sp.add(SlotIndex::index($r)) }
                 };
             }
-            macro_rules! v {
+            macro_rules! value {
                 ($r:expr) => {
-                    *unsafe { &mut *vp.add($r as usize) }
+                    *unsafe { &mut *vp.add(SlotIndex::index($r)) }
                 };
             }
-            macro_rules! n {
+            macro_rules! number {
                 ($r:expr) => {
-                    f(unsafe { *sp.add($r as usize) })
+                    from_bits(unsafe { *sp.add(SlotIndex::index($r)) })
                 };
+            }
+            // `big!(slot)`: a bigint slot's i128; `set_big!(slot, n)` writes one.
+            macro_rules! big {
+                ($r:expr) => {{
+                    let i = SlotIndex::index($r);
+                    unsafe { ((*sp.add(i) as u128) | ((*sp.add(i + 1) as u128) << 64)) as i128 }
+                }};
+            }
+            macro_rules! set_big {
+                ($r:expr, $n:expr) => {{
+                    let i = SlotIndex::index($r);
+                    let n: i128 = $n;
+                    unsafe {
+                        *sp.add(i) = n as u64;
+                        *sp.add(i + 1) = ((n as u128) >> 64) as u64;
+                    }
+                }};
             }
             macro_rules! refresh {
                 () => {
-                    sp = unsafe { self.s.as_mut_ptr().add(sb) };
-                    vp = unsafe { self.v.as_mut_ptr().add(vb) };
+                    sp = unsafe { self.scalars.as_mut_ptr().add(sb) };
+                    vp = unsafe { self.values.as_mut_ptr().add(vb) };
                 };
             }
-            debug_assert!(sb + func.ns <= self.s.len() && vb + func.nv <= self.v.len());
+            debug_assert!(sb + func.scalar_slots <= self.scalars.len() && vb + func.value_slots <= self.values.len());
             macro_rules! tri {
                 ($e:expr) => {
                     match $e {
@@ -729,108 +851,150 @@ impl Vm {
                 let ins = unsafe { *code.get_unchecked(pc) };
                 pc += 1;
                 match ins {
-                    I::LoadN { d, v } => s!(d) = b(v),
-                    I::LoadB { d, v } => s!(d) = v as u64,
-                    I::MovS { d, s } => s!(d) = s!(s),
-                    I::AddN { d, a, b: bb } => s!(d) = b(n!(a) + n!(bb)),
-                    I::SubN { d, a, b: bb } => s!(d) = b(n!(a) - n!(bb)),
-                    I::MulN { d, a, b: bb } => s!(d) = b(n!(a) * n!(bb)),
-                    I::DivN { d, a, b: bb } => s!(d) = b(n!(a) / n!(bb)),
-                    I::ModN { d, a, b: bb } => s!(d) = b(fast_mod(n!(a), n!(bb))),
-                    I::AddNK { d, a, k } => s!(d) = b(n!(a) + k),
-                    I::NumOp { op, d, a, b: bb } => s!(d) = b(num_op(op, n!(a), n!(bb))),
-                    I::LtN { d, a, b: bb } => s!(d) = (n!(a) < n!(bb)) as u64,
-                    I::LeN { d, a, b: bb } => s!(d) = (n!(a) <= n!(bb)) as u64,
-                    I::GtN { d, a, b: bb } => s!(d) = (n!(a) > n!(bb)) as u64,
-                    I::GeN { d, a, b: bb } => s!(d) = (n!(a) >= n!(bb)) as u64,
-                    I::EqN { d, a, b: bb } => s!(d) = (n!(a) == n!(bb)) as u64,
-                    I::NeN { d, a, b: bb } => s!(d) = (n!(a) != n!(bb)) as u64,
-                    I::EqB { d, a, b: bb } => s!(d) = (s!(a) == s!(bb)) as u64,
-                    I::NeB { d, a, b: bb } => s!(d) = (s!(a) != s!(bb)) as u64,
-                    I::NegN { d, s } => s!(d) = b(-n!(s)),
-                    I::NotB { d, s } => s!(d) = (s!(s) == 0) as u64,
-                    I::BitNotN { d, s } => s!(d) = b(!to_int32(n!(s)) as f64),
-                    I::TruthyN { d, s } => {
-                        let x = n!(s);
-                        s!(d) = (x != 0.0 && !x.is_nan()) as u64
+                    Instruction::LoadNumber { output, value } => scalar!(output) = bits(value),
+                    Instruction::LoadBool { output, value } => scalar!(output) = value as u64,
+                    Instruction::CopyNumber { to, from } => scalar!(to) = scalar!(from),
+                    Instruction::CopyBool { to, from } => scalar!(to) = scalar!(from),
+                    Instruction::Arithmetic { op: NumOp::Add, output, left, right } => scalar!(output) = bits(number!(left) + number!(right)),
+                    Instruction::Arithmetic { op: NumOp::Sub, output, left, right } => scalar!(output) = bits(number!(left) - number!(right)),
+                    Instruction::Arithmetic { op: NumOp::Mul, output, left, right } => scalar!(output) = bits(number!(left) * number!(right)),
+                    Instruction::Arithmetic { op: NumOp::Div, output, left, right } => scalar!(output) = bits(number!(left) / number!(right)),
+                    Instruction::Arithmetic { op: NumOp::Mod, output, left, right } => scalar!(output) = bits(fast_mod(number!(left), number!(right))),
+                    Instruction::AddConstant { output, left, constant } => scalar!(output) = bits(number!(left) + constant),
+                    Instruction::Arithmetic { op, output, left, right } => scalar!(output) = bits(num_op(op, number!(left), number!(right))),
+                    Instruction::Compare { op: CmpOp::Lt, output, left, right } => scalar!(output) = (number!(left) < number!(right)) as u64,
+                    Instruction::Compare { op: CmpOp::Le, output, left, right } => scalar!(output) = (number!(left) <= number!(right)) as u64,
+                    Instruction::Compare { op: CmpOp::Gt, output, left, right } => scalar!(output) = (number!(left) > number!(right)) as u64,
+                    Instruction::Compare { op: CmpOp::Ge, output, left, right } => scalar!(output) = (number!(left) >= number!(right)) as u64,
+                    Instruction::Compare { op: CmpOp::Eq, output, left, right } => scalar!(output) = (number!(left) == number!(right)) as u64,
+                    Instruction::Compare { op: CmpOp::Ne, output, left, right } => scalar!(output) = (number!(left) != number!(right)) as u64,
+                    Instruction::CompareBools { equal: true, output, left, right } => scalar!(output) = (scalar!(left) == scalar!(right)) as u64,
+                    Instruction::CompareBools { equal: false, output, left, right } => scalar!(output) = (scalar!(left) != scalar!(right)) as u64,
+                    Instruction::Negate { output, value } => scalar!(output) = bits(-number!(value)),
+                    Instruction::Not { output, value } => scalar!(output) = (scalar!(value) == 0) as u64,
+                    Instruction::BitNot { output, value } => scalar!(output) = bits(!to_int32(number!(value)) as f64),
+                    Instruction::NumberIsTruthy { output, value } => {
+                        let x = number!(value);
+                        scalar!(output) = (x != 0.0 && !x.is_nan()) as u64
                     }
-                    I::Math1 { op, d, s } => s!(d) = b(natives::math1(op, n!(s))),
-                    I::Math2 { op, d, a, b: bb } => s!(d) = b(natives::math2(op, n!(a), n!(bb))),
+                    Instruction::MathUnary { function, output, value } => scalar!(output) = bits(natives::math1(function, number!(value))),
+                    Instruction::MathBinary { function, output, left, right } => scalar!(output) = bits(natives::math2(function, number!(left), number!(right))),
 
-                    I::Jmp { t } => pc = t as usize,
-                    I::JmpT { c, t } => {
-                        if s!(c) != 0 {
-                            pc = t as usize
+                    Instruction::LoadBigInt { constant, output } => {
+                        let Value::BigInt(n) = &func.constants[constant as usize] else { unreachable!() };
+                        set_big!(output, **n)
+                    }
+                    Instruction::CopyBigInt { from, to } => set_big!(to, big!(from)),
+                    Instruction::BigIntArithmetic { op, left, right, output } => match bigint::arithmetic(op, big!(left), big!(right)) {
+                        Ok(n) => set_big!(output, n),
+                        Err(e) => break self.bigint_error(e),
+                    },
+                    Instruction::CompareBigInts { op, left, right, output } => scalar!(output) = bigint::compare(op, big!(left), big!(right)) as u64,
+                    Instruction::NegateBigInt { value, output } => match bigint::negate(big!(value)) {
+                        Ok(n) => set_big!(output, n),
+                        Err(e) => break self.bigint_error(e),
+                    },
+                    Instruction::BitNotBigInt { value, output } => set_big!(output, !big!(value)),
+                    Instruction::BigIntIsTruthy { value, output } => scalar!(output) = (big!(value) != 0) as u64,
+                    Instruction::BoxBigInt { value, output } => value!(output) = Value::bigint(big!(value)),
+                    Instruction::UnboxBigInt { value, output } => {
+                        let n = match &value!(value) {
+                            Value::BigInt(n) => **n,
+                            other => {
+                                let m = format!("expected a bigint, got {}", describe(other));
+                                break self.type_error(m);
+                            }
+                        };
+                        set_big!(output, n)
+                    }
+                    Instruction::ReadGlobalBigInt { global, output } => set_big!(output, read_big(&self.global_scalars, global as usize)),
+                    Instruction::WriteGlobalBigInt { global, value } => write_big(&mut self.global_scalars, global as usize, big!(value)),
+                    Instruction::ReturnBigInt { value } => {
+                        if tri!(self.do_return_big(big!(value), stop)) {
+                            return Ok(());
+                        }
+                        continue 'outer;
+                    }
+
+                    Instruction::Jump { to } => pc = to as usize,
+                    Instruction::JumpIf { when: true, condition, to } => {
+                        if scalar!(condition) != 0 {
+                            pc = to as usize
                         }
                     }
-                    I::JmpF { c, t } => {
-                        if s!(c) == 0 {
-                            pc = t as usize
+                    Instruction::JumpIf { when: false, condition, to } => {
+                        if scalar!(condition) == 0 {
+                            pc = to as usize
                         }
                     }
-                    I::JCmpN { op, sense, a, b: bb, t } => {
-                        if cmp(op, n!(a), n!(bb)) == sense {
-                            pc = t as usize
+                    Instruction::JumpIfCompare { op, when, left, right, to } => {
+                        if cmp(op, number!(left), number!(right)) == when {
+                            pc = to as usize
                         }
                     }
-                    I::JmpTV { c, t } => {
-                        if v!(c).truthy() {
-                            pc = t as usize
+                    Instruction::JumpIfTruthy { when: true, value, to } => {
+                        if value!(value).truthy() {
+                            pc = to as usize
                         }
                     }
-                    I::JmpFV { c, t } => {
-                        if !v!(c).truthy() {
-                            pc = t as usize
+                    Instruction::JumpIfTruthy { when: false, value, to } => {
+                        if !value!(value).truthy() {
+                            pc = to as usize
                         }
                     }
-                    I::JmpNullish { s, t } => {
-                        if v!(s).is_nullish() {
-                            pc = t as usize
+                    Instruction::JumpIfNullish { when: true, value, to } => {
+                        if value!(value).is_nullish() {
+                            pc = to as usize
                         }
                     }
-                    I::JmpNotNullish { s, t } => {
-                        if !v!(s).is_nullish() {
-                            pc = t as usize
+                    Instruction::JumpIfNullish { when: false, value, to } => {
+                        if !value!(value).is_nullish() {
+                            pc = to as usize
                         }
                     }
 
-                    I::LoadK { d, k } => v!(d) = func.consts[k as usize].clone(),
-                    I::LoadUndef { d } => v!(d) = Value::Undef,
-                    I::LoadNull { d } => v!(d) = Value::Null,
-                    I::MovV { d, s } => v!(d) = v!(s).clone(),
-                    I::ClearV { d, n } => {
-                        for x in &mut self.v[vb + d as usize..vb + d as usize + n as usize] {
+                    Instruction::LoadConstant { output, constant } => value!(output) = func.constants[constant as usize].clone(),
+                    Instruction::LoadUndefined { output } => value!(output) = Value::Undef,
+                    Instruction::LoadNull { output } => value!(output) = Value::Null,
+                    Instruction::CopyValue { to, from } => value!(to) = value!(from).clone(),
+                    Instruction::Release { first, count } => {
+                        for x in &mut self.values[vb + first.index()..vb + first.index() + count as usize] {
                             x.release();
                         }
                     }
-                    I::BoxN { d, s } => v!(d) = Value::Num(n!(s)),
-                    I::BoxB { d, s } => v!(d) = Value::Bool(s!(s) != 0),
-                    I::UnboxN { d, s } => {
-                        let x = match &v!(s) {
+                    Instruction::BoxNumber { output, value } => value!(output) = Value::Num(number!(value)),
+                    Instruction::BoxBool { output, value } => value!(output) = Value::Bool(scalar!(value) != 0),
+                    Instruction::UnboxNumber { output, value } => {
+                        let x = match &value!(value) {
                             Value::Num(x) => *x,
                             other => {
                                 let m = format!("expected a number, got {}", describe(other));
                                 break self.type_error(m);
                             }
                         };
-                        s!(d) = b(x)
+                        scalar!(output) = bits(x)
                     }
-                    I::UnboxB { d, s } => {
-                        let x = match &v!(s) {
+                    Instruction::UnboxBool { output, value } => {
+                        let x = match &value!(value) {
                             Value::Bool(x) => *x,
                             other => {
                                 let m = format!("expected a boolean, got {}", describe(other));
                                 break self.type_error(m);
                             }
                         };
-                        s!(d) = x as u64
+                        scalar!(output) = x as u64
                     }
-                    I::TruthyV { d, s } => s!(d) = v!(s).truthy() as u64,
-                    I::NumToStr { d, s } => v!(d) = Value::str(num_to_string(n!(s))),
-                    I::ToStr { d, s } => v!(d) = Value::Str(v!(s).to_js_string()),
-                    I::ToNum { d, s } => s!(d) = b(v!(s).to_number()),
-                    I::Concat { d, a, b: bb } => {
-                        let r = match (&v!(a), &v!(bb)) {
+                    Instruction::IsTruthy { output, value } => scalar!(output) = value!(value).truthy() as u64,
+                    Instruction::NumberToString { output, value } => value!(output) = Value::str(num_to_string(number!(value))),
+                    Instruction::ToString { output, value } => value!(output) = Value::Str(value!(value).to_js_string()),
+                    Instruction::ToNumber { output, value } => {
+                        if let Value::BigInt(_) = value!(value) {
+                            break self.bigint_error(bigint::TO_NUMBER);
+                        }
+                        scalar!(output) = bits(value!(value).to_number())
+                    }
+                    Instruction::Concat { output, left, right } => {
+                        let r = match (&value!(left), &value!(right)) {
                             (Value::Str(x), Value::Str(y)) => {
                                 if y.s.is_empty() {
                                     Value::Str(x.clone())
@@ -845,54 +1009,79 @@ impl Vm {
                             }
                             (x, y) => Value::str(format!("{}{}", x.to_js_string().s, y.to_js_string().s)),
                         };
-                        v!(d) = r
+                        value!(output) = r
                     }
-                    I::StrCmp { op, d, a, b: bb } => {
-                        let r = match (&v!(a), &v!(bb)) {
+                    Instruction::CompareStrings { op, output, left, right } => {
+                        let r = match (&value!(left), &value!(right)) {
                             (Value::Str(x), Value::Str(y)) => str_cmp(op, &x.s, &y.s),
                             (x, y) => str_cmp(op, &x.to_js_string().s, &y.to_js_string().s),
                         };
-                        s!(d) = r as u64
+                        scalar!(output) = r as u64
                     }
-                    I::StrictEq { d, a, b: bb, eq } => s!(d) = (v!(a).strict_eq(&v!(bb)) == eq) as u64,
-                    I::LooseEq { d, a, b: bb, eq } => s!(d) = (v!(a).loose_eq(&v!(bb)) == eq) as u64,
-                    I::DynAdd { d, a, b: bb } => {
-                        let r = match (&v!(a), &v!(bb)) {
+                    Instruction::StrictEquals { output, left, right, equal } => scalar!(output) = (value!(left).strict_eq(&value!(right)) == equal) as u64,
+                    Instruction::LooseEquals { output, left, right, equal } => scalar!(output) = (value!(left).loose_eq(&value!(right)) == equal) as u64,
+                    Instruction::DynamicAdd { output, left, right } => {
+                        let r = match (&value!(left), &value!(right)) {
                             (Value::Num(x), Value::Num(y)) => Value::Num(x + y),
+                            (Value::BigInt(x), Value::BigInt(y)) => match bigint::arithmetic(NumOp::Add, **x, **y) {
+                                Ok(n) => Value::bigint(n),
+                                Err(e) => break self.bigint_error(e),
+                            },
                             (x @ Value::Str(_), y) | (x, y @ Value::Str(_)) => {
                                 Value::str(format!("{}{}", x.to_js_string().s, y.to_js_string().s))
                             }
                             (x @ (Value::Arr(_) | Value::Obj(_)), y) | (x, y @ (Value::Arr(_) | Value::Obj(_))) => {
                                 Value::str(format!("{}{}", x.to_display(), y.to_display()))
                             }
+                            (Value::BigInt(_), _) | (_, Value::BigInt(_)) => break self.bigint_error(bigint::MIX),
                             (x, y) => Value::Num(x.to_number() + y.to_number()),
                         };
-                        v!(d) = r
+                        value!(output) = r
                     }
-                    I::DynNum { op, d, a, b: bb } => s!(d) = b(dyn_num(op, &v!(a), &v!(bb))),
-                    I::DynNumV { op, d, a, b: bb } => {
-                        let r = dyn_num(op, &v!(a), &v!(bb));
-                        v!(d) = Value::Num(r)
+                    Instruction::DynamicArithmetic { op, output, left, right } => {
+                        if matches!(value!(left), Value::BigInt(_)) || matches!(value!(right), Value::BigInt(_)) {
+                            break self.bigint_error(bigint::TO_NUMBER);
+                        }
+                        scalar!(output) = bits(dyn_num(op, &value!(left), &value!(right)))
                     }
-                    I::IncV { d, s, k } => {
-                        let r = match &v!(s) {
-                            Value::Num(x) => x + k,
-                            x => x.to_number() + k,
+                    Instruction::DynamicArithmeticToValue { op, output, left, right } => match dyn_numeric(op, &value!(left), &value!(right)) {
+                        Ok(r) => value!(output) = r,
+                        Err(e) => break self.bigint_error(e),
+                    },
+                    Instruction::DynamicAddConstant { output, value, constant } => {
+                        let r = match &value!(value) {
+                            Value::Num(x) => Value::Num(x + constant),
+                            Value::BigInt(x) => match bigint::arithmetic(NumOp::Add, **x, constant as i128) {
+                                Ok(n) => Value::bigint(n),
+                                Err(e) => break self.bigint_error(e),
+                            },
+                            x => Value::Num(x.to_number() + constant),
                         };
-                        v!(d) = Value::Num(r)
+                        value!(output) = r
                     }
-                    I::DynCmp { op, d, a, b: bb } => {
-                        let r = match (&v!(a), &v!(bb)) {
-                            (Value::Str(x), Value::Str(y)) => str_cmp(op, &x.s, &y.s),
-                            (x, y) => cmp(op, x.to_number(), y.to_number()),
+                    Instruction::DynamicCompare { op, output, left, right } => scalar!(output) = dyn_compare(op, &value!(left), &value!(right)) as u64,
+                    Instruction::DynamicNegate { output, value } => {
+                        let r = match &value!(value) {
+                            Value::BigInt(n) => match bigint::negate(**n) {
+                                Ok(n) => Value::bigint(n),
+                                Err(e) => break self.bigint_error(e),
+                            },
+                            v => Value::Num(-v.to_number()),
                         };
-                        s!(d) = r as u64
+                        value!(output) = r
                     }
-                    I::TypeOf { d, s } => v!(d) = Value::str(v!(s).type_of()),
-                    I::In { d, k, o } => {
-                        let r = match &v!(o) {
+                    Instruction::DynamicBitNot { output, value } => {
+                        let r = match &value!(value) {
+                            Value::BigInt(n) => Value::bigint(!**n),
+                            v => Value::Num(!to_int32(v.to_number()) as f64),
+                        };
+                        value!(output) = r
+                    }
+                    Instruction::TypeOf { output, value } => value!(output) = Value::str(value!(value).type_of()),
+                    Instruction::In { output: d, key: k, object: o } => {
+                        let r = match &value!(o) {
                             Value::Obj(ob) => {
-                                let key = v!(k).to_js_string();
+                                let key = value!(k).to_js_string();
                                 ob.get(&key.s).is_some()
                                     || ob.class.as_ref().is_some_and(|c| {
                                         let mut c = Some(c.clone());
@@ -905,67 +1094,69 @@ impl Vm {
                                         false
                                     })
                             }
-                            Value::Arr(a) => as_index(&v!(k)).is_some_and(|i| i < a.len()) || v!(k).to_display() == "length",
+                            Value::Arr(a) => as_index(&value!(k)).is_some_and(|i| i < a.len()) || value!(k).to_display() == "length",
                             other => {
                                 let m = format!("Cannot use 'in' operator to search for a key in {}", other.to_display());
                                 break self.type_error(m);
                             }
                         };
-                        s!(d) = r as u64
+                        scalar!(d) = r as u64
                     }
-                    I::InstanceOf { d, o, class } => {
-                        s!(d) = matches!(&v!(o), Value::Obj(ob) if ob.class.as_ref().is_some_and(|c| c.is_subclass_of(class)))
+                    Instruction::InstanceOf { output, value, class } => {
+                        scalar!(output) = matches!(&value!(value), Value::Obj(ob) if ob.class.as_ref().is_some_and(|c| c.is_subclass_of(class)))
                             as u64
                     }
 
-                    I::NewCell { d } => v!(d) = Value::Cell(Rc::new(std::cell::RefCell::new(Value::Undef))),
-                    I::CellGet { d, c } => {
-                        let x = match &v!(c) {
+                    Instruction::NewCell { output } => value!(output) = Value::Cell(Rc::new(std::cell::RefCell::new(Value::Undef))),
+                    Instruction::ReadCell { output: d, cell: c } => {
+                        let x = match &value!(c) {
                             Value::Cell(cell) => cell.borrow().clone(),
                             _ => unreachable!("not a cell"),
                         };
-                        v!(d) = x
+                        value!(d) = x
                     }
-                    I::CellSet { c, s } => {
-                        let x = v!(s).clone();
-                        match &v!(c) {
+                    Instruction::WriteCell { cell: c, value: s } => {
+                        let x = value!(s).clone();
+                        match &value!(c) {
                             Value::Cell(cell) => *cell.borrow_mut() = x,
                             _ => unreachable!("not a cell"),
                         }
                     }
-                    I::UpGet { d, i } => {
-                        let x = self.frames[fi].closure.as_ref().unwrap().caps[i as usize].borrow().clone();
-                        v!(d) = x
+                    Instruction::ReadCapture { output, capture } => {
+                        let x = self.frames[fi].closure.as_ref().unwrap().caps[capture as usize].borrow().clone();
+                        value!(output) = x
                     }
-                    I::UpSet { i, s } => {
-                        let x = v!(s).clone();
-                        *self.frames[fi].closure.as_ref().unwrap().caps[i as usize].borrow_mut() = x;
+                    Instruction::WriteCapture { capture, value } => {
+                        let x = value!(value).clone();
+                        *self.frames[fi].closure.as_ref().unwrap().caps[capture as usize].borrow_mut() = x;
                     }
-                    I::GetGS { d, g } => s!(d) = self.gs[g as usize],
-                    I::SetGS { g, s } => self.gs[g as usize] = s!(s),
-                    I::GetGV { d, g } => v!(d) = self.gv[g as usize].clone(),
-                    I::SetGV { g, s } => self.gv[g as usize] = v!(s).clone(),
+                    Instruction::ReadGlobalNumber { output, global } => scalar!(output) = self.global_scalars[global as usize],
+                    Instruction::ReadGlobalBool { output, global } => scalar!(output) = self.global_scalars[global as usize],
+                    Instruction::WriteGlobalNumber { global, value } => self.global_scalars[global as usize] = scalar!(value),
+                    Instruction::WriteGlobalBool { global, value } => self.global_scalars[global as usize] = scalar!(value),
+                    Instruction::ReadGlobal { output, global } => value!(output) = self.global_values[global as usize].clone(),
+                    Instruction::WriteGlobal { global, value } => self.global_values[global as usize] = value!(value).clone(),
 
-                    I::MakeClosure { d, f: fidx, caps } => {
-                        let list = &func.caps[caps as usize];
+                    Instruction::MakeClosure { output, function, captures } => {
+                        let list = &func.capture_lists[captures as usize];
                         let mut cells = Vec::with_capacity(list.len());
                         for c in list {
                             cells.push(match c {
-                                CapSrc::Local(r) => match &v!(*r) {
+                                CaptureFrom::Slot(r) => match &value!(*r) {
                                     Value::Cell(cell) => cell.clone(),
                                     _ => unreachable!("capture source is not a cell"),
                                 },
-                                CapSrc::Up(i) => self.frames[fi].closure.as_ref().unwrap().caps[*i as usize].clone(),
+                                CaptureFrom::Capture(i) => self.frames[fi].closure.as_ref().unwrap().caps[*i as usize].clone(),
                             });
                         }
-                        v!(d) = Value::Func(Rc::new(Closure {
-                            func: fidx,
+                        value!(output) = Value::Func(Rc::new(Closure {
+                            func: function,
                             caps: cells.into_boxed_slice(),
                         }))
                     }
-                    I::Call { ci } => {
+                    Instruction::Call { site } => {
                         self.frames[fi].pc = pc;
-                        let r = self.do_call(func, &func.calls[ci as usize], sb, vb);
+                        let r = self.do_call(func, &func.call_sites[site as usize], sb, vb);
                         refresh!();
                         match r {
                             Ok(true) => continue 'outer,
@@ -973,38 +1164,38 @@ impl Vm {
                             Err(e) => break e,
                         }
                     }
-                    I::RetN { s } => {
-                        if tri!(self.do_return_s(Kind::Num, s!(s), stop)) {
+                    Instruction::ReturnNumber { value } => {
+                        if tri!(self.do_return_s(Kind::Num, scalar!(value), stop)) {
                             return Ok(());
                         }
                         continue 'outer;
                     }
-                    I::RetB { s } => {
-                        if tri!(self.do_return_s(Kind::Bool, s!(s), stop)) {
+                    Instruction::ReturnBool { value } => {
+                        if tri!(self.do_return_s(Kind::Bool, scalar!(value), stop)) {
                             return Ok(());
                         }
                         continue 'outer;
                     }
-                    I::RetV { s } => {
-                        let x = std::mem::take(&mut v!(s));
+                    Instruction::ReturnValue { value } => {
+                        let x = std::mem::take(&mut value!(value));
                         if tri!(self.do_return(x, stop)) {
                             return Ok(());
                         }
                         continue 'outer;
                     }
-                    I::RetUndef => {
+                    Instruction::ReturnUndefined => {
                         if tri!(self.do_return(Value::Undef, stop)) {
                             return Ok(());
                         }
                         continue 'outer;
                     }
 
-                    I::NewArr { d, num } => {
-                        v!(d) = Value::Arr(if num { Array::new_num(Vec::new()) } else { Array::new_val(Vec::new()) })
+                    Instruction::NewArray { output, numbers } => {
+                        value!(output) = Value::Arr(if numbers { Array::new_num(Vec::new()) } else { Array::new_val(Vec::new()) })
                     }
-                    I::PushN { a, s } => {
-                        let x = n!(s);
-                        match &v!(a) {
+                    Instruction::PushNumber { array, value } => {
+                        let x = number!(value);
+                        match &value!(array) {
                             Value::Arr(arr) => {
                                 let mut st = arr.store.borrow_mut();
                                 match &mut *st {
@@ -1018,9 +1209,9 @@ impl Vm {
                             }
                         }
                     }
-                    I::PushV { a, s } => {
-                        let x = v!(s).clone();
-                        match &v!(a) {
+                    Instruction::PushValue { array, value } => {
+                        let x = value!(value).clone();
+                        match &value!(array) {
                             Value::Arr(arr) => arr.push(x),
                             other => {
                                 let m = format!("cannot push to {}", describe(other));
@@ -1028,18 +1219,18 @@ impl Vm {
                             }
                         }
                     }
-                    I::PushSpread { a, s } => {
-                        let src = v!(s).clone();
+                    Instruction::PushSpread { array, source } => {
+                        let src = value!(source).clone();
                         let items = tri!(natives::iterate(self, &src));
-                        if let Value::Arr(arr) = &v!(a) {
+                        if let Value::Arr(arr) = &value!(array) {
                             for x in items {
                                 arr.push(x);
                             }
                         }
                     }
-                    I::GetIdxN { d, a, i } => {
-                        let idx = n!(i);
-                        let x = match &v!(a) {
+                    Instruction::ReadElementNumber { output: d, array: a, index: i } => {
+                        let idx = number!(i);
+                        let x = match &value!(a) {
                             Value::Arr(arr) => {
                                 let st = arr.store.borrow();
                                 match &*st {
@@ -1059,14 +1250,14 @@ impl Vm {
                             other => Err(format!("cannot index {}", describe(other))),
                         };
                         match x {
-                            Ok(x) => s!(d) = b(x),
+                            Ok(x) => scalar!(d) = bits(x),
                             Err(m) => break self.type_error(m),
                         }
                     }
-                    I::SetIdxN { a, i, s } => {
-                        let idx = n!(i);
-                        let x = n!(s);
-                        match &v!(a) {
+                    Instruction::WriteElementNumber { array: a, index: i, value: s } => {
+                        let idx = number!(i);
+                        let x = number!(s);
+                        match &value!(a) {
                             Value::Arr(arr) => {
                                 let mut st = arr.store.borrow_mut();
                                 match &mut *st {
@@ -1087,9 +1278,9 @@ impl Vm {
                             }
                         }
                     }
-                    I::GetIdxV { d, a, i } => {
-                        let idx = n!(i);
-                        let x = match &v!(a) {
+                    Instruction::ReadElement { output, array, index } => {
+                        let idx = number!(index);
+                        let x = match &value!(array) {
                             Value::Arr(arr) => {
                                 if idx >= 0.0 && idx.fract() == 0.0 {
                                     arr.get(idx as usize)
@@ -1110,12 +1301,12 @@ impl Vm {
                             }
                             other => get_dyn(other, &Value::Num(idx)),
                         };
-                        v!(d) = x
+                        value!(output) = x
                     }
-                    I::SetIdxV { a, i, s } => {
-                        let idx = n!(i);
-                        let x = v!(s).clone();
-                        match &v!(a) {
+                    Instruction::WriteElement { array, index, value } => {
+                        let idx = number!(index);
+                        let x = value!(value).clone();
+                        match &value!(array) {
                             Value::Arr(arr) => {
                                 if idx >= 0.0 && idx.fract() == 0.0 {
                                     arr.set(idx as usize, x)
@@ -1129,36 +1320,36 @@ impl Vm {
                             }
                         }
                     }
-                    I::GetDyn { d, o, k } => {
+                    Instruction::ReadDynamic { output: d, object: o, key: k } => {
                         // Array element by integer index.
-                        if let (Value::Arr(a), Value::Num(i)) = (&v!(o), &v!(k))
+                        if let (Value::Arr(a), Value::Num(i)) = (&value!(o), &value!(k))
                             && *i >= 0.0
                             && (*i as usize) as f64 == *i
                         {
                             let x = a.get(*i as usize);
-                            v!(d) = x;
+                            value!(d) = x;
                             continue;
                         }
-                        let x = match &v!(o) {
+                        let x = match &value!(o) {
                             other @ (Value::Undef | Value::Null) => {
                                 let m = format!(
                                     "Cannot read properties of {} (reading '{}')",
                                     other.to_display(),
-                                    v!(k).to_display()
+                                    value!(k).to_display()
                                 );
                                 break self.type_error(m);
                             }
                             Value::Obj(ob) => {
-                                let key = v!(k).to_js_string();
+                                let key = value!(k).to_js_string();
                                 match ob.get(&key.s) {
                                     Some(x) => x,
-                                    None => tri!(self.lookup_method(&v!(o).clone(), &key.s.clone())),
+                                    None => tri!(self.lookup_method(&value!(o).clone(), &key.s.clone())),
                                 }
                             }
                             other => {
-                                let r = get_dyn(other, &v!(k));
+                                let r = get_dyn(other, &value!(k));
                                 if matches!(r, Value::Undef)
-                                    && let Value::Str(name) = &v!(k)
+                                    && let Value::Str(name) = &value!(k)
                                 {
                                     method_by_name(other, &name.s).map_or(Value::Undef, Value::Native)
                                 } else {
@@ -1166,27 +1357,27 @@ impl Vm {
                                 }
                             }
                         };
-                        v!(d) = x
+                        value!(d) = x
                     }
-                    I::SetDyn { o, k, s } => {
-                        let x = v!(s).clone();
-                        if !set_dyn(&v!(o), &v!(k), x) {
+                    Instruction::WriteDynamic { object, key, value } => {
+                        let x = value!(value).clone();
+                        if !set_dyn(&value!(object), &value!(key), x) {
                             let m = format!(
                                 "Cannot set properties of {} (setting '{}')",
-                                v!(o).to_display(),
-                                v!(k).to_display()
+                                value!(object).to_display(),
+                                value!(key).to_display()
                             );
                             break self.type_error(m);
                         }
                     }
-                    I::DelDyn { o, k } => {
-                        if let Value::Obj(ob) = &v!(o) {
-                            let key = v!(k).to_js_string();
+                    Instruction::DeleteDynamic { object: o, key: k } => {
+                        if let Value::Obj(ob) = &value!(o) {
+                            let key = value!(k).to_js_string();
                             ob.delete(&key.s);
                         }
                     }
-                    I::ArrLen { d, a } => {
-                        let x = match &v!(a) {
+                    Instruction::ArrayLength { output, array } => {
+                        let x = match &value!(array) {
                             Value::Arr(arr) => arr.len(),
                             Value::Str(st) => st.len16(),
                             other => {
@@ -1194,30 +1385,30 @@ impl Vm {
                                 break self.type_error(m);
                             }
                         };
-                        s!(d) = b(x as f64)
+                        scalar!(output) = bits(x as f64)
                     }
-                    I::SetArrLen { a, s } => {
-                        let x = n!(s);
-                        if let Value::Arr(arr) = &v!(a) {
+                    Instruction::SetArrayLength { array: a, length: s } => {
+                        let x = number!(s);
+                        if let Value::Arr(arr) = &value!(a) {
                             if x < 0.0 || x.fract() != 0.0 {
                                 break self.range_error("Invalid array length".into());
                             }
                             arr.set_len(x as usize)
                         }
                     }
-                    I::StrLen { d, s } => {
-                        let x = match &v!(s) {
+                    Instruction::StringLength { output, string } => {
+                        let x = match &value!(string) {
                             Value::Str(st) => st.len16(),
                             other => {
                                 let m = format!("Cannot read properties of {} (reading 'length')", other.to_display());
                                 break self.type_error(m);
                             }
                         };
-                        s!(d) = b(x as f64)
+                        scalar!(output) = bits(x as f64)
                     }
-                    I::CharCodeAt { d, s, i } => {
-                        let idx = n!(i);
-                        let x = match &v!(s) {
+                    Instruction::CharCodeAt { output, string, index } => {
+                        let idx = number!(index);
+                        let x = match &value!(string) {
                             Value::Str(st) => {
                                 if idx >= 0.0 && idx.fract() == 0.0 {
                                     st.code_unit(idx as usize).map_or(f64::NAN, |c| c as f64)
@@ -1232,59 +1423,59 @@ impl Vm {
                                 break self.type_error(m);
                             }
                         };
-                        s!(d) = b(x)
+                        scalar!(output) = bits(x)
                     }
-                    I::IterArr { d, s } => {
-                        let x = match &v!(s) {
-                            Value::Arr(_) => v!(s).clone(),
+                    Instruction::ToIterationArray { output, value } => {
+                        let x = match &value!(value) {
+                            Value::Arr(_) => value!(value).clone(),
                             other => {
                                 let other = other.clone();
                                 Value::Arr(Array::new_val(tri!(natives::iterate(self, &other))))
                             }
                         };
-                        v!(d) = x
+                        value!(output) = x
                     }
-                    I::KeysArr { d, s } => {
-                        let x = Value::Arr(Array::new_val(keys_of(&v!(s))));
-                        v!(d) = x
+                    Instruction::KeysArray { output, object } => {
+                        let x = Value::Arr(Array::new_val(keys_of(&value!(object))));
+                        value!(output) = x
                     }
 
-                    I::NewObj { d, shape } => {
+                    Instruction::NewObject { output, shape } => {
                         let sh = self.prog.shapes[shape as usize].clone();
                         let n = sh.keys.len();
                         let _ = n;
-                        v!(d) = Value::Obj(Object::blank(sh, None))
+                        value!(output) = Value::Obj(Object::blank(sh, None))
                     }
-                    I::ObjSpread { o, s } => {
-                        let src = v!(s).clone();
-                        let dst = v!(o).clone();
+                    Instruction::SpreadIntoObject { object, source } => {
+                        let src = value!(source).clone();
+                        let dst = value!(object).clone();
                         for k in keys_of(&src) {
                             let x = get_dyn(&src, &k);
                             set_dyn(&dst, &k, x);
                         }
                     }
-                    I::GetField { d, o, i } => {
-                        let x = match &v!(o) {
-                            Value::Obj(ob) => ob.inner.borrow().vals[i as usize].clone(),
+                    Instruction::ReadField { output, object, field } => {
+                        let x = match &value!(object) {
+                            Value::Obj(ob) => ob.inner.borrow().vals[field as usize].clone(),
                             other => {
                                 let m = format!("Cannot read properties of {}", other.to_display());
                                 break self.type_error(m);
                             }
                         };
-                        v!(d) = x
+                        value!(output) = x
                     }
-                    I::SetField { o, i, s } => {
-                        let x = v!(s).clone();
-                        match &v!(o) {
-                            Value::Obj(ob) => ob.inner.borrow_mut().vals[i as usize] = x,
+                    Instruction::WriteField { object, field, value } => {
+                        let x = value!(value).clone();
+                        match &value!(object) {
+                            Value::Obj(ob) => ob.inner.borrow_mut().vals[field as usize] = x,
                             other => {
                                 let m = format!("Cannot set properties of {}", other.to_display());
                                 break self.type_error(m);
                             }
                         }
                     }
-                    I::GetFieldN { d, o, i } => {
-                        let x = match &v!(o) {
+                    Instruction::ReadFieldNumber { output: d, object: o, field: i } => {
+                        let x = match &value!(o) {
                             Value::Obj(ob) => match &ob.inner.borrow().vals[i as usize] {
                                 Value::Num(x) => Ok(*x),
                                 other => Err(format!("expected a number field, got {}", describe(other))),
@@ -1292,23 +1483,23 @@ impl Vm {
                             other => Err(format!("Cannot read properties of {}", other.to_display())),
                         };
                         match x {
-                            Ok(x) => s!(d) = b(x),
+                            Ok(x) => scalar!(d) = bits(x),
                             Err(m) => break self.type_error(m),
                         }
                     }
-                    I::SetFieldN { o, i, s } => {
-                        let x = n!(s);
-                        match &v!(o) {
-                            Value::Obj(ob) => ob.inner.borrow_mut().vals[i as usize] = Value::Num(x),
+                    Instruction::WriteFieldNumber { object, field, value } => {
+                        let x = number!(value);
+                        match &value!(object) {
+                            Value::Obj(ob) => ob.inner.borrow_mut().vals[field as usize] = Value::Num(x),
                             other => {
                                 let m = format!("Cannot set properties of {}", other.to_display());
                                 break self.type_error(m);
                             }
                         }
                     }
-                    I::GetProp { d, o, p } => {
-                        let site = &func.props[p as usize];
-                        let fast = match &v!(o) {
+                    Instruction::ReadProperty { output, object, property } => {
+                        let site = &func.property_sites[property as usize];
+                        let fast = match &value!(object) {
                             Value::Obj(ob) => {
                                 let inner = ob.inner.borrow();
                                 match &*site.cache.entry.borrow() {
@@ -1322,17 +1513,17 @@ impl Vm {
                         let x = match fast {
                             Some(x) => x,
                             None => {
-                                let recv = v!(o).clone();
+                                let recv = value!(object).clone();
                                 tri!(self.get_prop_slow(&recv, site))
                             }
                         };
-                        v!(d) = x
+                        value!(output) = x
                     }
-                    I::SetProp { o, p, s } => {
-                        let site = &func.props[p as usize];
-                        let x = v!(s).clone();
+                    Instruction::WriteProperty { object, property, value } => {
+                        let site = &func.property_sites[property as usize];
+                        let x = value!(value).clone();
                         // Inline cache hit: the shape already has the slot.
-                        let x = if let Value::Obj(ob) = &v!(o) {
+                        let x = if let Value::Obj(ob) = &value!(object) {
                             let mut inner = ob.inner.borrow_mut();
                             match &*site.cache.entry.borrow() {
                                 Some((sh, slot)) if Rc::ptr_eq(sh, &inner.shape) => {
@@ -1345,21 +1536,21 @@ impl Vm {
                             Some(x)
                         };
                         if let Some(x) = x {
-                            let recv = v!(o).clone();
+                            let recv = value!(object).clone();
                             tri!(self.set_prop(&recv, site, x));
                         }
                     }
-                    I::NewInst { d, class } => {
+                    Instruction::NewInstance { output, class } => {
                         let c = self.prog.classes[class as usize].clone();
                         let n = c.shape.keys.len();
                         let _ = n;
-                        v!(d) = Value::Obj(Object::blank(c.shape.clone(), Some(c)))
+                        value!(output) = Value::Obj(Object::blank(c.shape.clone(), Some(c)))
                     }
-                    I::LoadClass { d, class } => v!(d) = Value::Class(self.prog.classes[class as usize].clone()),
+                    Instruction::LoadClass { output, class } => value!(output) = Value::Class(self.prog.classes[class as usize].clone()),
 
-                    I::Throw { s } => break v!(s).clone(),
-                    I::TryBegin { catch, exc } => self.handlers.push((fi, catch, exc)),
-                    I::TryEnd => {
+                    Instruction::Throw { value } => break value!(value).clone(),
+                    Instruction::TryBegin { catch, exception } => self.handlers.push((fi, catch, exception)),
+                    Instruction::TryEnd => {
                         self.handlers.pop();
                     }
                 }

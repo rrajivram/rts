@@ -12,17 +12,24 @@ pub type TParamId = u32;
 /// Where a value of some type lives at run time.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Kind {
-    /// f64 in the scalar register file.
+    /// f64 in a number slot (see `bytecode.rs`).
     Num,
-    /// 0/1 in the scalar register file.
+    /// 0/1 in a boolean slot.
     Bool,
-    /// Tagged, refcounted `Value` in the value register file.
+    /// An `i128` BigInt in two consecutive number slots (low half first).
+    Big,
+    /// Tagged, refcounted `Value` in a value slot.
     Val,
 }
 
 impl Kind {
     pub fn is_scalar(self) -> bool {
         !matches!(self, Kind::Val)
+    }
+
+    /// How many slots a value of this kind takes.
+    pub fn width(self) -> u16 {
+        if self == Kind::Big { 2 } else { 1 }
     }
 }
 
@@ -88,6 +95,7 @@ pub enum BuiltinNs {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Type {
     Number,
+    BigInt,
     Boolean,
     String,
     Void,
@@ -123,11 +131,14 @@ impl Type {
         match self {
             Type::Number | Type::NumLit(_) | Type::Enum(_) => Kind::Num,
             Type::Boolean | Type::BoolLit(_) => Kind::Bool,
+            Type::BigInt => Kind::Big,
             Type::Union(ts) => {
                 if ts.iter().all(|t| matches!(t.kind(), Kind::Num)) {
                     Kind::Num
                 } else if ts.iter().all(|t| matches!(t.kind(), Kind::Bool)) {
                     Kind::Bool
+                } else if ts.iter().all(|t| matches!(t.kind(), Kind::Big)) {
+                    Kind::Big
                 } else {
                     Kind::Val
                 }
@@ -260,6 +271,10 @@ impl Type {
     pub fn is_booleanish(&self) -> bool {
         self.kind() == Kind::Bool
     }
+
+    pub fn is_bigint(&self) -> bool {
+        self.kind() == Kind::Big
+    }
 }
 
 /// Display needs class/enum names; the checker supplies them.
@@ -278,6 +293,7 @@ impl<N: TypeNames> fmt::Display for Disp<'_, N> {
         let d = |t: &Type| format!("{}", Disp(t, n));
         match self.0 {
             Type::Number => write!(f, "number"),
+            Type::BigInt => write!(f, "bigint"),
             Type::Boolean => write!(f, "boolean"),
             Type::String => write!(f, "string"),
             Type::Void => write!(f, "void"),

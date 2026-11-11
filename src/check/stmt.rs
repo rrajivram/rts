@@ -1332,6 +1332,7 @@ fn narrow_eq(t: &Type, lit: &Type, positive: bool, loose: bool) -> Type {
 fn typeof_tag(t: &Type) -> &'static str {
     match t {
         Type::Number | Type::NumLit(_) | Type::Enum(_) => "number",
+        Type::BigInt => "bigint",
         Type::String | Type::StrLit(_) => "string",
         Type::Boolean | Type::BoolLit(_) => "boolean",
         Type::Undefined | Type::Void => "undefined",
@@ -1347,6 +1348,7 @@ fn filter_typeof(t: &Type, tag: &str, keep: bool) -> Type {
         }
         return match tag {
             "number" => Type::Number,
+            "bigint" => Type::BigInt,
             "string" => Type::String,
             "boolean" => Type::Boolean,
             "undefined" => Type::Undefined,

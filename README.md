@@ -20,15 +20,19 @@ bench/types.py                            # typed vs --no-types on the same engi
 ## How it works
 
 ```
-lexer → parser → type checker → typed HIR → codegen → typed register bytecode → VM
+lexer → parser → type checker → typed HIR → codegen → instructions on typed slots → VM
 ```
 
 See [DESIGN.md](DESIGN.md) for details. In short:
 
-- **Two register files.** `number` and `boolean` live unboxed in a `u64` file
-  and never touch the heap or a refcount. Everything else is a 16-byte tagged
-  `Value`. When the types are known, `a + b` compiles to `AddN`, a raw f64 add
-  with no tag check.
+- **Typed slots.** Every variable, parameter and temporary lives in a numbered
+  *slot* of its function's frame, and the compiler fixes each slot's type:
+  a number slot holds a raw `f64`, a boolean slot holds 0 or 1, a bigint
+  takes two number slots (an `i128`), and a value slot holds a tagged `Value`
+  (strings, objects, `any`…). Numbers, booleans and bigints never touch the
+  heap or a refcount. When the types are known, `a + b`
+  compiles to `Arithmetic { op: Add, left: a, right: b, output: … }` on number
+  slots: a plain f64 add with no tag check.
 - **Hybrid typing.** `any`, `unknown`, unions and generics fall back to boxed
   values with dynamic operations. At each boundary the checker inserts a
   *checked* unbox, so an incorrect `as`, a bad `.d.ts` or a covariant array
@@ -37,20 +41,20 @@ See [DESIGN.md](DESIGN.md) for details. In short:
   die. Frames release their references when they return, and blocks release
   theirs when they exit. Reference cycles leak (see Next steps).
 - **Objects.** Class instances have fixed layouts, so typed field access is a
-  constant slot index (`GetFieldN`). Method calls go through a vtable.
+  fixed position (`ReadFieldNumber`). Method calls go through a vtable.
   Structural types and `any` use shape-keyed inline caches.
 - **Arrays.** `number[]` uses `Vec<f64>` storage. It degrades to `Vec<Value>`
   if something writes a non-number into it through `any`.
 
 ### Optimizations that rely on knowing types
 
-- Every variable is resolved to a register slot at compile time. Top-level
-  variables used only by top-level code live in registers; the rest live in
-  typed global slots.
-- Numeric constants are kept in registers inside loops, and `const x = 5` reads
-  are folded to the literal.
-- Fused compare-and-branch (`JCmpN`), rotated loops (one branch per
-  iteration), `AddNK` for `x + k`, an integer fast path for `%`, and a
+- Every variable is resolved to a slot at compile time. Top-level variables
+  used only by top-level code live in the top-level code's slots; the rest
+  are typed globals.
+- Numeric constants used in loops are loaded into slots once (`#3` in dumps),
+  and `const x = 5` reads are folded to the literal.
+- Fused compare-and-branch (`JumpIfCompare`), rotated loops (one branch per
+  iteration), `AddConstant` for `x + k`, an integer fast path for `%`, and a
   peephole pass that removes jumps to the next instruction.
 - `arr.map/filter/forEach/reduce/some/every/find/findIndex` compile to
   bytecode loops. Arrow callbacks are **inlined** into the loop, so
@@ -60,7 +64,7 @@ See [DESIGN.md](DESIGN.md) for details. In short:
   instructions.
 - Call sites state the kinds of the values they pass. When those match the
   callee's parameter kinds (the usual case), arguments are copied from
-  register to register. Otherwise the VM converts per argument, which is how
+  slot to slot. Otherwise the VM converts per argument, which is how
   calls through `any`, generics and callbacks to natives work.
 
 ## Benchmarks
@@ -80,9 +84,12 @@ in about 2ms.
 | nbody (class fields, float math, 200k steps) | 229.5 ms | 464.2 ms | 104.9 ms | – |
 | strings (join/split/Map/charCodeAt) | 45.6 ms | 106.3 ms | 78.6 ms | – |
 | alloc_churn (2M short-lived objects) | 334.8 ms | 356.5 ms | 63.8 ms | – |
+| bigint (modpow and a hash mod 2^61−1) | **67.6 ms** | 182.3 ms | 154.7 ms | – |
 
 rts is faster than `node --jitless` on everything here, and on several
-benchmarks it is within startup time of JIT Node. Comparing the two `complex`
+benchmarks it is within startup time of JIT Node. On `bigint` it beats JIT
+Node: typed BigInts stay in slots as `i128`s, while V8 heap-allocates every
+BigInt result (V8's are arbitrary precision; see BigInts below). Comparing the two `complex`
 rows shows what type annotations are worth: about 2× on the same program.
 
 **Memory (alloc_churn, peak RSS):** rts **3.3 MB** vs Node **54 MB**
@@ -120,33 +127,41 @@ V8's interpreter (`node --jitless`) is shown for reference.
 | loop | 91.2 ms | 177.5 ms | **1.9×** | 129.2 ms |
 | complex_untyped (only inferred types) | 15.0 ms | 26.0 ms | **1.7×** | 59.0 ms |
 | alloc_churn | 311.3 ms | 497.6 ms | **1.6×** | 359.5 ms |
+| bigint | 67.7 ms | 189.7 ms | **2.8×** | 190.5 ms |
 
-Types make every program faster, by 1.6× to 3.2×. The untyped engine is a
+Types make every program faster, by 1.6× to 3.2×. (The bigint row was measured
+later than the others, on the same machine.) The untyped engine is a
 fair baseline: it is in the same range as V8's interpreter, faster on two
 programs and up to about 2× slower on the rest. The typed engine beats V8's
 interpreter on all of them.
 
-Where the speedup comes from, using `fib` as the example (`rts --dump` vs `rts --no-types --dump`):
+Where the speedup comes from, using `fib` as the example (`rts --dump` vs
+`rts --no-types --dump`). Slots are shown by variable name; `num3`, `bool0`
+and `val5` are temporaries (number, boolean and value slots):
 
 ```
-typed (11 instructions)                    untyped (16 instructions)
-LoadN  k, 2                                LoadK   t, 2
-JCmpN  Lt  n, k  → else                    DynCmp  Lt  c, n, t      ; tag checks on both sides
-MovS   r, n                                JmpF    c → else
-Jmp    ret                                 MovV    r, n             ; refcount-aware move
-AddNK  a, n, -1                            Jmp     ret
-Call   fib(a)        ; args copied raw     LoadK   t, 1
-AddNK  b, n, -2                            DynNum  Sub  x, n, t
-Call   fib(b)                              BoxN    a, x
-AddN   r, ra, rb     ; raw f64 add         Call    fib(a)           ; args boxed
-MovS / RetN
-                                           …       (same for n - 2)
-                                           DynAdd  r, ra, rb        ; tag dispatch: number? string?
-                                           MovV / RetV
+function fib(n: number)                               function fib(n: value)
+    LoadNumber { value: 2, output: num2 }                 LoadConstant { constant: 2, output: val3 }
+    JumpIfCompare { op: Lt, when: false,                  DynamicCompare { op: Lt, left: n, right: val3, output: bool0 }
+                    left: n, right: num2, to: L4 }        JumpIf { when: false, condition: bool0, to: L5 }
+    CopyNumber { from: n, to: num1 }                      CopyValue { from: n, to: val2 }
+    Jump { to: L9 }                                       Jump { to: L14 }
+L4:                                                   L5:
+    AddConstant { left: n, constant: -1, output: num3 }   LoadConstant { constant: 1, output: val4 }
+                                                          DynamicArithmetic { op: Sub, left: n, right: val4, output: num0 }
+                                                          BoxNumber { value: num0, output: val5 }
+    Call { function: fib, args: [num3], output: num2 }    Call { function: fib, args: [val5], output: val3 }
+    …same for n - 2…                                      …same for n - 2…
+    Arithmetic { op: Add, left: num2, right: num4,        DynamicAdd { left: val3, right: val6, output: val2 }
+                 output: num1 }
+L9:                                                   L14:
+    CopyNumber { from: num1, to: num2 }                   CopyValue { from: val2, to: val3 }
+    ReturnNumber { value: num2 }                          ReturnValue { value: val3 }
 ```
 
-With types known, numbers stay in untagged registers: no tag checks, no boxing,
-no refcount-aware moves. The compiler can also do things that are impossible
+With types known, numbers stay in untagged number slots: no tag checks
+(`DynamicCompare` and `DynamicAdd` check whether each side is a number or a
+string), no boxing, and no reference-counted copies (`CopyValue`). The compiler can also do things that are impossible
 without types:
 
 - fuse a compare with its branch
@@ -157,7 +172,7 @@ The last one is the 2.9× on `closures`.
 
 ## Supported TypeScript (POC subset)
 
-- **Types:** primitives, literal types, arrays, tuples, functions, object
+- **Types:** primitives (including `bigint`), literal types, arrays, tuples, functions, object
   types, interfaces (including recursive, generic, `extends`, merging), type
   aliases, unions, intersections of object types, enums (numeric and string),
   classes and generics, `keyof`, `typeof`, `Record`, `Partial`, `Readonly`,
@@ -178,6 +193,16 @@ The last one is the 2.9× on `closures`.
   `Number.*`, `parseInt`/`parseFloat`, `String`, most string and array
   methods, `Map`, `Set`, and `Error`/`TypeError`/`RangeError` (written in
   TypeScript in `src/prelude.ts`).
+- **BigInts** are 128-bit integers (`i128`), as in rjs. That covers the
+  usual uses (64-bit IDs, nanosecond timestamps, modular arithmetic) without
+  a heap allocation per value. A result outside ±2^127 throws
+  `RangeError: Maximum BigInt size exceeded`, where Node would keep growing.
+  Typed `bigint` values are unboxed (`BigIntArithmetic` on two-slot
+  `BigSlot`s); `any` values holding BigInts are boxed and checked. Mixing
+  `bigint` and `number` in arithmetic is a compile error, as in TypeScript.
+  Supported: literals (`10n`, `0xffn`), all operators except `>>>`,
+  `BigInt(x)`, `Number(x)`, `String(x)`, `.toString(radix)`, comparison
+  with numbers and strings, `Map`/`Set` keys, `typeof`.
 - `console.log` formatting follows Node's `util.inspect` (line breaking and
   array grouping), so test output can be compared with Node byte for byte.
 
@@ -198,7 +223,7 @@ Roughly in order of what's needed to run real npm packages:
    2. Inferred `weak` back-references (parent pointers).
    3. A trial-deletion cycle collector limited to cycle-capable types.
 4. **Unboxed object fields.** Store `number` fields as `f64` in the object
-   layout. Today `GetFieldN` pays a `RefCell` borrow and a tag check, which is
+   layout. Today `ReadFieldNumber` pays a `RefCell` borrow and a tag check, which is
    the main cost in `nbody`.
 5. **Faster calls.** Calls cost about 30ns. To reduce that: inline small
    non-recursive functions (the HOF inliner already does this for callbacks),
@@ -208,7 +233,7 @@ Roughly in order of what's needed to run real npm packages:
    Types from `.d.ts` files would give typed boundaries.
 7. **Missing language features:** regular expressions, symbols and
    iterators (`for-of` over user iterables), class expressions, computed keys,
-   object-literal getters, `BigInt`, `Date`, mapped and conditional types,
+   object-literal getters, `Date`, mapped and conditional types,
    static blocks, and labeled `continue` in inlined callbacks.
 8. **Error locations.** Uncaught errors have no stack trace yet. A pc → source
    line table is reserved (`FuncCode::lines`).
@@ -221,9 +246,11 @@ Roughly in order of what's needed to run real npm packages:
 | `src/types.rs` | types and storage kinds |
 | `src/check/` | checker: declarations and classes (`mod.rs`), expressions and calls (`expr.rs`), statements and narrowing (`stmt.rs`), built-in signatures (`builtins.rs`) |
 | `src/hir.rs` | typed IR |
-| `src/codegen.rs` | register allocation, lowering, inlining, peephole |
-| `src/bytecode.rs`, `src/vm.rs` | instruction set and interpreter |
-| `src/runtime/` | values, objects, shapes, `inspect`, natives |
+| `src/codegen.rs` | slot allocation, lowering, inlining, peephole |
+| `src/bytecode.rs` | the instruction set: `Instruction`, slots, call sites |
+| `src/disasm.rs` | `--dump`: instructions with slots shown by variable name |
+| `src/vm.rs` | the interpreter |
+| `src/runtime/` | values, objects, shapes, `inspect`, natives, BigInt arithmetic (`bigint.rs`) |
 | `tests/programs/` | programs whose output must match Node |
 | `tests/rts/` | rts-specific behaviour (checked `any` boundaries) |
 | `bench/` | benchmarks and runner |

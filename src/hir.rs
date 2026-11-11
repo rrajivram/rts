@@ -16,7 +16,7 @@ pub type FuncId = u32;
 #[derive(Debug, Clone)]
 pub struct VarInfo {
     pub name: Name,
-    /// Declared (storage) type; determines the register kind.
+    /// Declared (storage) type; determines the slot type (number, boolean or value).
     pub ty: Type,
     /// Function that owns the variable; None = global.
     pub owner: Option<FuncId>,
@@ -62,6 +62,8 @@ pub struct HClass {
     /// Method name → function, including inherited (vtable order = index).
     pub vtable: Vec<(Name, FuncId)>,
     pub ctor: FuncId,
+    /// Defined by the built-in prelude (`Error` and friends), not the program.
+    pub prelude: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -180,6 +182,10 @@ impl CmpOp {
 pub enum HBin {
     /// Both operands numbers (scalar).
     Num(NumOp),
+    /// Both operands BigInts (unboxed).
+    Big(NumOp),
+    /// BigInt comparison, both unboxed.
+    BigCmp(CmpOp),
     /// Numeric comparison, both scalar numbers. (Negation of NaN compares isn't
     /// valid, so fused jumps only negate via jump sense, never the op.)
     NumCmp(CmpOp),
@@ -195,8 +201,12 @@ pub enum HBin {
     LooseEq(bool),
     /// Fully dynamic `+` (number or string at run time).
     DynAdd,
-    /// Dynamic arithmetic: operands converted with ToNumber.
+    /// Dynamic arithmetic with a statically-number operand: the result is a
+    /// number (or a TypeError if the other side is a BigInt).
     DynNum(NumOp),
+    /// Dynamic arithmetic on two untyped operands: a number, or a BigInt if
+    /// both turn out to be BigInts, so the result is a value.
+    DynNumeric(NumOp),
     /// Dynamic relational comparison.
     DynCmp(CmpOp),
     /// `key in obj`
@@ -208,6 +218,11 @@ pub enum HUnary {
     NegNum,
     NotBool,
     BitNotNum,
+    NegBig,
+    BitNotBig,
+    /// `-x` / `~x` on an untyped value: a number, or a BigInt for a BigInt.
+    NegDyn,
+    BitNotDyn,
     /// `typeof x` → string
     TypeOf,
     /// `void x` → undefined
@@ -284,6 +299,7 @@ pub struct HCall {
 #[derive(Debug, Clone)]
 pub enum HK {
     Num(f64),
+    BigInt(i128),
     Bool(bool),
     Str(Rc<str>),
     Null,

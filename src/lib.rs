@@ -1,12 +1,13 @@
 //! rts: a TypeScript runtime without a garbage collector.
 //!
-//! Pipeline: lexer → parser → checker (typed HIR) → codegen (typed register
+//! Pipeline: lexer → parser → checker (typed HIR) → codegen (typed slot
 //! bytecode) → VM. See DESIGN.md.
 
 pub mod ast;
 pub mod bytecode;
 pub mod check;
 pub mod codegen;
+pub mod disasm;
 pub mod error;
 pub mod hir;
 pub mod lexer;

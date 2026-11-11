@@ -7,7 +7,7 @@ This is a proof of concept. The long-term goal is to run arbitrary npm packages.
 ## Pipeline
 
 ```
-source ──lexer──▶ tokens ──parser──▶ AST ──checker──▶ typed HIR ──codegen──▶ bytecode ──▶ VM
+source ──lexer──▶ tokens ──parser──▶ AST ──checker──▶ typed HIR ──codegen──▶ instructions ──▶ VM
 ```
 
 | module | job |
@@ -17,31 +17,81 @@ source ──lexer──▶ tokens ──parser──▶ AST ──checker──
 | `ast` | The untyped syntax tree. Type annotations are kept as `TypeExpr`. |
 | `types` | Semantic types (`Type`), assignability, and the mapping from a type to a storage **kind**. |
 | `check` | Resolves names, infers and checks types, narrows unions, and finds captured variables. Its output is HIR: every expression has a type, every identifier is resolved to a `VarId` or a global, and every implicit conversion (boxing, unboxing, number→string) is an explicit node. |
-| `codegen` | Allocates typed registers and lowers HIR to bytecode. |
+| `codegen` | Gives every variable and temporary a typed slot and lowers HIR to instructions. |
+| `bytecode` | The instruction set (`Instruction`), the slot types, and call sites. |
+| `disasm` | `rts --dump`: prints instructions with slots shown by variable name. |
 | `vm` | The interpreter loop, frames, and calls. |
 | `runtime` | Values, objects, arrays, strings, and built-ins (`console`, `Math`, string and array methods). |
 
-## Hybrid typing (option "c")
+## Instructions and slots
 
-Every static type maps to one of two storage **kinds**:
+The instruction style follows rjs: each instruction is a named variant with
+named fields, such as `Arithmetic { op, left, right, output }` or
+`JumpIf { when, condition, to }`. The operands are **slots**. Every local
+variable, parameter and temporary of a function has a numbered slot in its
+frame, resolved at compile time, so nothing is looked up by name at run time.
 
-| kind | holds | register file |
+Each slot has a type fixed by the compiler, so every instruction knows what
+its operands hold:
+
+| slot type | holds | stored in |
 |---|---|---|
-| `S` (scalar) | `number` (f64 bits), `boolean` (0/1) | `Vec<u64>`, untagged, never refcounted |
-| `V` (value) | everything else: `string`, objects, arrays, functions, unions, `any`, `unknown`, generics | `Vec<Value>`, tagged, refcounted |
+| `NumSlot` | a `number` | the frame's scalar slots (`Vec<u64>`): raw f64 bits, untagged, never refcounted |
+| `BoolSlot` | a `boolean` | the frame's scalar slots: 0 or 1 |
+| `BigSlot` | a `bigint` | two consecutive scalar slots: an `i128`, low half first |
+| `ValSlot` | everything else: `string`, objects, arrays, functions, unions, `any`, `unknown`, generics | the frame's value slots (`Vec<Value>`): tagged, refcounted |
 
-A frame has a window into each file. When both operands are known to be numbers,
-an instruction such as `AddN d, a, b` is a plain f64 add on two `u64` slots, with
-no tag check and no refcount traffic.
+So `NumSlot(3)` and `ValSlot(3)` are different places. When both operands are
+known numbers, `Arithmetic { op: Add, left, right, output }` is a plain f64
+add, with no tag check and no refcount traffic.
+
+BigInts follow rjs and are `i128`s rather than arbitrary precision; a result
+that doesn't fit is a `RangeError`. Because one fits in two scalar slots, a
+typed `bigint` is as unboxed as a `number`: `BigIntArithmetic`,
+`CompareBigInts`, `ReturnBigInt` and bigint call arguments copy 16 bytes and
+never allocate. Only BigInts stored as values (`any`, arrays, fields,
+closures) are boxed, as `Value::BigInt(Rc<i128>)`. Untyped arithmetic on two
+`any` operands produces a value (`DynamicArithmeticToValue`), since it may
+turn out to be a BigInt.
+
+`rts --dump` shows slots by the variable they hold (`n`, `total`). It shows a
+slot preloaded with the constant 3 as `#3`, and temporaries as `num4`,
+`bool0`, `big6` or `val2`:
+
+```
+function fib(n: number)
+  ; slots: 6 number/boolean, 1 value
+    LoadNumber { value: 2, output: num2 }
+    JumpIfCompare { op: Lt, when: false, left: n, right: num2, to: L4 }
+    CopyNumber { from: n, to: num1 }
+    Jump { to: L9 }
+L4:
+    AddConstant { left: n, constant: -1, output: num3 }
+    Call { function: fib, args: [num3], output: num2 }
+    AddConstant { left: n, constant: -2, output: num5 }
+    Call { function: fib, args: [num5], output: num4 }
+    Arithmetic { op: Add, left: num2, right: num4, output: num1 }
+L9:
+    CopyNumber { from: num1, to: num2 }
+    ReturnNumber { value: num2 }
+```
+
+Where rjs differs: rjs looks variables up by name in scope objects
+(`Var("n")`), with registers `AX`–`DX` and a push/pop stack for temporaries.
+rts resolves every name to a slot before running, which is most of why it is
+faster (see the README benchmarks).
+
+## Hybrid typing (option "c")
 
 Values whose static type is not precise (`any`, `unknown`, unions, type
 parameters) are stored as boxed `Value`s, and operations on them check the tag at
 run time. The checker inserts the conversion at each boundary:
 
-- `Box{N,B}` turns a scalar into a value. This always succeeds.
-- `Unbox{N,B}` turns a value into a scalar. It checks the tag and throws a
-  `TypeError` on a mismatch, so a lie in a `.d.ts` or an `as` cast cannot corrupt
-  memory.
+- `BoxNumber` / `BoxBool` copy a number or boolean slot into a value slot.
+  This always succeeds.
+- `UnboxNumber` / `UnboxBool` copy a value slot into a number or boolean slot.
+  They check the tag and throw a `TypeError` on a mismatch, so a lie in a
+  `.d.ts` or an `as` cast cannot corrupt memory.
 
 ### Unsound TypeScript
 
@@ -50,7 +100,7 @@ are handled with run-time checks on slow paths, never by trusting the type:
 
 - **Arrays** are specialized by storage: `ArrStore::Num(Vec<f64>)` or
   `ArrStore::Val(Vec<Value>)`. A `number[]` starts as `Num`. A typed read such as
-  `GetIdxN` takes the fast path when the storage is `Num`. If something wrote a
+  `ReadElementNumber` takes the fast path when the storage is `Num`. If something wrote a
   non-number through a covariant alias, the storage has degraded to `Val`, and the
   read checks the element instead.
 - **Object fields** are `Value`s at a slot index. Typed reads check the tag with a
@@ -58,7 +108,7 @@ are handled with run-time checks on slow paths, never by trusting the type:
 
 ### Generics
 
-Generics are erased: type parameters are of kind `V`, and callers box and unbox
+Generics are erased: type parameters live in value slots, and callers box and unbox
 around them. Monomorphization can come later.
 
 ## Objects without hash lookups
@@ -67,19 +117,19 @@ around them. Monomorphization can come later.
   `Vec<Value>` indexed by the shape.
 - **Class instances** have a shape fixed by the class. A subclass extends its
   parent's shape as a prefix. When the receiver's static type is a class, a field
-  access compiles to a constant slot index (`GetField`), and a method call indexes
-  the class vtable (`CallMethod`).
+  access compiles to a fixed field position (`ReadField`), and a method call
+  indexes the class vtable (`Call` with a `CallTarget::Method`).
 - **Structural types** (interfaces, object literal types) and `any` use
-  `GetProp` with a per-instruction **inline cache** of (shape pointer → slot).
+  `ReadProperty` with a per-instruction **inline cache** of (shape pointer → field position).
   This is necessary because structurally typed objects can have any layout.
 
 ## Variables and calls
 
-- Locals are resolved to register slots at compile time, so there are no scope
+- Locals are resolved to slots at compile time, so there are no scope
   objects or name lookups at run time.
 - A local captured by a closure is detected by the checker and stored in a cell
   (`Rc<RefCell<Value>>`). Closures hold their captured cells in a `Vec`.
-- Calls pass arguments in the callee's register windows. A function value
+- Calls copy arguments into the callee's parameter slots. A function value
   carries its signature as a list of parameter kinds and a return kind. A call
   site states the kinds it is passing:
   - If they match the callee's (the common case), arguments are copied straight
@@ -87,7 +137,7 @@ around them. Monomorphization can come later.
   - Otherwise, each argument is boxed or unboxed. This handles dynamic calls
     through `any`, generic callbacks, and function-type subtyping uniformly.
 - A call to a top-level function that is never reassigned compiles to
-  `CallDirect`, with no closure lookup.
+  a `Call` with `CallTarget::Direct`, with no closure lookup.
 
 ## Memory: no tracing GC
 
@@ -105,7 +155,7 @@ around them. Monomorphization can come later.
 
 ## Supported subset (POC)
 
-**Types:** `number`, `boolean`, `string`, `void`, `null`, `undefined`, `any`,
+**Types:** `number`, `bigint` (128-bit), `boolean`, `string`, `void`, `null`, `undefined`, `any`,
 `unknown`, `never`, literal types, `T[]` and `Array<T>`, tuples (as arrays),
 function types, object type literals, interfaces (including `extends`), type
 aliases, unions with narrowing, classes, numeric enums, and generic functions

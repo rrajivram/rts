@@ -8,6 +8,8 @@ use crate::error::{CompileError, Span};
 #[derive(Debug, Clone, PartialEq)]
 pub enum Tok {
     Num(f64),
+    /// `123n`
+    BigInt(i128),
     Str(Rc<str>),
     /// `` `a${x}b` `` → quasis ["a", "b"], exprs [[x]]. quasis.len() == exprs.len() + 1.
     Template {
@@ -201,7 +203,14 @@ impl<'a> Lexer<'a> {
             while self.peek(0).is_ascii_alphanumeric() || self.peek(0) == b'_' {
                 self.pos += 1;
             }
-            let digits: String = self.text[ds..self.pos].chars().filter(|c| *c != '_').collect();
+            let mut digits: String = self.text[ds..self.pos].chars().filter(|c| *c != '_').collect();
+            if digits.ends_with('n') {
+                digits.pop();
+                return match i128::from_str_radix(&digits, radix) {
+                    Ok(v) => Ok(Tok::BigInt(v)),
+                    Err(_) => self.err("BigInt literal is too large (BigInts are 128-bit)", start),
+                };
+            }
             return match u64::from_str_radix(&digits, radix) {
                 Ok(v) => Ok(Tok::Num(v as f64)),
                 Err(_) => self.err("invalid number literal", start),
@@ -230,7 +239,13 @@ impl<'a> Lexer<'a> {
             }
         }
         if self.peek(0) == b'n' {
-            return self.err("BigInt literals are not supported yet", start);
+            let text: String = self.text[start..self.pos].chars().filter(|c| *c != '_').collect();
+            self.pos += 1;
+            return match text.parse::<i128>() {
+                Ok(v) => Ok(Tok::BigInt(v)),
+                Err(_) if text.bytes().all(|b| b.is_ascii_digit()) => self.err("BigInt literal is too large (BigInts are 128-bit)", start),
+                Err(_) => self.err("invalid BigInt literal", start),
+            };
         }
         let text: String = self.text[start..self.pos].chars().filter(|c| *c != '_').collect();
         match text.parse::<f64>() {

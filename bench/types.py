@@ -44,8 +44,8 @@ def run(cmd):
 def static_count(args, path):
     """Instructions in the compiled program, and how many are dynamic/boxing ops."""
     d = subprocess.run([RTS, "--dump", *args, path], capture_output=True, text=True).stdout
-    ops = [l.split()[1] for l in d.splitlines() if l.startswith("  ") and len(l.split()) > 1]
-    dyn = sum(o.startswith(("Dyn", "Box", "Unbox", "GetProp", "SetProp", "GetDyn", "SetDyn", "ToNum")) for o in ops)
+    ops = [l.split()[0] for l in d.splitlines() if l.startswith("    ") and l.strip()]
+    dyn = sum(o.startswith(("Dynamic", "Box", "Unbox", "ReadProperty", "WriteProperty", "ToNumber")) for o in ops)
     return len(ops), dyn
 
 

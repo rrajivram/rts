@@ -107,6 +107,7 @@ impl Parser {
     fn describe(&self) -> String {
         match self.tok() {
             Tok::Num(n) => format!("number {n}"),
+            Tok::BigInt(n) => format!("bigint {n}n"),
             Tok::Str(_) => "string".into(),
             Tok::Template { .. } => "template literal".into(),
             Tok::Ident(n) => format!("'{n}'"),
@@ -1724,6 +1725,10 @@ impl Parser {
             Tok::Num(n) => {
                 self.bump();
                 Ok(Self::mk(ExprKind::Num(n), start))
+            }
+            Tok::BigInt(n) => {
+                self.bump();
+                Ok(Self::mk(ExprKind::BigInt(n), start))
             }
             Tok::Str(s) => {
                 self.bump();

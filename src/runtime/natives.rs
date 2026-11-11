@@ -33,7 +33,7 @@ natives! {
     MathRandom = "random", MathHypot = "hypot", MathCbrt = "cbrt", MathImul = "imul", MathClz32 = "clz32",
     MathFround = "fround",
     ParseInt = "parseInt", ParseFloat = "parseFloat", IsNaN = "isNaN", IsFinite = "isFinite",
-    StringFn = "String", NumberFn = "Number", BooleanFn = "Boolean",
+    StringFn = "String", NumberFn = "Number", BooleanFn = "Boolean", BigIntFn = "BigInt",
     NumIsInteger = "isInteger", NumIsFinite = "isFinite", NumIsNaN = "isNaN", NumIsSafeInteger = "isSafeInteger",
     NumToFixed = "toFixed", NumToString = "toString", NumToPrecision = "toPrecision",
     StrCharAt = "charAt", StrCharCodeAt = "charCodeAt", StrCodePointAt = "codePointAt", StrIndexOf = "indexOf",
@@ -373,9 +373,24 @@ fn cb_args(x: Value, i: usize, arr: &Rc<Array>) -> [Value; 3] {
     [x, Value::Num(i as f64), Value::Arr(arr.clone())]
 }
 
+/// Whether JSON.stringify would reach a BigInt (which it cannot serialize).
+fn contains_bigint(v: &Value, depth: usize) -> bool {
+    if depth > 64 {
+        return false;
+    }
+    match v {
+        Value::BigInt(_) => true,
+        Value::Arr(a) => a.to_vec().iter().any(|x| contains_bigint(x, depth + 1)),
+        Value::Obj(o) => o.keys().iter().any(|k| o.get(k).is_some_and(|x| contains_bigint(&x, depth + 1))),
+        _ => false,
+    }
+}
+
 pub fn json_stringify(v: &Value, indent: &str, cur: &str, out: &mut String) -> bool {
     match v {
         Value::Undef | Value::Func(_) | Value::Native(_) | Value::Class(_) => return false,
+        // JSON.stringify checks for BigInts (a TypeError) before getting here.
+        Value::BigInt(n) => out.push_str(&n.to_string()),
         Value::Null => out.push_str("null"),
         Value::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
         Value::Num(n) => {
@@ -705,6 +720,25 @@ pub fn call_native(vm: &mut Vm, n: Native, this: Value, args: Vec<Value>) -> NRe
         },
         NumberFn => Value::Num(args.first().map_or(0.0, |v| v.to_number())),
         BooleanFn => Value::Bool(arg(&args, 0).truthy()),
+        BigIntFn => {
+            let r = match arg(&args, 0) {
+                Value::BigInt(n) => Ok(*n),
+                Value::Num(x) if x.fract() != 0.0 || !x.is_finite() => {
+                    return Err(vm.range_error(format!("The number {} cannot be converted to a BigInt because it is not an integer", num_to_string(x))));
+                }
+                Value::Num(x) => bigint::from_number(x),
+                Value::Bool(b) => Ok(b as i128),
+                Value::Str(s) => match bigint::parse(&s.s) {
+                    Some(n) => Ok(n),
+                    None => return Err(vm.syntax_error(format!("Cannot convert {} to a BigInt", s.s))),
+                },
+                v => return te(vm, format!("Cannot convert {} to a BigInt", v.to_display())),
+            };
+            match r {
+                Ok(n) => Value::bigint(n),
+                Err(e) => return Err(vm.bigint_error(e)),
+            }
+        }
         NumIsInteger => Value::Bool(matches!(arg(&args, 0), Value::Num(x) if x.is_finite() && x.fract() == 0.0)),
         NumIsSafeInteger => {
             Value::Bool(matches!(arg(&args, 0), Value::Num(x) if x.is_finite() && x.fract() == 0.0 && x.abs() <= 9007199254740991.0))
@@ -746,6 +780,7 @@ pub fn call_native(vm: &mut Vm, n: Native, this: Value, args: Vec<Value>) -> NRe
             }
             match &this {
                 Value::Num(x) => Value::str(radix_string(*x, r)),
+                Value::BigInt(n) => Value::str(bigint::to_string_radix(**n, r)),
                 v => Value::Str(v.to_js_string()),
             }
         }
@@ -1331,6 +1366,9 @@ pub fn call_native(vm: &mut Vm, n: Native, this: Value, args: Vec<Value>) -> NRe
                 Some(Value::Str(s)) => s.s.chars().take(10).collect(),
                 _ => String::new(),
             };
+            if contains_bigint(&arg(&args, 0), 0) {
+                return te(vm, "Do not know how to serialize a BigInt".into());
+            }
             let mut out = String::new();
             if json_stringify(&arg(&args, 0), &indent, "", &mut out) {
                 Value::str(out)
@@ -1571,6 +1609,7 @@ pub fn method_by_name(recv: &Value, name: &str) -> Option<Native> {
             StrLocaleCompare, StrToString, StrNormalize,
         ],
         Value::Num(_) => &[NumToFixed, NumToString, NumToPrecision],
+        Value::BigInt(_) => &[NumToString],
         Value::Map(_) => &[MapGet, MapSet, MapHas, MapDelete, MapClear, MapForEach, MapKeys, MapValues, MapEntries],
         Value::Set(_) => &[SetAdd, SetHas, SetDelete, SetClear, SetForEach, SetValues],
         _ => &[],

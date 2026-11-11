@@ -1,7 +1,40 @@
-//! Register bytecode. Registers are frame-relative indices into one of two
-//! files: `S` (u64 scalars: f64 bits or 0/1 booleans) and `V` (`Value`s).
-//! Every instruction's operands have a fixed file, so the interpreter never
-//! checks a tag for typed code.
+//! The instructions the VM runs.
+//!
+//! # Slots
+//!
+//! Every local variable, parameter and temporary value of a function lives in
+//! a numbered **slot** of the function's frame. The compiler gives each slot a
+//! fixed type, so an instruction always knows what kind of value an operand
+//! holds and never has to check at run time:
+//!
+//! | slot type  | holds                                               | stored as          |
+//! |------------|-----------------------------------------------------|--------------------|
+//! | `NumSlot`  | a `number`                                          | raw `f64` bits     |
+//! | `BoolSlot` | a `boolean`                                         | `0` or `1`         |
+//! | `BigSlot`  | a `bigint` (an `i128`, as in rjs)                   | two scalar slots   |
+//! | `ValSlot`  | anything else (`string`, objects, `any`, unions, …) | a tagged [`Value`] |
+//!
+//! Number, boolean and bigint slots share one array per frame (the *scalar* slots),
+//! and value slots are a second array (the *value* slots). Keeping numbers out
+//! of `Value` is what makes typed arithmetic a plain `f64` add, with no tag
+//! check and no reference counting. `NumSlot(3)` and `ValSlot(3)` are
+//! different slots: one is index 3 of the scalar array, the other index 3 of
+//! the value array.
+//!
+//! Value slot 0 always holds `this`. Parameters follow, each in a slot of its
+//! own type, in order.
+//!
+//! `rts --dump file.ts` prints a program's instructions with slots shown by
+//! the name of the variable they hold (or `num3`, `bool3`, `big3`, `val3` for
+//! temporaries, and `#2` for a slot preloaded with the constant 2).
+//!
+//! # Converting between slot types
+//!
+//! Where a typed value meets an untyped one (passing a `number` to a function
+//! taking `any`, reading an `any` into a `number` variable), the compiler
+//! inserts `BoxNumber` / `UnboxNumber` (or the `Bool` versions). Unboxing
+//! checks the value's type and throws a `TypeError` if it is wrong, so a
+//! wrong `as` cast or `any` can never be misread.
 
 use std::rc::Rc;
 
@@ -9,162 +42,357 @@ use crate::hir::{CmpOp, NumOp};
 use crate::runtime::{ClassRt, Native, PropCache, Shape, Value};
 use crate::types::Kind;
 
-pub type R = u16;
+/// A frame slot holding a `number`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NumSlot(pub u16);
 
+/// A frame slot holding a `boolean`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BoolSlot(pub u16);
+
+/// A frame slot holding a `bigint`: an `i128` in scalar slots `n` (low 64
+/// bits) and `n + 1` (high 64 bits). A BigInt that doesn't fit is a
+/// RangeError, never a heap allocation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BigSlot(pub u16);
+
+/// A frame slot holding a [`Value`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ValSlot(pub u16);
+
+/// A position in a function's instruction list (shown as a label, `L12`, in dumps).
+pub type Target = u32;
+
+/// Index of a slot within its array, whatever its type.
+pub trait SlotIndex: Copy {
+    fn index(self) -> usize;
+}
+impl SlotIndex for NumSlot {
+    #[inline(always)]
+    fn index(self) -> usize {
+        self.0 as usize
+    }
+}
+impl SlotIndex for BoolSlot {
+    #[inline(always)]
+    fn index(self) -> usize {
+        self.0 as usize
+    }
+}
+impl SlotIndex for BigSlot {
+    #[inline(always)]
+    fn index(self) -> usize {
+        self.0 as usize
+    }
+}
+impl SlotIndex for ValSlot {
+    #[inline(always)]
+    fn index(self) -> usize {
+        self.0 as usize
+    }
+}
+impl SlotIndex for u16 {
+    #[inline(always)]
+    fn index(self) -> usize {
+        self as usize
+    }
+}
+
+/// One VM instruction. Operands name slots of the current frame; `output` is
+/// where the result goes. Jump targets (`to`, `catch`) are instruction indices.
+///
+/// Instructions are `Copy` and 16 bytes, so the VM can fetch them cheaply.
 #[derive(Debug, Clone, Copy)]
-pub enum I {
-    // ── scalars ──
-    LoadN { d: R, v: f64 },
-    LoadB { d: R, v: bool },
-    MovS { d: R, s: R },
-    AddN { d: R, a: R, b: R },
-    SubN { d: R, a: R, b: R },
-    MulN { d: R, a: R, b: R },
-    DivN { d: R, a: R, b: R },
-    ModN { d: R, a: R, b: R },
-    /// `d = a + k`
-    AddNK { d: R, a: R, k: f64 },
-    NumOp { op: NumOp, d: R, a: R, b: R },
-    LtN { d: R, a: R, b: R },
-    LeN { d: R, a: R, b: R },
-    GtN { d: R, a: R, b: R },
-    GeN { d: R, a: R, b: R },
-    EqN { d: R, a: R, b: R },
-    NeN { d: R, a: R, b: R },
-    EqB { d: R, a: R, b: R },
-    NeB { d: R, a: R, b: R },
-    NegN { d: R, s: R },
-    NotB { d: R, s: R },
-    BitNotN { d: R, s: R },
-    TruthyN { d: R, s: R },
-    Math1 { op: Native, d: R, s: R },
-    Math2 { op: Native, d: R, a: R, b: R },
-    // ── control ──
-    Jmp { t: u32 },
-    JmpT { c: R, t: u32 },
-    JmpF { c: R, t: u32 },
-    /// Fused numeric compare-and-branch: jump if `(a op b) == sense`.
-    JCmpN { op: CmpOp, sense: bool, a: R, b: R, t: u32 },
-    JmpTV { c: R, t: u32 },
-    JmpFV { c: R, t: u32 },
-    JmpNullish { s: R, t: u32 },
-    JmpNotNullish { s: R, t: u32 },
+pub enum Instruction {
+    // ── numbers and booleans ──
+    /// `output = value`
+    LoadNumber { value: f64, output: NumSlot },
+    /// `output = value`
+    LoadBool { value: bool, output: BoolSlot },
+    /// `to = from`
+    CopyNumber { from: NumSlot, to: NumSlot },
+    /// `to = from`
+    CopyBool { from: BoolSlot, to: BoolSlot },
+    /// `output = left op right` on numbers (`+ - * / % **` and bitwise operators).
+    Arithmetic { op: NumOp, left: NumSlot, right: NumSlot, output: NumSlot },
+    /// `output = left + constant` (also `x - 1` with a negative constant).
+    AddConstant { left: NumSlot, constant: f64, output: NumSlot },
+    /// `output = left op right` on numbers (`< <= > >= === !==`).
+    Compare { op: CmpOp, left: NumSlot, right: NumSlot, output: BoolSlot },
+    /// `output = left === right` (or `!==` when `equal` is false) on booleans.
+    CompareBools { equal: bool, left: BoolSlot, right: BoolSlot, output: BoolSlot },
+    /// `output = -value`
+    Negate { value: NumSlot, output: NumSlot },
+    /// `output = !value`
+    Not { value: BoolSlot, output: BoolSlot },
+    /// `output = ~value`
+    BitNot { value: NumSlot, output: NumSlot },
+    /// `output = Boolean(value)`: false for 0 and NaN.
+    NumberIsTruthy { value: NumSlot, output: BoolSlot },
+    /// `output = Math.function(value)`, e.g. `Math.sqrt`.
+    MathUnary { function: Native, value: NumSlot, output: NumSlot },
+    /// `output = Math.function(left, right)`, e.g. `Math.max`.
+    MathBinary { function: Native, left: NumSlot, right: NumSlot, output: NumSlot },
+
+    // ── bigints ──
+    /// `output = constants[constant]`, a BigInt literal.
+    LoadBigInt { constant: u32, output: BigSlot },
+    /// `to = from`
+    CopyBigInt { from: BigSlot, to: BigSlot },
+    /// `output = left op right` on BigInts. Overflowing 128 bits or dividing
+    /// by zero throws a `RangeError`.
+    BigIntArithmetic { op: NumOp, left: BigSlot, right: BigSlot, output: BigSlot },
+    /// `output = left op right` on BigInts (`< <= > >= === !==`).
+    CompareBigInts { op: CmpOp, left: BigSlot, right: BigSlot, output: BoolSlot },
+    /// `output = -value`
+    NegateBigInt { value: BigSlot, output: BigSlot },
+    /// `output = ~value`
+    BitNotBigInt { value: BigSlot, output: BigSlot },
+    /// `output = Boolean(value)`: false for 0n.
+    BigIntIsTruthy { value: BigSlot, output: BoolSlot },
+
+    // ── jumps ──
+    /// Continue at `to`.
+    Jump { to: Target },
+    /// Jump to `to` if `condition == when`.
+    JumpIf { when: bool, condition: BoolSlot, to: Target },
+    /// Jump to `to` if `(left op right) == when`: a number comparison and a
+    /// branch in one instruction, as at the top of most loops.
+    JumpIfCompare { op: CmpOp, when: bool, left: NumSlot, right: NumSlot, to: Target },
+    /// Jump to `to` if the value's truthiness equals `when`.
+    JumpIfTruthy { when: bool, value: ValSlot, to: Target },
+    /// Jump to `to` if "value is null or undefined" equals `when` (for `??` and `?.`).
+    JumpIfNullish { when: bool, value: ValSlot, to: Target },
+
     // ── values ──
-    LoadK { d: R, k: u32 },
-    LoadUndef { d: R },
-    LoadNull { d: R },
-    MovV { d: R, s: R },
-    ClearV { d: R, n: u16 },
-    BoxN { d: R, s: R },
-    BoxB { d: R, s: R },
-    UnboxN { d: R, s: R },
-    UnboxB { d: R, s: R },
-    TruthyV { d: R, s: R },
-    NumToStr { d: R, s: R },
-    ToStr { d: R, s: R },
-    ToNum { d: R, s: R },
-    Concat { d: R, a: R, b: R },
-    StrCmp { op: CmpOp, d: R, a: R, b: R },
-    StrictEq { d: R, a: R, b: R, eq: bool },
-    LooseEq { d: R, a: R, b: R, eq: bool },
-    DynAdd { d: R, a: R, b: R },
-    DynNum { op: NumOp, d: R, a: R, b: R },
-    DynCmp { op: CmpOp, d: R, a: R, b: R },
-    /// Dynamic arithmetic producing a boxed number (`any * any` stored as a value).
-    DynNumV { op: NumOp, d: R, a: R, b: R },
-    /// `d = ToNumber(s) + k` as a boxed number (`i++` on an `any` local).
-    IncV { d: R, s: R, k: f64 },
-    TypeOf { d: R, s: R },
-    In { d: R, k: R, o: R },
-    InstanceOf { d: R, o: R, class: u32 },
-    // ── cells, upvalues, globals ──
-    NewCell { d: R },
-    CellGet { d: R, c: R },
-    CellSet { c: R, s: R },
-    UpGet { d: R, i: u16 },
-    UpSet { i: u16, s: R },
-    GetGS { d: R, g: u32 },
-    SetGS { g: u32, s: R },
-    GetGV { d: R, g: u32 },
-    SetGV { g: u32, s: R },
+    /// `output = constants[constant]` (strings and other literals).
+    LoadConstant { constant: u32, output: ValSlot },
+    /// `output = undefined`
+    LoadUndefined { output: ValSlot },
+    /// `output = null`
+    LoadNull { output: ValSlot },
+    /// `to = from`
+    CopyValue { from: ValSlot, to: ValSlot },
+    /// Drop the references held by `count` slots starting at `first`, as a
+    /// block's variables go out of scope. This is where memory is freed: there
+    /// is no garbage collector.
+    Release { first: ValSlot, count: u16 },
+    /// `output = value` as a `Value`.
+    BoxNumber { value: NumSlot, output: ValSlot },
+    /// `output = value` as a `Value`.
+    BoxBool { value: BoolSlot, output: ValSlot },
+    /// `output = value` as a `Value`.
+    BoxBigInt { value: BigSlot, output: ValSlot },
+    /// `output = value`, which must be a BigInt (else `TypeError`).
+    UnboxBigInt { value: ValSlot, output: BigSlot },
+    /// `output = value`, which must be a number (else `TypeError`).
+    UnboxNumber { value: ValSlot, output: NumSlot },
+    /// `output = value`, which must be a boolean (else `TypeError`).
+    UnboxBool { value: ValSlot, output: BoolSlot },
+    /// `output = Boolean(value)`
+    IsTruthy { value: ValSlot, output: BoolSlot },
+    /// `output = String(value)` for a number.
+    NumberToString { value: NumSlot, output: ValSlot },
+    /// `output = String(value)`
+    ToString { value: ValSlot, output: ValSlot },
+    /// `output = +value` (a BigInt is a `TypeError`)
+    ToNumber { value: ValSlot, output: NumSlot },
+    /// `output = left + right` on two strings.
+    Concat { left: ValSlot, right: ValSlot, output: ValSlot },
+    /// `output = left op right` on two strings.
+    CompareStrings { op: CmpOp, left: ValSlot, right: ValSlot, output: BoolSlot },
+    /// `output = left === right` (or `!==` when `equal` is false).
+    StrictEquals { equal: bool, left: ValSlot, right: ValSlot, output: BoolSlot },
+    /// `output = left == right` (or `!=` when `equal` is false).
+    LooseEquals { equal: bool, left: ValSlot, right: ValSlot, output: BoolSlot },
+    /// `output = left + right` when the types aren't known: adds numbers or
+    /// concatenates strings, decided at run time.
+    DynamicAdd { left: ValSlot, right: ValSlot, output: ValSlot },
+    /// `output = left op right` on untyped values (converted to numbers; a
+    /// BigInt operand is a `TypeError`, since the result must be a number).
+    DynamicArithmetic { op: NumOp, left: ValSlot, right: ValSlot, output: NumSlot },
+    /// `output = left op right` on untyped values, stored as a `Value`: two
+    /// BigInts give a BigInt, a BigInt and a number a `TypeError`.
+    DynamicArithmeticToValue { op: NumOp, left: ValSlot, right: ValSlot, output: ValSlot },
+    /// `output = value + constant` as a `Value` (`i++` on an `any`; a BigInt adds `constant` as a BigInt).
+    DynamicAddConstant { value: ValSlot, constant: f64, output: ValSlot },
+    /// `output = left op right` on untyped values (numbers or strings).
+    DynamicCompare { op: CmpOp, left: ValSlot, right: ValSlot, output: BoolSlot },
+    /// `output = -value` on an untyped value (a BigInt stays a BigInt).
+    DynamicNegate { value: ValSlot, output: ValSlot },
+    /// `output = ~value` on an untyped value (a BigInt stays a BigInt).
+    DynamicBitNot { value: ValSlot, output: ValSlot },
+    /// `output = typeof value`
+    TypeOf { value: ValSlot, output: ValSlot },
+    /// `output = key in object`
+    In { key: ValSlot, object: ValSlot, output: BoolSlot },
+    /// `output = value instanceof classes[class]`
+    InstanceOf { value: ValSlot, class: u32, output: BoolSlot },
+
+    // ── captured variables and globals ──
+    /// `output = a new cell`. A variable captured by a closure lives in a
+    /// cell, so the closure and the function share it.
+    NewCell { output: ValSlot },
+    /// `output = the value inside cell`
+    ReadCell { cell: ValSlot, output: ValSlot },
+    /// Put `value` inside `cell`.
+    WriteCell { cell: ValSlot, value: ValSlot },
+    /// `output = captures[capture]`: a cell the running closure captured.
+    ReadCapture { capture: u16, output: ValSlot },
+    /// Put `value` in the running closure's captured cell `capture`.
+    WriteCapture { capture: u16, value: ValSlot },
+    /// `output = global number variable`
+    ReadGlobalNumber { global: u32, output: NumSlot },
+    /// `output = global boolean variable`
+    ReadGlobalBool { global: u32, output: BoolSlot },
+    /// `global number variable = value`
+    WriteGlobalNumber { global: u32, value: NumSlot },
+    /// `global boolean variable = value`
+    WriteGlobalBool { global: u32, value: BoolSlot },
+    /// `output = global bigint variable`
+    ReadGlobalBigInt { global: u32, output: BigSlot },
+    /// `global bigint variable = value`
+    WriteGlobalBigInt { global: u32, value: BigSlot },
+    /// `output = global variable`
+    ReadGlobal { global: u32, output: ValSlot },
+    /// `global variable = value`
+    WriteGlobal { global: u32, value: ValSlot },
+
     // ── functions ──
-    MakeClosure { d: R, f: u32, caps: u32 },
-    Call { ci: u32 },
-    RetN { s: R },
-    RetB { s: R },
-    RetV { s: R },
-    RetUndef,
-    // ── arrays & strings ──
-    NewArr { d: R, num: bool },
-    PushN { a: R, s: R },
-    PushV { a: R, s: R },
-    PushSpread { a: R, s: R },
-    GetIdxN { d: R, a: R, i: R },
-    SetIdxN { a: R, i: R, s: R },
-    GetIdxV { d: R, a: R, i: R },
-    SetIdxV { a: R, i: R, s: R },
-    GetDyn { d: R, o: R, k: R },
-    SetDyn { o: R, k: R, s: R },
-    DelDyn { o: R, k: R },
-    ArrLen { d: R, a: R },
-    SetArrLen { a: R, s: R },
-    StrLen { d: R, s: R },
-    CharCodeAt { d: R, s: R, i: R },
-    /// Elements a for-of loop visits, as an array (arrays pass through).
-    IterArr { d: R, s: R },
-    KeysArr { d: R, s: R },
+    /// `output = a closure of functions[function]`, capturing the cells listed
+    /// in `capture_lists[captures]`.
+    MakeClosure { function: u32, captures: u32, output: ValSlot },
+    /// Call as described by `call_sites[site]` (callee, `this`, arguments, output).
+    Call { site: u32 },
+    /// Return a number.
+    ReturnNumber { value: NumSlot },
+    /// Return a boolean.
+    ReturnBool { value: BoolSlot },
+    /// Return a bigint.
+    ReturnBigInt { value: BigSlot },
+    /// Return a value.
+    ReturnValue { value: ValSlot },
+    /// Return `undefined`.
+    ReturnUndefined,
+
+    // ── arrays and strings ──
+    /// `output = []`; `numbers` starts it with `f64` storage (for `number[]`).
+    NewArray { numbers: bool, output: ValSlot },
+    /// `array.push(value)`
+    PushNumber { array: ValSlot, value: NumSlot },
+    /// `array.push(value)`
+    PushValue { array: ValSlot, value: ValSlot },
+    /// `array.push(...source)`
+    PushSpread { array: ValSlot, source: ValSlot },
+    /// `output = array[index]` for a `number[]`.
+    ReadElementNumber { array: ValSlot, index: NumSlot, output: NumSlot },
+    /// `array[index] = value` for a `number[]`.
+    WriteElementNumber { array: ValSlot, index: NumSlot, value: NumSlot },
+    /// `output = array[index]`
+    ReadElement { array: ValSlot, index: NumSlot, output: ValSlot },
+    /// `array[index] = value`
+    WriteElement { array: ValSlot, index: NumSlot, value: ValSlot },
+    /// `output = object[key]` when the key's type isn't known.
+    ReadDynamic { object: ValSlot, key: ValSlot, output: ValSlot },
+    /// `object[key] = value` when the key's type isn't known.
+    WriteDynamic { object: ValSlot, key: ValSlot, value: ValSlot },
+    /// `delete object[key]`
+    DeleteDynamic { object: ValSlot, key: ValSlot },
+    /// `output = array.length`
+    ArrayLength { array: ValSlot, output: NumSlot },
+    /// `array.length = length`
+    SetArrayLength { array: ValSlot, length: NumSlot },
+    /// `output = string.length`
+    StringLength { string: ValSlot, output: NumSlot },
+    /// `output = string.charCodeAt(index)`
+    CharCodeAt { string: ValSlot, index: NumSlot, output: NumSlot },
+    /// `output = the elements a for-of loop over value visits`, as an array.
+    ToIterationArray { value: ValSlot, output: ValSlot },
+    /// `output = the keys a for-in loop over object visits`, as an array.
+    KeysArray { object: ValSlot, output: ValSlot },
+
     // ── objects ──
-    NewObj { d: R, shape: u32 },
-    ObjSpread { o: R, s: R },
-    GetField { d: R, o: R, i: u16 },
-    SetField { o: R, i: u16, s: R },
-    GetFieldN { d: R, o: R, i: u16 },
-    SetFieldN { o: R, i: u16, s: R },
-    GetProp { d: R, o: R, p: u32 },
-    SetProp { o: R, p: u32, s: R },
-    NewInst { d: R, class: u32 },
-    LoadClass { d: R, class: u32 },
+    /// `output = a new object with shapes[shape]`'s keys, all undefined.
+    NewObject { shape: u32, output: ValSlot },
+    /// `{ ...source }` into `object`.
+    SpreadIntoObject { object: ValSlot, source: ValSlot },
+    /// `output = object.<field>`, where the field's position is known (class
+    /// instances): no lookup by name.
+    ReadField { object: ValSlot, field: u16, output: ValSlot },
+    /// `output = object.<field>` for a number field.
+    ReadFieldNumber { object: ValSlot, field: u16, output: NumSlot },
+    /// `object.<field> = value`
+    WriteField { object: ValSlot, field: u16, value: ValSlot },
+    /// `object.<field> = value` for a number field.
+    WriteFieldNumber { object: ValSlot, field: u16, value: NumSlot },
+    /// `output = object.name`, looked up by name with a cache
+    /// (`property_sites[property]`), for objects whose layout isn't known.
+    ReadProperty { object: ValSlot, property: u32, output: ValSlot },
+    /// `object.name = value`, looked up by name with a cache.
+    WriteProperty { object: ValSlot, property: u32, value: ValSlot },
+    /// `output = a new instance of classes[class]`, fields undefined (the
+    /// constructor is a separate `Call`).
+    NewInstance { class: u32, output: ValSlot },
+    /// `output = the class object classes[class]`
+    LoadClass { class: u32, output: ValSlot },
+
     // ── exceptions ──
-    Throw { s: R },
-    TryBegin { catch: u32, exc: R },
+    /// `throw value`
+    Throw { value: ValSlot },
+    /// Start a `try` block: an exception jumps to `catch` with the thrown value in `exception`.
+    TryBegin { catch: Target, exception: ValSlot },
+    /// End the innermost `try` block.
     TryEnd,
 }
 
+const _: () = assert!(std::mem::size_of::<Instruction>() == 16);
+
+/// Where a closure's captured cell comes from when the closure is made.
 #[derive(Debug, Clone, Copy)]
-pub enum CapSrc {
-    /// A V register of the enclosing frame holding a cell.
-    Local(R),
-    /// The enclosing closure's own capture.
-    Up(u16),
+pub enum CaptureFrom {
+    /// A value slot of the function making the closure, holding the cell.
+    Slot(ValSlot),
+    /// A cell the function making the closure captured itself.
+    Capture(u16),
 }
 
+/// What a `Call` calls.
 #[derive(Debug)]
 pub enum CallTarget {
+    /// `functions[i]`, known at compile time (a top-level function that is never reassigned).
     Direct(u32),
-    Value(R),
-    /// Virtual call through the receiver's class vtable.
-    Method(u32),
-    /// Method/function property looked up by name on the receiver.
-    Prop(u32),
+    /// The function value in a slot.
+    Value(ValSlot),
+    /// A method of the receiver's class, by its position (`slot`) in the
+    /// class's method table. `class` is the receiver's static class (for
+    /// `--dump`; the receiver may be a subclass, whose table is used).
+    Method { class: u32, slot: u32 },
+    /// A method looked up by name on the receiver (`property_sites[i]`).
+    Property(u32),
+    /// A built-in function.
     Native(Native),
 }
 
+/// Everything about one call: what to call, its arguments and where the result goes.
 #[derive(Debug)]
-pub struct CallInfo {
+pub struct CallSite {
     pub target: CallTarget,
-    /// Receiver (V register).
-    pub this: Option<R>,
-    pub args: Vec<(Kind, R)>,
-    /// Arguments contain spread markers: (Val, reg) entries flagged here are spread.
+    /// The receiver, for method calls.
+    pub this: Option<ValSlot>,
+    /// Each argument: its slot type and slot index.
+    pub args: Vec<(Kind, u16)>,
+    /// Which arguments are spread (`f(...xs)`).
     pub spread: Vec<bool>,
     pub has_spread: bool,
-    pub dst: Option<(Kind, R)>,
-    /// The caller already packed rest arguments into an array.
+    /// Where the result goes: its slot type and slot index (`None`: discarded).
+    pub output: Option<(Kind, u16)>,
+    /// The caller already packed the rest arguments into an array.
     pub packed_rest: bool,
 }
 
+/// A property accessed by name, with its lookup cache.
 #[derive(Debug)]
-pub struct PropSite {
+pub struct PropertySite {
     pub name: Rc<str>,
     pub key: Value,
     pub cache: PropCache,
@@ -172,30 +400,58 @@ pub struct PropSite {
     pub is_length: bool,
 }
 
+/// What a slot holds from one instruction on, for `--dump`.
+#[derive(Debug, Clone)]
+pub struct SlotName {
+    /// `Kind::Val` for a value slot; otherwise a scalar slot.
+    pub kind: Kind,
+    pub index: u16,
+    /// The variable's name, or `#2` for a slot preloaded with the constant 2;
+    /// `None` when the slot becomes a temporary.
+    pub name: Option<Rc<str>>,
+    /// The first instruction where the slot holds it.
+    pub from: u32,
+}
+
+/// A compiled function.
 #[derive(Debug, Default)]
-pub struct FuncCode {
+pub struct FunctionCode {
     pub name: Rc<str>,
-    pub code: Vec<I>,
-    pub ns: usize,
-    pub nv: usize,
-    /// Arrival kinds of parameters (after `this`, which is V0).
+    pub code: Vec<Instruction>,
+    /// How many number/boolean slots and value slots a frame needs.
+    pub scalar_slots: usize,
+    pub value_slots: usize,
+    /// Slot types of the parameters (after `this`, which is value slot 0).
     pub params: Vec<Kind>,
     pub rest: bool,
-    pub consts: Vec<Value>,
-    pub calls: Vec<CallInfo>,
-    pub props: Vec<PropSite>,
-    pub caps: Vec<Vec<CapSrc>>,
-    /// Source line per instruction (for error messages) — reserved.
-    pub lines: Vec<u32>,
+    pub constants: Vec<Value>,
+    pub call_sites: Vec<CallSite>,
+    pub property_sites: Vec<PropertySite>,
+    pub capture_lists: Vec<Vec<CaptureFrom>>,
+    /// Names of the cells this function captures (for `--dump`).
+    pub capture_names: Vec<Rc<str>>,
+    /// Which variable each slot holds, and from where (for `--dump`).
+    pub slot_names: Vec<SlotName>,
+    /// The field name of each field instruction, by instruction index (for `--dump`).
+    pub field_names: Vec<(u32, Rc<str>)>,
+    /// For `--dump`: the name to show (`Class.method` for methods), the
+    /// parameter names, and whether it belongs to the built-in prelude.
+    pub dump_name: Rc<str>,
+    pub param_names: Vec<Rc<str>>,
+    pub prelude: bool,
 }
 
 #[derive(Debug)]
 pub struct Program {
-    pub funcs: Vec<Rc<FuncCode>>,
+    pub funcs: Vec<Rc<FunctionCode>>,
     pub classes: Vec<Rc<ClassRt>>,
     pub shapes: Vec<Rc<Shape>>,
-    pub n_gs: usize,
-    pub n_gv: usize,
+    /// How many global number/boolean variables and global value variables there are.
+    pub global_scalars: usize,
+    pub global_values: usize,
+    /// Their names (for `--dump`).
+    pub global_scalar_names: Vec<Rc<str>>,
+    pub global_value_names: Vec<Rc<str>>,
     pub main: u32,
     pub error_class: Option<u32>,
     pub type_error_class: Option<u32>,

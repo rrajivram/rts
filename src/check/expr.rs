@@ -24,6 +24,7 @@ impl Checker {
         let span = e.span;
         Ok(match &e.kind {
             ExprKind::Num(v) => HExpr::num(*v),
+            ExprKind::BigInt(v) => HExpr::new(HK::BigInt(*v), Type::BigInt),
             ExprKind::Str(s) => HExpr::new(HK::Str(s.clone()), Type::StrLit(s.clone())),
             ExprKind::Bool(b) => HExpr::new(HK::Bool(*b), Type::BoolLit(*b)),
             ExprKind::Null => HExpr::new(HK::Null, Type::Null),
@@ -40,6 +41,17 @@ impl Checker {
             ExprKind::Update { inc, prefix, target } => {
                 let place = self.check_place(target)?;
                 let t = self.place_type(&place);
+                if t.is_bigint() {
+                    self.invalidate(target);
+                    return Ok(HExpr::new(
+                        HK::Update {
+                            place: Box::new(place),
+                            inc: *inc,
+                            prefix: *prefix,
+                        },
+                        Type::BigInt,
+                    ));
+                }
                 if !t.is_numeric() && !t.is_dynamic() {
                     return err(
                         format!("an arithmetic operand must be of type 'number', not '{}'", self.show(&t)),
@@ -428,6 +440,22 @@ impl Checker {
         }
         let h = self.check_expr(x, None)?;
         let t = h.ty.clone();
+        if t.is_bigint() && matches!(op, UnaryOp::Neg | UnaryOp::BitNot) {
+            if let (UnaryOp::Neg, HK::BigInt(v)) = (op, &h.kind)
+                && let Some(n) = v.checked_neg()
+            {
+                return Ok(HExpr::new(HK::BigInt(n), Type::BigInt));
+            }
+            let u = if op == UnaryOp::Neg { HUnary::NegBig } else { HUnary::BitNotBig };
+            return Ok(HExpr::new(HK::Unary(u, Box::new(h)), Type::BigInt));
+        }
+        if t.is_dynamic() && matches!(op, UnaryOp::Neg | UnaryOp::BitNot) {
+            let u = if op == UnaryOp::Neg { HUnary::NegDyn } else { HUnary::BitNotDyn };
+            return Ok(HExpr::new(HK::Unary(u, Box::new(h)), Type::Any));
+        }
+        if t.is_bigint() && op == UnaryOp::Plus {
+            return err("operator '+' cannot be applied to type 'bigint' (use Number(x))", span);
+        }
         Ok(match op {
             UnaryOp::Neg | UnaryOp::Plus | UnaryOp::BitNot => {
                 let operand = if t.is_numeric() {
@@ -495,6 +523,30 @@ impl Checker {
             _ => CmpOp::Ge,
         };
         let mk = |op: HBin, a: HExpr, b: HExpr, ty: Type| HExpr::new(HK::Binary(op, Box::new(a), Box::new(b)), ty);
+        // BigInts: unboxed when both sides are `bigint`; mixing with numbers is
+        // a type error (as in TypeScript), except in comparisons.
+        let (big_a, big_b) = (ta.is_bigint(), tb.is_bigint());
+        if big_a || big_b {
+            let other = if big_a { &tb } else { &ta };
+            let arith = matches!(op, Add | Sub | Mul | Div | Mod | Exp | BitAnd | BitOr | BitXor | Shl | Shr | UShr);
+            if big_a && big_b {
+                match op {
+                    UShr => return err("operator '>>>' cannot be applied to bigints (use >>)", sa.to(sb)),
+                    _ if arith => return Ok(mk(HBin::Big(numop(op)), ha, hb, Type::BigInt)),
+                    Lt | Le | Gt | Ge => return Ok(mk(HBin::BigCmp(cmpop(op)), ha, hb, Type::Boolean)),
+                    StrictEq | Eq => return Ok(mk(HBin::BigCmp(CmpOp::Eq), ha, hb, Type::Boolean)),
+                    StrictNe | Ne => return Ok(mk(HBin::BigCmp(CmpOp::Ne), ha, hb, Type::Boolean)),
+                    _ => {}
+                }
+            } else if arith && !other.is_dynamic() && !(op == Add && other.is_stringy()) {
+                return err(
+                    format!("operator cannot be applied to types '{}' and '{}' (convert with BigInt(x) or Number(x))", self.show(&ta), self.show(&tb)),
+                    sa.to(sb),
+                );
+            } else if matches!(op, Lt | Le | Gt | Ge) {
+                return Ok(mk(HBin::DynCmp(cmpop(op)), ha, hb, Type::Boolean));
+            }
+        }
         Ok(match op {
             Add => {
                 if ta.is_numeric() && tb.is_numeric() {
@@ -519,6 +571,9 @@ impl Checker {
             }
             Sub | Mul | Div | Mod | Exp | BitAnd | BitOr | BitXor | Shl | Shr | UShr => {
                 if ta.is_dynamic() || tb.is_dynamic() {
+                    if !ta.is_numeric() && !tb.is_numeric() {
+                        return Ok(mk(HBin::DynNumeric(numop(op)), ha, hb, Type::Any));
+                    }
                     return Ok(mk(HBin::DynNum(numop(op)), ha, hb, Type::Number));
                 }
                 let a = self.arith_operand(ha, sa)?;
@@ -1721,6 +1776,7 @@ pub fn falsy_part(t: &Type) -> Type {
         Type::Null | Type::Undefined | Type::Void | Type::BoolLit(false) => Some(m),
         Type::Boolean => Some(Type::BoolLit(false)),
         Type::Number | Type::NumLit(_) | Type::Enum(_) => Some(Type::Number),
+        Type::BigInt => Some(Type::BigInt),
         Type::String | Type::StrLit(_) => Some(Type::String),
         Type::Any | Type::Unknown | Type::Param(_) => Some(m),
         _ => None,

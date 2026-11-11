@@ -138,6 +138,8 @@ pub enum ObjProp {
 #[derive(Debug, Clone)]
 pub enum ExprKind {
     Num(f64),
+    /// `123n`
+    BigInt(i128),
     Str(Name),
     Template {
         quasis: Vec<Name>,

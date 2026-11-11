@@ -28,6 +28,7 @@ pub fn install_globals(module: &Rc<Scope>) {
         ("parseFloat", Native::ParseFloat),
         ("isNaN", Native::IsNaN),
         ("isFinite", Native::IsFinite),
+        ("BigInt", Native::BigIntFn),
     ] {
         v.insert(n.into(), VB::NativeFn(f));
     }
@@ -98,6 +99,7 @@ pub fn global_fn_type(n: Native) -> Rc<FuncType> {
         Native::StringFn => ft(vec![opt("x", any())], string()),
         Native::NumberFn => ft(vec![opt("x", any())], num()),
         Native::BooleanFn => ft(vec![opt("x", any())], boolean()),
+        Native::BigIntFn => ft(vec![p("x", any())], Type::BigInt),
         _ => ft(vec![rest("args", any())], any()),
     }
 }
@@ -327,6 +329,10 @@ impl Checker {
                 "toFixed" => r(NumToFixed, ft(vec![opt("digits", num())], string())),
                 "toString" => r(NumToString, ft(vec![opt("radix", num())], string())),
                 "toPrecision" => r(NumToPrecision, ft(vec![opt("p", num())], string())),
+                _ => None,
+            },
+            Type::BigInt => match name {
+                "toString" => r(NumToString, ft(vec![opt("radix", num())], string())),
                 _ => None,
             },
             Type::Boolean | Type::BoolLit(_) => match name {

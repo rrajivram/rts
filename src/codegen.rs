@@ -1,5 +1,6 @@
-//! HIR → bytecode. Allocates typed registers (S for numbers/booleans, V for
-//! values) and inserts box/unbox at every point where kinds differ.
+//! HIR → instructions. Gives every variable and temporary a typed slot
+//! (number/boolean slots or value slots, see `bytecode.rs`) and inserts
+//! box/unbox instructions wherever a value moves between slot types.
 
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -12,33 +13,42 @@ use crate::hir::*;
 use crate::runtime::{ClassRt, Native, PropCache, Shape, Value};
 use crate::types::{Kind, Type};
 
+/// An evaluated operand: the type of slot it is in (`k`) and the slot's index
+/// (`r`) in that slot array (scalar slots for `Num`/`Bool`, value slots for `Val`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Op {
     k: Kind,
-    r: R,
+    r: u16,
 }
 
+/// Where a variable lives.
 #[derive(Debug, Clone, Copy)]
 enum Home {
-    S(R),
-    V(R),
-    /// V register holding the variable's cell.
-    Cell(R),
-    Up(u16),
-    GS(u32),
-    GV(u32),
+    /// A number/boolean slot of the frame.
+    Scalar(u16),
+    /// A value slot of the frame.
+    Value(u16),
+    /// A value slot holding the variable's cell (the variable is captured by a closure).
+    Cell(u16),
+    /// A cell the running closure captured.
+    Capture(u16),
+    /// A global number/boolean variable.
+    GlobalScalar(u32),
+    /// A global value variable.
+    GlobalValue(u32),
 }
 
 /// An evaluated assignment target.
 enum PlaceRef {
     Var(VarId),
-    Field { o: R, slot: u16 },
-    Prop { o: R, p: u32 },
-    Index { a: R, i: R, k: Kind },
-    Dyn { o: R, k: R },
-    ArrLen { a: R },
-    StrLen { s: R },
-    Accessor { o: R, get: Option<u32>, set: Option<u32> },
+    /// `name` is the field's name, for `--dump`.
+    Field { o: u16, slot: u16, name: Option<Rc<str>> },
+    Prop { o: u16, p: u32 },
+    Index { a: u16, i: u16, k: Kind },
+    Dyn { o: u16, k: u16 },
+    ArrLen { a: u16 },
+    StrLen { s: u16 },
+    Accessor { o: u16, class: u32, get: Option<u32>, set: Option<u32> },
 }
 
 struct LoopCtx {
@@ -67,16 +77,16 @@ pub fn compile(hir: &HProgram) -> Program {
     for (i, v) in hir.vars.iter().enumerate() {
         if v.owner.is_none() {
             let h = if v.kind().is_scalar() {
-                cg.n_gs += 1;
-                Home::GS(cg.n_gs as u32 - 1)
+                cg.n_gs += v.kind().width() as usize;
+                Home::GlobalScalar((cg.n_gs - v.kind().width() as usize) as u32)
             } else {
                 cg.n_gv += 1;
-                Home::GV(cg.n_gv as u32 - 1)
+                Home::GlobalValue(cg.n_gv as u32 - 1)
             };
             cg.globals.insert(i as VarId, h);
         }
     }
-    let funcs: Vec<Rc<FuncCode>> = (0..hir.funcs.len()).map(|f| Rc::new(cg.func(f as FuncId))).collect();
+    let funcs: Vec<Rc<FunctionCode>> = (0..hir.funcs.len()).map(|f| Rc::new(cg.func(f as FuncId))).collect();
     let mut classes: Vec<Option<Rc<ClassRt>>> = vec![None; hir.classes.len()];
     fn build(i: usize, hir: &HProgram, out: &mut Vec<Option<Rc<ClassRt>>>) -> Rc<ClassRt> {
         if let Some(c) = &out[i] {
@@ -103,12 +113,16 @@ pub fn compile(hir: &HProgram) -> Program {
     for i in 0..hir.classes.len() {
         build(i, hir, &mut classes);
     }
+    let global_scalar_names = cg.global_names(false);
+    let global_value_names = cg.global_names(true);
     Program {
         funcs,
         classes: classes.into_iter().map(|c| c.unwrap()).collect(),
         shapes: cg.shapes,
-        n_gs: cg.n_gs,
-        n_gv: cg.n_gv,
+        global_scalars: cg.n_gs,
+        global_values: cg.n_gv,
+        global_scalar_names,
+        global_value_names,
         main: hir.main,
         error_class: hir.error_class,
         type_error_class: hir.type_error_class,
@@ -127,6 +141,19 @@ struct Codegen<'a> {
 }
 
 impl<'a> Codegen<'a> {
+    /// Names of the global value variables (`values`) or scalar variables, by
+    /// index (a bigint's second slot has no name of its own).
+    fn global_names(&self, values: bool) -> Vec<Rc<str>> {
+        let mut out: Vec<Rc<str>> = vec![Rc::from(""); if values { self.n_gv } else { self.n_gs }];
+        for (v, h) in &self.globals {
+            match (h, values) {
+                (Home::GlobalValue(g), true) | (Home::GlobalScalar(g), false) => out[*g as usize] = self.hir.vars[*v as usize].name.clone(),
+                _ => {}
+            }
+        }
+        out
+    }
+
     fn shape(&mut self, keys: Vec<Rc<str>>) -> u32 {
         if let Some(i) = self.shape_ids.get(&keys) {
             return *i;
@@ -137,7 +164,7 @@ impl<'a> Codegen<'a> {
         i
     }
 
-    fn func(&mut self, fid: FuncId) -> FuncCode {
+    fn func(&mut self, fid: FuncId) -> FunctionCode {
         let hir: &'a HProgram = self.hir;
         let hf = &hir.funcs[fid as usize];
         let mut g = FnGen {
@@ -159,17 +186,17 @@ impl<'a> Codegen<'a> {
             opt_exits: Vec::new(),
             num_regs: HashMap::new(),
             inline: Vec::new(),
+            slot_names: vec![SlotName { kind: Kind::Val, index: 0, name: Some("this".into()), from: 0 }],
+            field_names: Vec::new(),
         };
-        // Arrival registers: V0 = this, then params in order per file.
+        // Arrival slots: value slot 0 = this, then each parameter in a slot of its type.
         let mut arrivals = Vec::new();
         for p in &hf.params {
-            let r = match p.arrival {
-                Kind::Val => g.alloc_v(),
-                _ => g.alloc_s(),
-            };
+            let r = g.alloc(p.arrival).r;
+            g.note_slot(p.arrival, r, Some(hir.vars[p.var as usize].name.clone()));
             arrivals.push(r);
         }
-        // Constant registers: every distinct numeric literal is loaded once.
+        // Constant slots: every distinct numeric literal used in a loop is loaded once.
         let mut nums = Vec::new();
         for p in &hf.params {
             if let Some(d) = &p.default {
@@ -185,11 +212,12 @@ impl<'a> Codegen<'a> {
                 continue;
             }
             let r = g.alloc_s();
-            g.emit(I::LoadN { d: r, v });
+            g.note_slot(Kind::Num, r, Some(format!("#{}", crate::runtime::num_to_string(v)).into()));
+            g.emit(Instruction::LoadNumber { output: NumSlot(r), value: v });
             g.num_regs.insert(bits, r);
         }
         for (i, v) in hf.free.iter().enumerate() {
-            g.homes.insert(*v, Home::Up(i as u16));
+            g.homes.insert(*v, Home::Capture(i as u16));
         }
         if let Some(tv) = hf.this_var {
             g.bind_arrival(tv, Kind::Val, 0);
@@ -197,11 +225,11 @@ impl<'a> Codegen<'a> {
         for (p, r) in hf.params.iter().zip(arrivals) {
             if let Some(d) = &p.default {
                 let skip = g.jump_placeholder();
-                g.code[skip] = I::JmpNotNullish { s: r, t: 0 };
+                g.code[skip] = Instruction::JumpIfNullish { when: false, value: ValSlot(r), to: 0 };
                 let m = g.mark();
                 let dv = g.expr(d);
                 let dv = g.coerce(dv, Kind::Val);
-                g.emit(I::MovV { d: r, s: dv.r });
+                g.emit(Instruction::CopyValue { to: ValSlot(r), from: ValSlot(dv.r) });
                 g.reset(m);
                 g.patch_here(skip);
             }
@@ -210,21 +238,38 @@ impl<'a> Codegen<'a> {
         for st in &hf.body {
             g.stmt(st);
         }
-        g.emit(I::RetUndef);
-        peephole(&mut g.code);
+        g.emit(Instruction::ReturnUndefined);
+        if let Some(new_index) = peephole(&mut g.code) {
+            for n in &mut g.slot_names {
+                n.from = new_index[n.from as usize];
+            }
+            for (pc, _) in &mut g.field_names {
+                *pc = new_index[*pc as usize];
+            }
+        }
         let name = hf.name.clone();
-        FuncCode {
+        FunctionCode {
             name,
             code: g.code,
-            ns: g.max_s as usize,
-            nv: g.max_v as usize,
+            scalar_slots: g.max_s as usize,
+            value_slots: g.max_v as usize,
             params: hf.params.iter().map(|p| p.arrival).collect(),
             rest: hf.params.last().is_some_and(|p| p.rest),
-            consts: g.consts,
-            calls: g.calls,
-            props: g.props,
-            caps: g.caps,
-            lines: Vec::new(),
+            constants: g.consts,
+            call_sites: g.calls,
+            property_sites: g.props,
+            capture_lists: g.caps,
+            capture_names: hf.free.iter().map(|v| hir.vars[*v as usize].name.clone()).collect(),
+            slot_names: g.slot_names,
+            field_names: g.field_names,
+            dump_name: match hf.class {
+                Some(c) if hf.is_ctor => format!("{} constructor", hir.classes[c as usize].name).into(),
+                Some(c) => format!("{}.{}", hir.classes[c as usize].name, hf.name).into(),
+                None if hf.name.is_empty() => format!("<anonymous #{fid}>").into(),
+                None => hf.name.clone(),
+            },
+            param_names: hf.params.iter().map(|p| hir.vars[p.var as usize].name.clone()).collect(),
+            prelude: hf.class.is_some_and(|c| hir.classes[c as usize].prelude),
         }
     }
 }
@@ -232,24 +277,28 @@ impl<'a> Codegen<'a> {
 struct FnGen<'c, 'a> {
     cg: &'c mut Codegen<'a>,
     fid: FuncId,
-    code: Vec<I>,
+    code: Vec<Instruction>,
     s_top: u16,
     v_top: u16,
     max_s: u16,
     max_v: u16,
     consts: Vec<Value>,
     str_consts: HashMap<Rc<str>, u32>,
-    calls: Vec<CallInfo>,
-    props: Vec<PropSite>,
-    caps: Vec<Vec<CapSrc>>,
+    calls: Vec<CallSite>,
+    props: Vec<PropertySite>,
+    caps: Vec<Vec<CaptureFrom>>,
     homes: HashMap<VarId, Home>,
     loops: Vec<LoopCtx>,
     tries: Vec<TryCtx>,
     opt_exits: Vec<Vec<usize>>,
-    /// Numeric literals preloaded into dedicated registers (f64 bits → register).
-    num_regs: HashMap<u64, R>,
+    /// Numeric literals preloaded into dedicated slots (f64 bits → slot).
+    num_regs: HashMap<u64, u16>,
     /// Functions currently being inlined (innermost last).
     inline: Vec<InlineCtx>,
+    /// What each slot holds over time (for `--dump`).
+    slot_names: Vec<SlotName>,
+    /// Field names of field instructions, by instruction index (for `--dump`).
+    field_names: Vec<(u32, Rc<str>)>,
 }
 
 struct InlineCtx {
@@ -261,25 +310,76 @@ struct InlineCtx {
 }
 
 impl FnGen<'_, '_> {
-    // ───────────── registers & emission ─────────────
+    // ───────────── slots & emission ─────────────
 
-    fn alloc_s(&mut self) -> R {
+    fn alloc_s(&mut self) -> u16 {
         let r = self.s_top;
         self.s_top += 1;
         self.max_s = self.max_s.max(self.s_top);
+        self.note_slot(Kind::Num, r, None);
         r
     }
-    fn alloc_v(&mut self) -> R {
+    fn alloc_v(&mut self) -> u16 {
         let r = self.v_top;
         self.v_top += 1;
         self.max_v = self.max_v.max(self.v_top);
+        self.note_slot(Kind::Val, r, None);
         r
     }
-    fn alloc(&mut self, k: Kind) -> Op {
-        Op {
-            k,
-            r: if k == Kind::Val { self.alloc_v() } else { self.alloc_s() },
+    /// Record that from the next instruction on, a slot holds `name` (`None`: a temporary).
+    fn note_slot(&mut self, kind: Kind, index: u16, name: Option<Rc<str>>) {
+        let kind = if kind == Kind::Val { Kind::Val } else { Kind::Num };
+        let from = self.code.len() as u32;
+        if let Some(last) = self.slot_names.iter_mut().rev().find(|n| n.kind == kind && n.index == index)
+            && last.from == from
+        {
+            last.name = name;
+            return;
         }
+        self.slot_names.push(SlotName { kind, index, name, from });
+    }
+    /// The next instruction accesses the field `name` (for `--dump`).
+    fn note_field(&mut self, name: &Option<Rc<str>>) {
+        if let Some(n) = name {
+            let pc = self.code.len() as u32;
+            self.field_names.push((pc, n.clone()));
+        }
+    }
+    fn with_field_name(&mut self, name: &Option<Rc<str>>, i: Instruction) -> Instruction {
+        self.note_field(name);
+        i
+    }
+    fn set_home(&mut self, var: VarId, h: Home) {
+        self.homes.insert(var, h);
+        self.name_var_slot(var, h);
+    }
+    fn name_var_slot(&mut self, var: VarId, h: Home) {
+        let name = self.var_info(var).name.clone();
+        match h {
+            Home::Scalar(r) => self.note_slot(Kind::Num, r, Some(name)),
+            Home::Value(r) | Home::Cell(r) => self.note_slot(Kind::Val, r, Some(name)),
+            _ => {}
+        }
+    }
+    fn alloc(&mut self, k: Kind) -> Op {
+        let r = match k {
+            Kind::Val => self.alloc_v(),
+            Kind::Big => {
+                let r = self.alloc_s();
+                self.alloc_s();
+                r
+            }
+            _ => self.alloc_s(),
+        };
+        Op { k, r }
+    }
+    /// A BigInt constant (for `LoadBigInt`).
+    fn big_const(&mut self, n: i128) -> u32 {
+        self.konst(Value::bigint(n))
+    }
+    fn load_big(&mut self, n: i128, output: u16) {
+        let constant = self.big_const(n);
+        self.emit(Instruction::LoadBigInt { constant, output: BigSlot(output) });
     }
     fn mark(&self) -> (u16, u16) {
         (self.s_top, self.v_top)
@@ -288,7 +388,7 @@ impl FnGen<'_, '_> {
         self.s_top = m.0;
         self.v_top = m.1;
     }
-    fn emit(&mut self, i: I) -> usize {
+    fn emit(&mut self, i: Instruction) -> usize {
         self.code.push(i);
         self.code.len() - 1
     }
@@ -296,19 +396,16 @@ impl FnGen<'_, '_> {
         self.code.len() as u32
     }
     fn jump_placeholder(&mut self) -> usize {
-        self.emit(I::Jmp { t: u32::MAX })
+        self.emit(Instruction::Jump { to: u32::MAX })
     }
     fn patch(&mut self, at: usize, target: u32) {
         match &mut self.code[at] {
-            I::Jmp { t }
-            | I::JmpT { t, .. }
-            | I::JmpF { t, .. }
-            | I::JCmpN { t, .. }
-            | I::JmpTV { t, .. }
-            | I::JmpFV { t, .. }
-            | I::JmpNullish { t, .. }
-            | I::JmpNotNullish { t, .. } => *t = target,
-            I::TryBegin { catch, .. } => *catch = target,
+            Instruction::Jump { to: t }
+            | Instruction::JumpIf { to: t, .. }
+            | Instruction::JumpIfCompare { to: t, .. }
+            | Instruction::JumpIfTruthy { to: t, .. }
+            | Instruction::JumpIfNullish { to: t, .. } => *t = target,
+            Instruction::TryBegin { catch, .. } => *catch = target,
             other => panic!("patching non-jump {other:?}"),
         }
     }
@@ -329,7 +426,7 @@ impl FnGen<'_, '_> {
         k
     }
     fn prop_site(&mut self, name: &Rc<str>) -> u32 {
-        self.props.push(PropSite {
+        self.props.push(PropertySite {
             name: name.clone(),
             key: Value::str(&**name),
             cache: PropCache::default(),
@@ -357,25 +454,25 @@ impl FnGen<'_, '_> {
         )
     }
 
-    /// Give a parameter/this variable its home given its arrival register.
-    fn bind_arrival(&mut self, var: VarId, arrival: Kind, r: R) {
+    /// Give a parameter/this variable its home given its arrival slot.
+    fn bind_arrival(&mut self, var: VarId, arrival: Kind, r: u16) {
         let info = self.var_info(var).clone();
         if info.captured {
             let c = self.alloc_v();
-            self.emit(I::NewCell { d: c });
+            self.emit(Instruction::NewCell { output: ValSlot(c) });
             let val = self.coerce(Op { k: arrival, r }, Kind::Val);
-            self.emit(I::CellSet { c, s: val.r });
-            self.homes.insert(var, Home::Cell(c));
+            self.emit(Instruction::WriteCell { cell: ValSlot(c), value: ValSlot(val.r) });
+            self.set_home(var, Home::Cell(c));
             return;
         }
         let k = info.kind();
         if k == arrival {
-            self.homes.insert(var, if k == Kind::Val { Home::V(r) } else { Home::S(r) });
+            self.set_home(var, if k == Kind::Val { Home::Value(r) } else { Home::Scalar(r) });
         } else {
             let h = self.alloc(k);
             let src = self.coerce(Op { k: arrival, r }, k);
             self.mov(h, src);
-            self.homes.insert(var, if k == Kind::Val { Home::V(h.r) } else { Home::S(h.r) });
+            self.set_home(var, if k == Kind::Val { Home::Value(h.r) } else { Home::Scalar(h.r) });
         }
     }
 
@@ -388,11 +485,12 @@ impl FnGen<'_, '_> {
         let h = if info.captured {
             Home::Cell(self.alloc_v())
         } else if info.kind() == Kind::Val {
-            Home::V(self.alloc_v())
+            Home::Value(self.alloc_v())
         } else {
-            Home::S(self.alloc_s())
+            let k = info.kind();
+            Home::Scalar(self.alloc(k).r)
         };
-        self.homes.insert(var, h);
+        self.set_home(var, h);
         h
     }
 
@@ -401,11 +499,12 @@ impl FnGen<'_, '_> {
         if d.r == s.r && d.k == s.k {
             return;
         }
-        if d.k == Kind::Val {
-            self.emit(I::MovV { d: d.r, s: s.r });
-        } else {
-            self.emit(I::MovS { d: d.r, s: s.r });
-        }
+        match d.k {
+            Kind::Val => self.emit(Instruction::CopyValue { to: ValSlot(d.r), from: ValSlot(s.r) }),
+            Kind::Num => self.emit(Instruction::CopyNumber { to: NumSlot(d.r), from: NumSlot(s.r) }),
+            Kind::Bool => self.emit(Instruction::CopyBool { to: BoolSlot(d.r), from: BoolSlot(s.r) }),
+            Kind::Big => self.emit(Instruction::CopyBigInt { to: BigSlot(d.r), from: BigSlot(s.r) }),
+        };
     }
 
     /// Convert an operand to another kind (boxing / checked unboxing).
@@ -416,23 +515,33 @@ impl FnGen<'_, '_> {
         match (o.k, k) {
             (Kind::Num, Kind::Val) => {
                 let d = self.alloc_v();
-                self.emit(I::BoxN { d, s: o.r });
+                self.emit(Instruction::BoxNumber { output: ValSlot(d), value: NumSlot(o.r) });
                 Op { k, r: d }
             }
             (Kind::Bool, Kind::Val) => {
                 let d = self.alloc_v();
-                self.emit(I::BoxB { d, s: o.r });
+                self.emit(Instruction::BoxBool { output: ValSlot(d), value: BoolSlot(o.r) });
                 Op { k, r: d }
             }
             (Kind::Val, Kind::Num) => {
                 let d = self.alloc_s();
-                self.emit(I::UnboxN { d, s: o.r });
+                self.emit(Instruction::UnboxNumber { output: NumSlot(d), value: ValSlot(o.r) });
                 Op { k, r: d }
             }
             (Kind::Val, Kind::Bool) => {
                 let d = self.alloc_s();
-                self.emit(I::UnboxB { d, s: o.r });
+                self.emit(Instruction::UnboxBool { output: BoolSlot(d), value: ValSlot(o.r) });
                 Op { k, r: d }
+            }
+            (Kind::Big, Kind::Val) => {
+                let d = self.alloc_v();
+                self.emit(Instruction::BoxBigInt { output: ValSlot(d), value: BigSlot(o.r) });
+                Op { k, r: d }
+            }
+            (Kind::Val, Kind::Big) => {
+                let d = self.alloc(Kind::Big);
+                self.emit(Instruction::UnboxBigInt { output: BigSlot(d.r), value: ValSlot(o.r) });
+                d
             }
             // number <-> boolean only through casts; go via a value (checked).
             (a, b) => {
@@ -464,12 +573,12 @@ impl FnGen<'_, '_> {
             }
             self.homes.remove(v);
             if let Home::Cell(c) = self.declare(*v) {
-                self.emit(I::NewCell { d: c });
+                self.emit(Instruction::NewCell { output: ValSlot(c) });
             }
         }
         self.stmts(ss);
         if self.v_top > m.1 {
-            self.emit(I::ClearV { d: m.1, n: self.v_top - m.1 });
+            self.emit(Instruction::Release { first: ValSlot(m.1), count: self.v_top - m.1 });
         }
         self.reset(m);
     }
@@ -479,9 +588,13 @@ impl FnGen<'_, '_> {
         let k = self.var_info(var).kind();
         let t = self.alloc(k);
         match k {
-            Kind::Num => self.emit(I::LoadN { d: t.r, v: f64::NAN }),
-            Kind::Bool => self.emit(I::LoadB { d: t.r, v: false }),
-            Kind::Val => self.emit(I::LoadUndef { d: t.r }),
+            Kind::Num => self.emit(Instruction::LoadNumber { output: NumSlot(t.r), value: f64::NAN }),
+            Kind::Bool => self.emit(Instruction::LoadBool { output: BoolSlot(t.r), value: false }),
+            Kind::Big => {
+                self.load_big(0, t.r);
+                0
+            }
+            Kind::Val => self.emit(Instruction::LoadUndefined { output: ValSlot(t.r) }),
         };
         self.store_var(var, t);
     }
@@ -496,40 +609,45 @@ impl FnGen<'_, '_> {
         let k = self.var_info(var).kind();
         match h {
             Home::Cell(c) => {
-                self.emit(I::NewCell { d: c });
+                self.emit(Instruction::NewCell { output: ValSlot(c) });
                 if let Some(v) = val {
                     let v = self.coerce(v, Kind::Val);
-                    self.emit(I::CellSet { c, s: v.r });
+                    self.emit(Instruction::WriteCell { cell: ValSlot(c), value: ValSlot(v.r) });
                 } else if k == Kind::Num {
                     let t = self.alloc_v();
                     let kk = self.konst(Value::Num(f64::NAN));
-                    self.emit(I::LoadK { d: t, k: kk });
-                    self.emit(I::CellSet { c, s: t });
-                } else if k == Kind::Bool {
+                    self.emit(Instruction::LoadConstant { output: ValSlot(t), constant: kk });
+                    self.emit(Instruction::WriteCell { cell: ValSlot(c), value: ValSlot(t) });
+                } else if k.is_scalar() {
                     let t = self.alloc_v();
-                    let kk = self.konst(Value::Bool(false));
-                    self.emit(I::LoadK { d: t, k: kk });
-                    self.emit(I::CellSet { c, s: t });
+                    let kk = self.konst(if k == Kind::Big { Value::bigint(0) } else { Value::Bool(false) });
+                    self.emit(Instruction::LoadConstant { output: ValSlot(t), constant: kk });
+                    self.emit(Instruction::WriteCell { cell: ValSlot(c), value: ValSlot(t) });
                 }
             }
             _ => match val {
                 Some(v) => self.store_var(var, v),
                 None => match (h, k) {
-                    (Home::S(r), Kind::Num) => {
-                        self.emit(I::LoadN { d: r, v: f64::NAN });
+                    (Home::Scalar(r), Kind::Num) => {
+                        self.emit(Instruction::LoadNumber { output: NumSlot(r), value: f64::NAN });
                     }
-                    (Home::S(r), _) => {
-                        self.emit(I::LoadB { d: r, v: false });
+                    (Home::Scalar(r), Kind::Big) => self.load_big(0, r),
+                    (Home::Scalar(r), _) => {
+                        self.emit(Instruction::LoadBool { output: BoolSlot(r), value: false });
                     }
-                    (Home::V(r), _) => {
-                        self.emit(I::LoadUndef { d: r });
+                    (Home::Value(r), _) => {
+                        self.emit(Instruction::LoadUndefined { output: ValSlot(r) });
                     }
-                    (Home::GS(_), _) | (Home::GV(_), _) => {
+                    (Home::GlobalScalar(_), _) | (Home::GlobalValue(_), _) => {
                         let t = self.alloc(k);
                         match k {
-                            Kind::Num => self.emit(I::LoadN { d: t.r, v: f64::NAN }),
-                            Kind::Bool => self.emit(I::LoadB { d: t.r, v: false }),
-                            Kind::Val => self.emit(I::LoadUndef { d: t.r }),
+                            Kind::Num => self.emit(Instruction::LoadNumber { output: NumSlot(t.r), value: f64::NAN }),
+                            Kind::Bool => self.emit(Instruction::LoadBool { output: BoolSlot(t.r), value: false }),
+                            Kind::Big => {
+                                self.load_big(0, t.r);
+                                0
+                            }
+                            Kind::Val => self.emit(Instruction::LoadUndefined { output: ValSlot(t.r) }),
                         };
                         self.store_var(var, t);
                     }
@@ -550,13 +668,13 @@ impl FnGen<'_, '_> {
                 // Homes are normally created by the enclosing block's prologue.
                 if !self.homes.contains_key(var) {
                     if let Home::Cell(c) = self.declare(*var) {
-                        self.emit(I::NewCell { d: c });
+                        self.emit(Instruction::NewCell { output: ValSlot(c) });
                     }
                 }
                 let m2 = self.mark();
                 let k = self.var_info(*var).kind();
                 match (init, self.home(*var)) {
-                    (Some(e), Home::S(r) | Home::V(r)) => self.expr_into(e, Op { k, r }),
+                    (Some(e), Home::Scalar(r) | Home::Value(r)) => self.expr_into(e, Op { k, r }),
                     (Some(e), _) => {
                         let v = self.expr(e);
                         self.store_var(*var, v);
@@ -568,7 +686,7 @@ impl FnGen<'_, '_> {
             HStmt::MakeClosure(var, f) => {
                 if !self.homes.contains_key(var) {
                     if let Home::Cell(c) = self.declare(*var) {
-                        self.emit(I::NewCell { d: c });
+                        self.emit(Instruction::NewCell { output: ValSlot(c) });
                     }
                 }
                 let m2 = self.mark();
@@ -614,9 +732,9 @@ impl FnGen<'_, '_> {
                 for v in fresh {
                     if let Some(Home::Cell(c)) = self.homes.get(v).copied() {
                         let t = self.alloc_v();
-                        self.emit(I::CellGet { d: t, c });
-                        self.emit(I::NewCell { d: c });
-                        self.emit(I::CellSet { c, s: t });
+                        self.emit(Instruction::ReadCell { output: ValSlot(t), cell: ValSlot(c) });
+                        self.emit(Instruction::NewCell { output: ValSlot(c) });
+                        self.emit(Instruction::WriteCell { cell: ValSlot(c), value: ValSlot(t) });
                         self.v_top -= 1;
                     }
                 }
@@ -638,7 +756,7 @@ impl FnGen<'_, '_> {
                         }
                     }
                     None => {
-                        self.emit(I::Jmp { t: top });
+                        self.emit(Instruction::Jump { to: top });
                     }
                 }
                 let ctx = self.loops.pop().unwrap();
@@ -660,12 +778,12 @@ impl FnGen<'_, '_> {
                 let src = self.coerce(src, Kind::Val);
                 let arr = self.alloc_v();
                 if is_in {
-                    self.emit(I::KeysArr { d: arr, s: src.r });
+                    self.emit(Instruction::KeysArray { output: ValSlot(arr), object: ValSlot(src.r) });
                 } else {
-                    self.emit(I::IterArr { d: arr, s: src.r });
+                    self.emit(Instruction::ToIterationArray { output: ValSlot(arr), value: ValSlot(src.r) });
                 }
                 let idx = self.alloc_s();
-                self.emit(I::LoadN { d: idx, v: 0.0 });
+                self.emit(Instruction::LoadNumber { output: NumSlot(idx), value: 0.0 });
                 let len = self.alloc_s();
                 self.loops.push(LoopCtx {
                     label: label.clone(),
@@ -675,21 +793,15 @@ impl FnGen<'_, '_> {
                     try_depth: self.tries.len(),
                 });
                 let top = self.here();
-                self.emit(I::ArrLen { d: len, a: arr });
-                let exit = self.emit(I::JCmpN {
-                    op: CmpOp::Lt,
-                    sense: false,
-                    a: idx,
-                    b: len,
-                    t: 0,
-                });
+                self.emit(Instruction::ArrayLength { output: NumSlot(len), array: ValSlot(arr) });
+                let exit = self.emit(Instruction::JumpIfCompare { op: CmpOp::Lt, when: false, left: NumSlot(idx), right: NumSlot(len), to: 0 });
                 let bm = self.mark();
                 let ek = self.var_info(*elem).kind();
                 let el = self.alloc(if ek == Kind::Num { Kind::Num } else { Kind::Val });
                 if el.k == Kind::Num {
-                    self.emit(I::GetIdxN { d: el.r, a: arr, i: idx });
+                    self.emit(Instruction::ReadElementNumber { output: NumSlot(el.r), array: ValSlot(arr), index: NumSlot(idx) });
                 } else {
-                    self.emit(I::GetIdxV { d: el.r, a: arr, i: idx });
+                    self.emit(Instruction::ReadElement { output: ValSlot(el.r), array: ValSlot(arr), index: NumSlot(idx) });
                 }
                 let el = self.coerce(el, ek);
                 self.homes.remove(elem);
@@ -697,8 +809,8 @@ impl FnGen<'_, '_> {
                 self.block(body);
                 self.reset(bm);
                 let cont = self.here();
-                self.emit(I::AddNK { d: idx, a: idx, k: 1.0 });
-                self.emit(I::Jmp { t: top });
+                self.emit(Instruction::AddConstant { output: NumSlot(idx), left: NumSlot(idx), constant: 1.0 });
+                self.emit(Instruction::Jump { to: top });
                 let ctx = self.loops.pop().unwrap();
                 for c in ctx.continues {
                     self.patch(c, cont);
@@ -707,7 +819,7 @@ impl FnGen<'_, '_> {
                 for b in ctx.breaks {
                     self.patch_here(b);
                 }
-                self.emit(I::LoadUndef { d: arr });
+                self.emit(Instruction::LoadUndefined { output: ValSlot(arr) });
                 self.reset(m);
             }
             HStmt::Break(label) => {
@@ -774,11 +886,12 @@ impl FnGen<'_, '_> {
                 });
                 self.exit_tries(0);
                 match val {
-                    None => self.emit(I::RetUndef),
+                    None => self.emit(Instruction::ReturnUndefined),
                     Some(o) => match o.k {
-                        Kind::Num => self.emit(I::RetN { s: o.r }),
-                        Kind::Bool => self.emit(I::RetB { s: o.r }),
-                        Kind::Val => self.emit(I::RetV { s: o.r }),
+                        Kind::Num => self.emit(Instruction::ReturnNumber { value: NumSlot(o.r) }),
+                        Kind::Bool => self.emit(Instruction::ReturnBool { value: BoolSlot(o.r) }),
+                        Kind::Big => self.emit(Instruction::ReturnBigInt { value: BigSlot(o.r) }),
+                        Kind::Val => self.emit(Instruction::ReturnValue { value: ValSlot(o.r) }),
                     },
                 };
                 self.reset(m);
@@ -786,7 +899,7 @@ impl FnGen<'_, '_> {
             HStmt::Throw(e) => {
                 let o = self.expr(e);
                 let o = self.coerce(o, Kind::Val);
-                self.emit(I::Throw { s: o.r });
+                self.emit(Instruction::Throw { value: ValSlot(o.r) });
                 self.reset(m);
             }
             HStmt::Try {
@@ -825,7 +938,7 @@ impl FnGen<'_, '_> {
         while i > depth {
             i -= 1;
             if self.tries[i].has_handler {
-                self.emit(I::TryEnd);
+                self.emit(Instruction::TryEnd);
             }
             if let Some(f) = self.tries[i].finalizer.clone() {
                 // Run the finalizer outside its own region.
@@ -838,14 +951,14 @@ impl FnGen<'_, '_> {
 
     fn try_stmt(&mut self, block: &[HStmt], catch_var: Option<VarId>, handler: &[HStmt], finalizer: Option<&Vec<HStmt>>) {
         let exc = self.alloc_v();
-        let begin = self.emit(I::TryBegin { catch: 0, exc });
+        let begin = self.emit(Instruction::TryBegin { catch: 0, exception: ValSlot(exc) });
         self.tries.push(TryCtx {
             finalizer: finalizer.cloned(),
             has_handler: true,
         });
         self.block(block);
         self.tries.pop();
-        self.emit(I::TryEnd);
+        self.emit(Instruction::TryEnd);
         if let Some(f) = finalizer {
             self.block(f);
         }
@@ -857,7 +970,7 @@ impl FnGen<'_, '_> {
             // Protect the handler too when there is a finalizer.
             let (exc2, begin2) = if finalizer.is_some() {
                 let exc2 = self.alloc_v();
-                let b2 = self.emit(I::TryBegin { catch: 0, exc: exc2 });
+                let b2 = self.emit(Instruction::TryBegin { catch: 0, exception: ValSlot(exc2) });
                 self.tries.push(TryCtx {
                     finalizer: finalizer.cloned(),
                     has_handler: true,
@@ -875,16 +988,16 @@ impl FnGen<'_, '_> {
             self.reset(m);
             if let (Some(exc2), Some(b2)) = (exc2, begin2) {
                 self.tries.pop();
-                self.emit(I::TryEnd);
+                self.emit(Instruction::TryEnd);
                 self.block(finalizer.unwrap());
                 end2 = Some(self.jump_placeholder());
                 self.patch_here(b2);
                 self.block(finalizer.unwrap());
-                self.emit(I::Throw { s: exc2 });
+                self.emit(Instruction::Throw { value: ValSlot(exc2) });
             }
         } else if let Some(f) = finalizer {
             self.block(f);
-            self.emit(I::Throw { s: exc });
+            self.emit(Instruction::Throw { value: ValSlot(exc) });
         }
         self.patch_here(end);
         if let Some(e2) = end2 {
@@ -895,7 +1008,7 @@ impl FnGen<'_, '_> {
     fn switch(&mut self, label: &Option<Name>, disc: &HExpr, cases: &[(Option<HExpr>, Vec<HStmt>)]) {
         let m = self.mark();
         let d = self.expr(disc);
-        // Keep the discriminant in its own register.
+        // Keep the discriminant in its own slot.
         let dr = self.alloc(d.k);
         self.mov(dr, d);
         let mut case_jumps = Vec::new();
@@ -907,24 +1020,13 @@ impl FnGen<'_, '_> {
             let mm = self.mark();
             let tv = self.expr(t);
             let j = if dr.k == Kind::Num && tv.k == Kind::Num {
-                self.emit(I::JCmpN {
-                    op: CmpOp::Eq,
-                    sense: true,
-                    a: dr.r,
-                    b: tv.r,
-                    t: 0,
-                })
+                self.emit(Instruction::JumpIfCompare { op: CmpOp::Eq, when: true, left: NumSlot(dr.r), right: NumSlot(tv.r), to: 0 })
             } else {
                 let a = self.coerce(dr, Kind::Val);
                 let b = self.coerce(tv, Kind::Val);
                 let c = self.alloc_s();
-                self.emit(I::StrictEq {
-                    d: c,
-                    a: a.r,
-                    b: b.r,
-                    eq: true,
-                });
-                self.emit(I::JmpT { c, t: 0 })
+                self.emit(Instruction::StrictEquals { output: BoolSlot(c), left: ValSlot(a.r), right: ValSlot(b.r), equal: true });
+                self.emit(Instruction::JumpIf { when: true, condition: BoolSlot(c), to: 0 })
             };
             self.reset(mm);
             case_jumps.push(Some(j));
@@ -952,7 +1054,7 @@ impl FnGen<'_, '_> {
             self.stmts(body);
         }
         if self.v_top > bm.1 {
-            self.emit(I::ClearV { d: bm.1, n: self.v_top - bm.1 });
+            self.emit(Instruction::Release { first: ValSlot(bm.1), count: self.v_top - bm.1 });
         }
         self.reset(bm);
         if !has_default {
@@ -998,41 +1100,37 @@ impl FnGen<'_, '_> {
                 let m = self.mark();
                 let x = self.expr(a);
                 let y = self.expr(b);
-                let j = self.emit(I::JCmpN {
-                    op: *op,
-                    sense,
-                    a: x.r,
-                    b: y.r,
-                    t: 0,
-                });
+                let j = self.emit(Instruction::JumpIfCompare { op: *op, when: sense, left: NumSlot(x.r), right: NumSlot(y.r), to: 0 });
                 self.reset(m);
                 vec![j]
             }
             _ => {
                 let m = self.mark();
                 let o = self.expr(e);
+                let o = self.big_truthy(o);
                 let j = match o.k {
+                    Kind::Big => unreachable!(),
                     Kind::Bool => {
                         if sense {
-                            self.emit(I::JmpT { c: o.r, t: 0 })
+                            self.emit(Instruction::JumpIf { when: true, condition: BoolSlot(o.r), to: 0 })
                         } else {
-                            self.emit(I::JmpF { c: o.r, t: 0 })
+                            self.emit(Instruction::JumpIf { when: false, condition: BoolSlot(o.r), to: 0 })
                         }
                     }
                     Kind::Num => {
                         let t = self.alloc_s();
-                        self.emit(I::TruthyN { d: t, s: o.r });
+                        self.emit(Instruction::NumberIsTruthy { output: BoolSlot(t), value: NumSlot(o.r) });
                         if sense {
-                            self.emit(I::JmpT { c: t, t: 0 })
+                            self.emit(Instruction::JumpIf { when: true, condition: BoolSlot(t), to: 0 })
                         } else {
-                            self.emit(I::JmpF { c: t, t: 0 })
+                            self.emit(Instruction::JumpIf { when: false, condition: BoolSlot(t), to: 0 })
                         }
                     }
                     Kind::Val => {
                         if sense {
-                            self.emit(I::JmpTV { c: o.r, t: 0 })
+                            self.emit(Instruction::JumpIfTruthy { when: true, value: ValSlot(o.r), to: 0 })
                         } else {
-                            self.emit(I::JmpFV { c: o.r, t: 0 })
+                            self.emit(Instruction::JumpIfTruthy { when: false, value: ValSlot(o.r), to: 0 })
                         }
                     }
                 };
@@ -1050,33 +1148,25 @@ impl FnGen<'_, '_> {
         match &e.kind {
             HK::Update { place, inc, .. } => {
                 if let Place::Var(v) = &**place
-                    && let Home::S(r) = self.home(*v)
+                    && let Home::Scalar(r) = self.home(*v)
                     && self.var_info(*v).kind() == Kind::Num
                 {
-                    self.emit(I::AddNK {
-                        d: r,
-                        a: r,
-                        k: if *inc { 1.0 } else { -1.0 },
-                    });
+                    self.emit(Instruction::AddConstant { output: NumSlot(r), left: NumSlot(r), constant: if *inc { 1.0 } else { -1.0 } });
                 } else if let Place::Var(v) = &**place
-                    && let Home::V(r) = self.home(*v)
+                    && let Home::Value(r) = self.home(*v)
                 {
-                    self.emit(I::IncV {
-                        d: r,
-                        s: r,
-                        k: if *inc { 1.0 } else { -1.0 },
-                    });
+                    self.emit(Instruction::DynamicAddConstant { output: ValSlot(r), value: ValSlot(r), constant: if *inc { 1.0 } else { -1.0 } });
                 } else {
-                    self.update(place, *inc, true);
+                    self.update(place, *inc, true, e.kind() == Kind::Big);
                 }
             }
             HK::Call(c) => {
                 self.call(c, None);
             }
             HK::Assign(place, value) => {
-                // Assign straight into a local's register.
+                // Assign straight into a local's slot.
                 if let Place::Var(v) = &**place
-                    && let Home::S(r) | Home::V(r) = self.home(*v)
+                    && let Home::Scalar(r) | Home::Value(r) = self.home(*v)
                 {
                     let k = self.var_info(*v).kind();
                     self.expr_into(value, Op { k, r });
@@ -1098,7 +1188,7 @@ impl FnGen<'_, '_> {
         self.reset(m);
     }
 
-    /// Evaluate into a specific register.
+    /// Evaluate into a specific slot.
     fn expr_into(&mut self, e: &HExpr, d: Op) {
         // Arithmetic directly into the destination saves a move.
         if let HK::Binary(HBin::Num(op), a, b) = &e.kind
@@ -1109,11 +1199,7 @@ impl FnGen<'_, '_> {
                 && matches!(op, NumOp::Add | NumOp::Sub)
             {
                 let x = self.expr(a);
-                self.emit(I::AddNK {
-                    d: d.r,
-                    a: x.r,
-                    k: if *op == NumOp::Add { k } else { -k },
-                });
+                self.emit(Instruction::AddConstant { output: NumSlot(d.r), left: NumSlot(x.r), constant: if *op == NumOp::Add { k } else { -k } });
             } else {
                 let x = self.expr(a);
                 let y = self.expr(b);
@@ -1129,13 +1215,13 @@ impl FnGen<'_, '_> {
             let m = self.mark();
             let pr = self.eval_place(p);
             let direct = match (&pr, d.k) {
-                (PlaceRef::Index { a, i, k: Kind::Num }, Kind::Num) => Some(I::GetIdxN { d: d.r, a: *a, i: *i }),
-                (PlaceRef::Index { a, i, k: Kind::Val }, Kind::Val) => Some(I::GetIdxV { d: d.r, a: *a, i: *i }),
-                (PlaceRef::Field { o, slot, .. }, Kind::Num) => Some(I::GetFieldN { d: d.r, o: *o, i: *slot }),
-                (PlaceRef::Field { o, slot, .. }, Kind::Val) => Some(I::GetField { d: d.r, o: *o, i: *slot }),
-                (PlaceRef::Prop { o, p }, Kind::Val) => Some(I::GetProp { d: d.r, o: *o, p: *p }),
-                (PlaceRef::ArrLen { a }, Kind::Num) => Some(I::ArrLen { d: d.r, a: *a }),
-                (PlaceRef::StrLen { s }, Kind::Num) => Some(I::StrLen { d: d.r, s: *s }),
+                (PlaceRef::Index { a, i, k: Kind::Num }, Kind::Num) => Some(Instruction::ReadElementNumber { output: NumSlot(d.r), array: ValSlot(*a), index: NumSlot(*i) }),
+                (PlaceRef::Index { a, i, k: Kind::Val }, Kind::Val) => Some(Instruction::ReadElement { output: ValSlot(d.r), array: ValSlot(*a), index: NumSlot(*i) }),
+                (PlaceRef::Field { o, slot, name }, Kind::Num) => Some(self.with_field_name(name, Instruction::ReadFieldNumber { output: NumSlot(d.r), object: ValSlot(*o), field: *slot })),
+                (PlaceRef::Field { o, slot, name }, Kind::Val) => Some(self.with_field_name(name, Instruction::ReadField { output: ValSlot(d.r), object: ValSlot(*o), field: *slot })),
+                (PlaceRef::Prop { o, p }, Kind::Val) => Some(Instruction::ReadProperty { output: ValSlot(d.r), object: ValSlot(*o), property: *p }),
+                (PlaceRef::ArrLen { a }, Kind::Num) => Some(Instruction::ArrayLength { output: NumSlot(d.r), array: ValSlot(*a) }),
+                (PlaceRef::StrLen { s }, Kind::Num) => Some(Instruction::StringLength { output: NumSlot(d.r), string: ValSlot(*s) }),
                 _ => None,
             };
             match direct {
@@ -1163,6 +1249,22 @@ impl FnGen<'_, '_> {
             return;
         }
         let m = self.mark();
+        // A literal goes straight into the destination.
+        match (&e.kind, d.k) {
+            (HK::Num(v), Kind::Num) if !self.num_regs.contains_key(&v.to_bits()) => {
+                self.emit(Instruction::LoadNumber { value: *v, output: NumSlot(d.r) });
+                return;
+            }
+            (HK::Bool(v), Kind::Bool) => {
+                self.emit(Instruction::LoadBool { value: *v, output: BoolSlot(d.r) });
+                return;
+            }
+            (HK::BigInt(v), Kind::Big) => {
+                self.load_big(*v, d.r);
+                return;
+            }
+            _ => {}
+        }
         // Dynamic arithmetic stored as a value: produce the boxed result directly.
         if d.k == Kind::Val
             && let HK::Cast(x) = &e.kind
@@ -1173,11 +1275,11 @@ impl FnGen<'_, '_> {
             if xa.k == Kind::Val || xb.k == Kind::Val {
                 let xa = self.coerce(xa, Kind::Val);
                 let xb = self.coerce(xb, Kind::Val);
-                self.emit(I::DynNumV { op: *nop, d: d.r, a: xa.r, b: xb.r });
+                self.emit(Instruction::DynamicArithmeticToValue { op: *nop, output: ValSlot(d.r), left: ValSlot(xa.r), right: ValSlot(xb.r) });
             } else {
                 let t = self.alloc_s();
                 self.num_op(*nop, t, xa.r, xb.r);
-                self.emit(I::BoxN { d: d.r, s: t });
+                self.emit(Instruction::BoxNumber { output: ValSlot(d.r), value: NumSlot(t) });
             }
             self.reset(m);
             return;
@@ -1185,8 +1287,9 @@ impl FnGen<'_, '_> {
         let o = self.expr(e);
         // Box/unbox straight into the destination instead of via a temporary.
         match (o.k, d.k) {
-            (Kind::Num, Kind::Val) => self.emit(I::BoxN { d: d.r, s: o.r }),
-            (Kind::Bool, Kind::Val) => self.emit(I::BoxB { d: d.r, s: o.r }),
+            (Kind::Num, Kind::Val) => self.emit(Instruction::BoxNumber { output: ValSlot(d.r), value: NumSlot(o.r) }),
+            (Kind::Bool, Kind::Val) => self.emit(Instruction::BoxBool { output: ValSlot(d.r), value: BoolSlot(o.r) }),
+            (Kind::Big, Kind::Val) => self.emit(Instruction::BoxBigInt { output: ValSlot(d.r), value: BigSlot(o.r) }),
             _ => {
                 let o = self.coerce(o, d.k);
                 self.mov(d, o);
@@ -1196,18 +1299,18 @@ impl FnGen<'_, '_> {
         self.reset(m);
     }
 
-    fn num_op(&mut self, op: NumOp, d: R, a: R, b: R) {
+    fn num_op(&mut self, op: NumOp, d: u16, a: u16, b: u16) {
         self.emit(match op {
-            NumOp::Add => I::AddN { d, a, b },
-            NumOp::Sub => I::SubN { d, a, b },
-            NumOp::Mul => I::MulN { d, a, b },
-            NumOp::Div => I::DivN { d, a, b },
-            NumOp::Mod => I::ModN { d, a, b },
-            op => I::NumOp { op, d, a, b },
+            NumOp::Add => Instruction::Arithmetic { op: NumOp::Add, output: NumSlot(d), left: NumSlot(a), right: NumSlot(b) },
+            NumOp::Sub => Instruction::Arithmetic { op: NumOp::Sub, output: NumSlot(d), left: NumSlot(a), right: NumSlot(b) },
+            NumOp::Mul => Instruction::Arithmetic { op: NumOp::Mul, output: NumSlot(d), left: NumSlot(a), right: NumSlot(b) },
+            NumOp::Div => Instruction::Arithmetic { op: NumOp::Div, output: NumSlot(d), left: NumSlot(a), right: NumSlot(b) },
+            NumOp::Mod => Instruction::Arithmetic { op: NumOp::Mod, output: NumSlot(d), left: NumSlot(a), right: NumSlot(b) },
+            op => Instruction::Arithmetic { op, output: NumSlot(d), left: NumSlot(a), right: NumSlot(b) },
         });
     }
 
-    /// Evaluate; the result has kind `e.kind()`. May return a variable's own register.
+    /// Evaluate; the result has kind `e.kind()`. May return a variable's own slot.
     fn expr(&mut self, e: &HExpr) -> Op {
         let k = e.kind();
         let o = self.expr_raw(e);
@@ -1222,28 +1325,33 @@ impl FnGen<'_, '_> {
                     return Op { k: Kind::Num, r: *r };
                 }
                 let d = self.alloc_s();
-                self.emit(I::LoadN { d, v: *v });
+                self.emit(Instruction::LoadNumber { output: NumSlot(d), value: *v });
                 Op { k: Kind::Num, r: d }
             }
             HK::Bool(v) => {
                 let d = self.alloc_s();
-                self.emit(I::LoadB { d, v: *v });
+                self.emit(Instruction::LoadBool { output: BoolSlot(d), value: *v });
                 Op { k: Kind::Bool, r: d }
+            }
+            HK::BigInt(v) => {
+                let d = self.alloc(Kind::Big);
+                self.load_big(*v, d.r);
+                d
             }
             HK::Str(s) => {
                 let d = self.alloc_v();
                 let kk = self.str_const(s);
-                self.emit(I::LoadK { d, k: kk });
+                self.emit(Instruction::LoadConstant { output: ValSlot(d), constant: kk });
                 Op { k: Kind::Val, r: d }
             }
             HK::Null => {
                 let d = self.alloc_v();
-                self.emit(I::LoadNull { d });
+                self.emit(Instruction::LoadNull { output: ValSlot(d) });
                 Op { k: Kind::Val, r: d }
             }
             HK::Undefined => {
                 let d = self.alloc_v();
-                self.emit(I::LoadUndef { d });
+                self.emit(Instruction::LoadUndefined { output: ValSlot(d) });
                 Op { k: Kind::Val, r: d }
             }
             HK::Read(p) => {
@@ -1254,7 +1362,7 @@ impl FnGen<'_, '_> {
             HK::NativeFn(n) => {
                 let d = self.alloc_v();
                 let kk = self.konst(Value::Native(*n));
-                self.emit(I::LoadK { d, k: kk });
+                self.emit(Instruction::LoadConstant { output: ValSlot(d), constant: kk });
                 Op { k: Kind::Val, r: d }
             }
             HK::Delete(o, key) => {
@@ -1262,14 +1370,14 @@ impl FnGen<'_, '_> {
                 let o = self.coerce(o, Kind::Val);
                 let kk = self.expr(key);
                 let kk = self.coerce(kk, Kind::Val);
-                self.emit(I::DelDyn { o: o.r, k: kk.r });
+                self.emit(Instruction::DeleteDynamic { object: ValSlot(o.r), key: ValSlot(kk.r) });
                 let d = self.alloc_s();
-                self.emit(I::LoadB { d, v: true });
+                self.emit(Instruction::LoadBool { output: BoolSlot(d), value: true });
                 Op { k: Kind::Bool, r: d }
             }
             HK::ClassRef(c) => {
                 let d = self.alloc_v();
-                self.emit(I::LoadClass { d, class: *c });
+                self.emit(Instruction::LoadClass { output: ValSlot(d), class: *c });
                 Op { k: Kind::Val, r: d }
             }
             HK::Array(elems) => {
@@ -1283,7 +1391,7 @@ impl FnGen<'_, '_> {
                     _ => false,
                 };
                 let d = self.alloc_v();
-                self.emit(I::NewArr { d, num });
+                self.emit(Instruction::NewArray { output: ValSlot(d), numbers: num });
                 for el in elems {
                     let m = self.mark();
                     match el {
@@ -1295,16 +1403,16 @@ impl FnGen<'_, '_> {
                             let o = self.expr(x);
                             if num {
                                 let o = self.coerce(o, Kind::Num);
-                                self.emit(I::PushN { a: d, s: o.r });
+                                self.emit(Instruction::PushNumber { array: ValSlot(d), value: NumSlot(o.r) });
                             } else {
                                 let o = self.coerce(o, Kind::Val);
-                                self.emit(I::PushV { a: d, s: o.r });
+                                self.emit(Instruction::PushValue { array: ValSlot(d), value: ValSlot(o.r) });
                             }
                         }
                         HElem::Spread(x) => {
                             let o = self.expr(x);
                             let o = self.coerce(o, Kind::Val);
-                            self.emit(I::PushSpread { a: d, s: o.r });
+                            self.emit(Instruction::PushSpread { array: ValSlot(d), source: ValSlot(o.r) });
                         }
                     }
                     self.reset(m);
@@ -1324,23 +1432,24 @@ impl FnGen<'_, '_> {
                         }
                     }
                     let shape = self.cg.shape(keys.clone());
-                    self.emit(I::NewObj { d, shape });
+                    self.emit(Instruction::NewObject { output: ValSlot(d), shape });
                     for p in props {
                         let HProp::Init(n, x) = p else { unreachable!() };
                         let slot = keys.iter().position(|k| k == n).unwrap() as u16;
                         let m = self.mark();
                         let o = self.expr(x);
+                        self.note_field(&Some(n.clone()));
                         if o.k == Kind::Num {
-                            self.emit(I::SetFieldN { o: d, i: slot, s: o.r });
+                            self.emit(Instruction::WriteFieldNumber { object: ValSlot(d), field: slot, value: NumSlot(o.r) });
                         } else {
                             let o = self.coerce(o, Kind::Val);
-                            self.emit(I::SetField { o: d, i: slot, s: o.r });
+                            self.emit(Instruction::WriteField { object: ValSlot(d), field: slot, value: ValSlot(o.r) });
                         }
                         self.reset(m);
                     }
                 } else {
                     let shape = self.cg.shape(vec![]);
-                    self.emit(I::NewObj { d, shape });
+                    self.emit(Instruction::NewObject { output: ValSlot(d), shape });
                     for p in props {
                         let m = self.mark();
                         match p {
@@ -1348,12 +1457,12 @@ impl FnGen<'_, '_> {
                                 let o = self.expr(x);
                                 let o = self.coerce(o, Kind::Val);
                                 let ps = self.prop_site(n);
-                                self.emit(I::SetProp { o: d, p: ps, s: o.r });
+                                self.emit(Instruction::WriteProperty { object: ValSlot(d), property: ps, value: ValSlot(o.r) });
                             }
                             HProp::Spread(x) => {
                                 let o = self.expr(x);
                                 let o = self.coerce(o, Kind::Val);
-                                self.emit(I::ObjSpread { o: d, s: o.r });
+                                self.emit(Instruction::SpreadIntoObject { object: ValSlot(d), source: ValSlot(o.r) });
                             }
                         }
                         self.reset(m);
@@ -1367,10 +1476,11 @@ impl FnGen<'_, '_> {
                 // Test the left operand in its own kind, then convert whichever side is used.
                 let d = self.alloc(k);
                 let av = self.expr(a);
+                let av_test = if *op == LogicalOp::Nullish { av } else { self.big_truthy(av) };
                 let use_a = match op {
                     LogicalOp::Nullish => {
                         if av.k == Kind::Val {
-                            Some(self.emit(I::JmpNotNullish { s: av.r, t: 0 }))
+                            Some(self.emit(Instruction::JumpIfNullish { when: false, value: ValSlot(av.r), to: 0 }))
                         } else {
                             None
                         }
@@ -1378,28 +1488,30 @@ impl FnGen<'_, '_> {
                     LogicalOp::And | LogicalOp::Or => {
                         // `a && b` uses a when a is falsy; `a || b` when truthy.
                         let sense = *op == LogicalOp::Or;
+                        let av = av_test;
                         Some(match av.k {
+                            Kind::Big => unreachable!(),
                             Kind::Bool => {
                                 if sense {
-                                    self.emit(I::JmpT { c: av.r, t: 0 })
+                                    self.emit(Instruction::JumpIf { when: true, condition: BoolSlot(av.r), to: 0 })
                                 } else {
-                                    self.emit(I::JmpF { c: av.r, t: 0 })
+                                    self.emit(Instruction::JumpIf { when: false, condition: BoolSlot(av.r), to: 0 })
                                 }
                             }
                             Kind::Num => {
                                 let t = self.alloc_s();
-                                self.emit(I::TruthyN { d: t, s: av.r });
+                                self.emit(Instruction::NumberIsTruthy { output: BoolSlot(t), value: NumSlot(av.r) });
                                 if sense {
-                                    self.emit(I::JmpT { c: t, t: 0 })
+                                    self.emit(Instruction::JumpIf { when: true, condition: BoolSlot(t), to: 0 })
                                 } else {
-                                    self.emit(I::JmpF { c: t, t: 0 })
+                                    self.emit(Instruction::JumpIf { when: false, condition: BoolSlot(t), to: 0 })
                                 }
                             }
                             Kind::Val => {
                                 if sense {
-                                    self.emit(I::JmpTV { c: av.r, t: 0 })
+                                    self.emit(Instruction::JumpIfTruthy { when: true, value: ValSlot(av.r), to: 0 })
                                 } else {
-                                    self.emit(I::JmpFV { c: av.r, t: 0 })
+                                    self.emit(Instruction::JumpIfTruthy { when: false, value: ValSlot(av.r), to: 0 })
                                 }
                             }
                         })
@@ -1432,7 +1544,7 @@ impl FnGen<'_, '_> {
             HK::Assign(place, value) => {
                 let pr = self.eval_place(place);
                 let v = self.expr(value);
-                // Keep the value in a register the store won't clobber.
+                // Keep the value in a slot the store won't clobber.
                 let v = if matches!(pr, PlaceRef::Var(_)) {
                     let t = self.alloc(v.k);
                     self.mov(t, v);
@@ -1447,16 +1559,17 @@ impl FnGen<'_, '_> {
                 let pr = self.eval_place(place);
                 let operand_kind = match op {
                     HBin::Num(_) => Kind::Num,
+                    HBin::Big(_) => Kind::Big,
                     _ => Kind::Val,
                 };
                 let cur = self.load_place(&pr, operand_kind);
                 let cur = self.coerce(cur, operand_kind);
                 let v = self.expr(value);
-                // `x += e` on a number local computes straight into x's register.
+                // `x += e` on a number local computes straight into x's slot.
                 if let PlaceRef::Var(var) = pr
-                    && let Home::S(r) = self.home(var)
-                    && operand_kind == Kind::Num
-                    && self.var_info(var).kind() == Kind::Num
+                    && let Home::Scalar(r) = self.home(var)
+                    && operand_kind != Kind::Val
+                    && self.var_info(var).kind() == operand_kind
                 {
                     return self.binop_into(*op, cur, v, Some(r));
                 }
@@ -1470,30 +1583,32 @@ impl FnGen<'_, '_> {
                 let cur = self.load_place(&pr, k);
                 let cur = self.coerce(cur, k);
                 self.mov(d, cur);
-                let skip = match (op, d.k) {
-                    (LogicalOp::Nullish, Kind::Val) => self.emit(I::JmpNotNullish { s: d.r, t: 0 }),
+                let t = if *op == LogicalOp::Nullish { d } else { self.big_truthy(d) };
+                let skip = match (op, t.k) {
+                    (_, Kind::Big) => unreachable!(),
+                    (LogicalOp::Nullish, Kind::Val) => self.emit(Instruction::JumpIfNullish { when: false, value: ValSlot(d.r), to: 0 }),
                     (LogicalOp::Nullish, _) => self.jump_placeholder(),
                     (op, Kind::Val) => {
                         if *op == LogicalOp::Or {
-                            self.emit(I::JmpTV { c: d.r, t: 0 })
+                            self.emit(Instruction::JumpIfTruthy { when: true, value: ValSlot(d.r), to: 0 })
                         } else {
-                            self.emit(I::JmpFV { c: d.r, t: 0 })
+                            self.emit(Instruction::JumpIfTruthy { when: false, value: ValSlot(d.r), to: 0 })
                         }
                     }
                     (op, Kind::Bool) => {
                         if *op == LogicalOp::Or {
-                            self.emit(I::JmpT { c: d.r, t: 0 })
+                            self.emit(Instruction::JumpIf { when: true, condition: BoolSlot(d.r), to: 0 })
                         } else {
-                            self.emit(I::JmpF { c: d.r, t: 0 })
+                            self.emit(Instruction::JumpIf { when: false, condition: BoolSlot(d.r), to: 0 })
                         }
                     }
                     (op, Kind::Num) => {
                         let t = self.alloc_s();
-                        self.emit(I::TruthyN { d: t, s: d.r });
+                        self.emit(Instruction::NumberIsTruthy { output: BoolSlot(t), value: NumSlot(d.r) });
                         if *op == LogicalOp::Or {
-                            self.emit(I::JmpT { c: t, t: 0 })
+                            self.emit(Instruction::JumpIf { when: true, condition: BoolSlot(t), to: 0 })
                         } else {
-                            self.emit(I::JmpF { c: t, t: 0 })
+                            self.emit(Instruction::JumpIf { when: false, condition: BoolSlot(t), to: 0 })
                         }
                     }
                 };
@@ -1502,7 +1617,7 @@ impl FnGen<'_, '_> {
                 self.patch_here(skip);
                 d
             }
-            HK::Update { place, inc, prefix } => self.update(place, *inc, *prefix),
+            HK::Update { place, inc, prefix } => self.update(place, *inc, *prefix, k == Kind::Big),
             HK::Call(c) => {
                 let d = self.alloc(k);
                 self.call(c, Some(d));
@@ -1510,7 +1625,7 @@ impl FnGen<'_, '_> {
             }
             HK::New { class, args } => {
                 let d = self.alloc_v();
-                self.emit(I::NewInst { d, class: *class });
+                self.emit(Instruction::NewInstance { output: ValSlot(d), class: *class });
                 let ctor = self.cg.hir.classes[*class as usize].ctor;
                 let call = HCall {
                     callee: Callee::Direct { func: ctor, closure: None },
@@ -1542,7 +1657,7 @@ impl FnGen<'_, '_> {
                 let o = self.expr(x);
                 let o = self.coerce(o, Kind::Val);
                 let d = self.alloc_s();
-                self.emit(I::InstanceOf { d, o: o.r, class: *c });
+                self.emit(Instruction::InstanceOf { output: BoolSlot(d), value: ValSlot(o.r), class: *c });
                 Op { k: Kind::Bool, r: d }
             }
             HK::Cast(x) if k == Kind::Val && matches!(x.kind, HK::Num(_) | HK::Bool(_)) => {
@@ -1554,7 +1669,7 @@ impl FnGen<'_, '_> {
                 };
                 let kk = self.konst(v);
                 let d = self.alloc_v();
-                self.emit(I::LoadK { d, k: kk });
+                self.emit(Instruction::LoadConstant { output: ValSlot(d), constant: kk });
                 Op { k, r: d }
             }
             HK::Cast(x) if k == Kind::Val && matches!(x.kind, HK::Binary(HBin::DynNum(_), _, _)) => {
@@ -1576,9 +1691,13 @@ impl FnGen<'_, '_> {
                     self.patch_here(j);
                 }
                 match d.k {
-                    Kind::Val => self.emit(I::LoadUndef { d: d.r }),
-                    Kind::Num => self.emit(I::LoadN { d: d.r, v: f64::NAN }),
-                    Kind::Bool => self.emit(I::LoadB { d: d.r, v: false }),
+                    Kind::Val => self.emit(Instruction::LoadUndefined { output: ValSlot(d.r) }),
+                    Kind::Num => self.emit(Instruction::LoadNumber { output: NumSlot(d.r), value: f64::NAN }),
+                    Kind::Bool => self.emit(Instruction::LoadBool { output: BoolSlot(d.r), value: false }),
+                    Kind::Big => {
+                        self.load_big(0, d.r);
+                        0
+                    }
                 };
                 self.patch_here(end);
                 d
@@ -1595,11 +1714,11 @@ impl FnGen<'_, '_> {
 
     fn closure(&mut self, f: FuncId) -> Op {
         let free = self.cg.hir.funcs[f as usize].free.clone();
-        let list: Vec<CapSrc> = free
+        let list: Vec<CaptureFrom> = free
             .iter()
             .map(|v| match self.home(*v) {
-                Home::Cell(r) => CapSrc::Local(r),
-                Home::Up(i) => CapSrc::Up(i),
+                Home::Cell(r) => CaptureFrom::Slot(ValSlot(r)),
+                Home::Capture(i) => CaptureFrom::Capture(i),
                 h => panic!(
                     "codegen: captured variable {} has non-cell home {h:?} in {}",
                     self.var_info(*v).name,
@@ -1610,7 +1729,7 @@ impl FnGen<'_, '_> {
         self.caps.push(list);
         let caps = self.caps.len() as u32 - 1;
         let d = self.alloc_v();
-        self.emit(I::MakeClosure { d, f, caps });
+        self.emit(Instruction::MakeClosure { output: ValSlot(d), function: f, captures: caps });
         Op { k: Kind::Val, r: d }
     }
 
@@ -1620,28 +1739,52 @@ impl FnGen<'_, '_> {
                 let o = self.expr(x);
                 let o = self.coerce(o, Kind::Num);
                 let d = self.alloc_s();
-                self.emit(I::NegN { d, s: o.r });
+                self.emit(Instruction::Negate { output: NumSlot(d), value: NumSlot(o.r) });
                 Op { k: Kind::Num, r: d }
             }
             HUnary::BitNotNum => {
                 let o = self.expr(x);
                 let o = self.coerce(o, Kind::Num);
                 let d = self.alloc_s();
-                self.emit(I::BitNotN { d, s: o.r });
+                self.emit(Instruction::BitNot { output: NumSlot(d), value: NumSlot(o.r) });
                 Op { k: Kind::Num, r: d }
+            }
+            HUnary::NegBig | HUnary::BitNotBig => {
+                let o = self.expr(x);
+                let o = self.coerce(o, Kind::Big);
+                let d = self.alloc(Kind::Big);
+                self.emit(if op == HUnary::NegBig {
+                    Instruction::NegateBigInt { output: BigSlot(d.r), value: BigSlot(o.r) }
+                } else {
+                    Instruction::BitNotBigInt { output: BigSlot(d.r), value: BigSlot(o.r) }
+                });
+                d
+            }
+            HUnary::NegDyn | HUnary::BitNotDyn => {
+                let o = self.expr(x);
+                let o = self.coerce(o, Kind::Val);
+                let d = self.alloc_v();
+                self.emit(if op == HUnary::NegDyn {
+                    Instruction::DynamicNegate { output: ValSlot(d), value: ValSlot(o.r) }
+                } else {
+                    Instruction::DynamicBitNot { output: ValSlot(d), value: ValSlot(o.r) }
+                });
+                Op { k: Kind::Val, r: d }
             }
             HUnary::NotBool | HUnary::Truthy => {
                 let o = self.expr(x);
+                let o = self.big_truthy(o);
                 let t = match o.k {
+                    Kind::Big => unreachable!(),
                     Kind::Bool => o,
                     Kind::Num => {
                         let d = self.alloc_s();
-                        self.emit(I::TruthyN { d, s: o.r });
+                        self.emit(Instruction::NumberIsTruthy { output: BoolSlot(d), value: NumSlot(o.r) });
                         Op { k: Kind::Bool, r: d }
                     }
                     Kind::Val => {
                         let d = self.alloc_s();
-                        self.emit(I::TruthyV { d, s: o.r });
+                        self.emit(Instruction::IsTruthy { output: BoolSlot(d), value: ValSlot(o.r) });
                         Op { k: Kind::Bool, r: d }
                     }
                 };
@@ -1649,7 +1792,7 @@ impl FnGen<'_, '_> {
                     return t;
                 }
                 let d = self.alloc_s();
-                self.emit(I::NotB { d, s: t.r });
+                self.emit(Instruction::Not { output: BoolSlot(d), value: BoolSlot(t.r) });
                 Op { k: Kind::Bool, r: d }
             }
             HUnary::TypeOf => {
@@ -1658,14 +1801,18 @@ impl FnGen<'_, '_> {
                 match o.k {
                     Kind::Num => {
                         let kk = self.str_const(&"number".into());
-                        self.emit(I::LoadK { d, k: kk });
+                        self.emit(Instruction::LoadConstant { output: ValSlot(d), constant: kk });
                     }
                     Kind::Bool => {
                         let kk = self.str_const(&"boolean".into());
-                        self.emit(I::LoadK { d, k: kk });
+                        self.emit(Instruction::LoadConstant { output: ValSlot(d), constant: kk });
+                    }
+                    Kind::Big => {
+                        let kk = self.str_const(&"bigint".into());
+                        self.emit(Instruction::LoadConstant { output: ValSlot(d), constant: kk });
                     }
                     Kind::Val => {
-                        self.emit(I::TypeOf { d, s: o.r });
+                        self.emit(Instruction::TypeOf { output: ValSlot(d), value: ValSlot(o.r) });
                     }
                 }
                 Op { k: Kind::Val, r: d }
@@ -1673,7 +1820,7 @@ impl FnGen<'_, '_> {
             HUnary::Void => {
                 self.expr_discard(x);
                 let d = self.alloc_v();
-                self.emit(I::LoadUndef { d });
+                self.emit(Instruction::LoadUndefined { output: ValSlot(d) });
                 Op { k: Kind::Val, r: d }
             }
             HUnary::ToNum => {
@@ -1683,7 +1830,7 @@ impl FnGen<'_, '_> {
                     _ => {
                         let o = self.coerce(o, Kind::Val);
                         let d = self.alloc_s();
-                        self.emit(I::ToNum { d, s: o.r });
+                        self.emit(Instruction::ToNumber { output: NumSlot(d), value: ValSlot(o.r) });
                         Op { k: Kind::Num, r: d }
                     }
                 }
@@ -1693,14 +1840,14 @@ impl FnGen<'_, '_> {
                 let d = self.alloc_v();
                 match o.k {
                     Kind::Num => {
-                        self.emit(I::NumToStr { d, s: o.r });
+                        self.emit(Instruction::NumberToString { output: ValSlot(d), value: NumSlot(o.r) });
                     }
                     _ => {
                         let o = self.coerce(o, Kind::Val);
                         if matches!(x.ty, Type::String | Type::StrLit(_)) {
                             return o;
                         }
-                        self.emit(I::ToStr { d, s: o.r });
+                        self.emit(Instruction::ToString { output: ValSlot(d), value: ValSlot(o.r) });
                     }
                 }
                 let _ = k;
@@ -1717,11 +1864,7 @@ impl FnGen<'_, '_> {
             let x = self.expr(a);
             let x = self.coerce(x, Kind::Num);
             let d = self.alloc_s();
-            self.emit(I::AddNK {
-                d,
-                a: x.r,
-                k: if nop == NumOp::Add { kv } else { -kv },
-            });
+            self.emit(Instruction::AddConstant { output: NumSlot(d), left: NumSlot(x.r), constant: if nop == NumOp::Add { kv } else { -kv } });
             return Op { k: Kind::Num, r: d };
         }
         let x = self.operand(op, a);
@@ -1732,11 +1875,11 @@ impl FnGen<'_, '_> {
     /// Evaluate a binary operand. Literals feeding a dynamic operator are
     /// loaded as pre-boxed constants instead of loaded and then boxed.
     fn operand(&mut self, op: HBin, e: &HExpr) -> Op {
-        let dynamic = matches!(op, HBin::DynAdd | HBin::DynNum(_) | HBin::DynCmp(_) | HBin::StrictEq(_) | HBin::LooseEq(_));
+        let dynamic = matches!(op, HBin::DynAdd | HBin::DynNum(_) | HBin::DynNumeric(_) | HBin::DynCmp(_) | HBin::StrictEq(_) | HBin::LooseEq(_));
         if dynamic && let HK::Num(n) = e.kind {
             let kk = self.konst(Value::Num(n));
             let d = self.alloc_v();
-            self.emit(I::LoadK { d, k: kk });
+            self.emit(Instruction::LoadConstant { output: ValSlot(d), constant: kk });
             return Op { k: Kind::Val, r: d };
         }
         if dynamic && let HK::Binary(HBin::DynNum(nop), a, b) = &e.kind {
@@ -1746,7 +1889,7 @@ impl FnGen<'_, '_> {
                 let xa = self.coerce(xa, Kind::Val);
                 let xb = self.coerce(xb, Kind::Val);
                 let d = self.alloc_v();
-                self.emit(I::DynNumV { op: *nop, d, a: xa.r, b: xb.r });
+                self.emit(Instruction::DynamicArithmeticToValue { op: *nop, output: ValSlot(d), left: ValSlot(xa.r), right: ValSlot(xb.r) });
                 return Op { k: Kind::Val, r: d };
             }
             let d = self.alloc_s();
@@ -1761,8 +1904,22 @@ impl FnGen<'_, '_> {
     }
 
     /// Binary op; writes into `dst` when given (its kind must match the result kind).
-    fn binop_into(&mut self, op: HBin, x: Op, y: Op, dst: Option<R>) -> Op {
+    fn binop_into(&mut self, op: HBin, x: Op, y: Op, dst: Option<u16>) -> Op {
         match op {
+            HBin::Big(nop) => {
+                let x = self.coerce(x, Kind::Big);
+                let y = self.coerce(y, Kind::Big);
+                let d = dst.unwrap_or_else(|| self.alloc(Kind::Big).r);
+                self.emit(Instruction::BigIntArithmetic { op: nop, output: BigSlot(d), left: BigSlot(x.r), right: BigSlot(y.r) });
+                Op { k: Kind::Big, r: d }
+            }
+            HBin::BigCmp(cop) => {
+                let x = self.coerce(x, Kind::Big);
+                let y = self.coerce(y, Kind::Big);
+                let d = dst.unwrap_or_else(|| self.alloc_s());
+                self.emit(Instruction::CompareBigInts { op: cop, output: BoolSlot(d), left: BigSlot(x.r), right: BigSlot(y.r) });
+                Op { k: Kind::Bool, r: d }
+            }
             HBin::Num(nop) => {
                 let x = self.coerce(x, Kind::Num);
                 let y = self.coerce(y, Kind::Num);
@@ -1775,12 +1932,12 @@ impl FnGen<'_, '_> {
                 let y = self.coerce(y, Kind::Num);
                 let d = dst.unwrap_or_else(|| self.alloc_s());
                 self.emit(match c {
-                    CmpOp::Lt => I::LtN { d, a: x.r, b: y.r },
-                    CmpOp::Le => I::LeN { d, a: x.r, b: y.r },
-                    CmpOp::Gt => I::GtN { d, a: x.r, b: y.r },
-                    CmpOp::Ge => I::GeN { d, a: x.r, b: y.r },
-                    CmpOp::Eq => I::EqN { d, a: x.r, b: y.r },
-                    CmpOp::Ne => I::NeN { d, a: x.r, b: y.r },
+                    CmpOp::Lt => Instruction::Compare { op: CmpOp::Lt, output: BoolSlot(d), left: NumSlot(x.r), right: NumSlot(y.r) },
+                    CmpOp::Le => Instruction::Compare { op: CmpOp::Le, output: BoolSlot(d), left: NumSlot(x.r), right: NumSlot(y.r) },
+                    CmpOp::Gt => Instruction::Compare { op: CmpOp::Gt, output: BoolSlot(d), left: NumSlot(x.r), right: NumSlot(y.r) },
+                    CmpOp::Ge => Instruction::Compare { op: CmpOp::Ge, output: BoolSlot(d), left: NumSlot(x.r), right: NumSlot(y.r) },
+                    CmpOp::Eq => Instruction::Compare { op: CmpOp::Eq, output: BoolSlot(d), left: NumSlot(x.r), right: NumSlot(y.r) },
+                    CmpOp::Ne => Instruction::Compare { op: CmpOp::Ne, output: BoolSlot(d), left: NumSlot(x.r), right: NumSlot(y.r) },
                 });
                 Op { k: Kind::Bool, r: d }
             }
@@ -1789,9 +1946,9 @@ impl FnGen<'_, '_> {
                 let y = self.coerce(y, Kind::Bool);
                 let d = dst.unwrap_or_else(|| self.alloc_s());
                 self.emit(if eq {
-                    I::EqB { d, a: x.r, b: y.r }
+                    Instruction::CompareBools { equal: true, output: BoolSlot(d), left: BoolSlot(x.r), right: BoolSlot(y.r) }
                 } else {
-                    I::NeB { d, a: x.r, b: y.r }
+                    Instruction::CompareBools { equal: false, output: BoolSlot(d), left: BoolSlot(x.r), right: BoolSlot(y.r) }
                 });
                 Op { k: Kind::Bool, r: d }
             }
@@ -1799,20 +1956,20 @@ impl FnGen<'_, '_> {
                 let d = dst.unwrap_or_else(|| self.alloc_s());
                 if x.k == Kind::Num && y.k == Kind::Num {
                     self.emit(if eq {
-                        I::EqN { d, a: x.r, b: y.r }
+                        Instruction::Compare { op: CmpOp::Eq, output: BoolSlot(d), left: NumSlot(x.r), right: NumSlot(y.r) }
                     } else {
-                        I::NeN { d, a: x.r, b: y.r }
+                        Instruction::Compare { op: CmpOp::Ne, output: BoolSlot(d), left: NumSlot(x.r), right: NumSlot(y.r) }
                     });
                 } else if x.k == Kind::Bool && y.k == Kind::Bool {
                     self.emit(if eq {
-                        I::EqB { d, a: x.r, b: y.r }
+                        Instruction::CompareBools { equal: true, output: BoolSlot(d), left: BoolSlot(x.r), right: BoolSlot(y.r) }
                     } else {
-                        I::NeB { d, a: x.r, b: y.r }
+                        Instruction::CompareBools { equal: false, output: BoolSlot(d), left: BoolSlot(x.r), right: BoolSlot(y.r) }
                     });
                 } else {
                     let x = self.coerce(x, Kind::Val);
                     let y = self.coerce(y, Kind::Val);
-                    self.emit(I::StrictEq { d, a: x.r, b: y.r, eq });
+                    self.emit(Instruction::StrictEquals { output: BoolSlot(d), left: ValSlot(x.r), right: ValSlot(y.r), equal: eq });
                 }
                 Op { k: Kind::Bool, r: d }
             }
@@ -1820,14 +1977,14 @@ impl FnGen<'_, '_> {
                 let d = dst.unwrap_or_else(|| self.alloc_s());
                 if x.k == Kind::Num && y.k == Kind::Num {
                     self.emit(if eq {
-                        I::EqN { d, a: x.r, b: y.r }
+                        Instruction::Compare { op: CmpOp::Eq, output: BoolSlot(d), left: NumSlot(x.r), right: NumSlot(y.r) }
                     } else {
-                        I::NeN { d, a: x.r, b: y.r }
+                        Instruction::Compare { op: CmpOp::Ne, output: BoolSlot(d), left: NumSlot(x.r), right: NumSlot(y.r) }
                     });
                 } else {
                     let x = self.coerce(x, Kind::Val);
                     let y = self.coerce(y, Kind::Val);
-                    self.emit(I::LooseEq { d, a: x.r, b: y.r, eq });
+                    self.emit(Instruction::LooseEquals { output: BoolSlot(d), left: ValSlot(x.r), right: ValSlot(y.r), equal: eq });
                 }
                 Op { k: Kind::Bool, r: d }
             }
@@ -1835,21 +1992,21 @@ impl FnGen<'_, '_> {
                 let x = self.coerce(x, Kind::Val);
                 let y = self.coerce(y, Kind::Val);
                 let d = dst.unwrap_or_else(|| self.alloc_v());
-                self.emit(I::Concat { d, a: x.r, b: y.r });
+                self.emit(Instruction::Concat { output: ValSlot(d), left: ValSlot(x.r), right: ValSlot(y.r) });
                 Op { k: Kind::Val, r: d }
             }
             HBin::StrCmp(c) => {
                 let x = self.coerce(x, Kind::Val);
                 let y = self.coerce(y, Kind::Val);
                 let d = dst.unwrap_or_else(|| self.alloc_s());
-                self.emit(I::StrCmp { op: c, d, a: x.r, b: y.r });
+                self.emit(Instruction::CompareStrings { op: c, output: BoolSlot(d), left: ValSlot(x.r), right: ValSlot(y.r) });
                 Op { k: Kind::Bool, r: d }
             }
             HBin::DynAdd => {
                 let x = self.coerce(x, Kind::Val);
                 let y = self.coerce(y, Kind::Val);
                 let d = dst.unwrap_or_else(|| self.alloc_v());
-                self.emit(I::DynAdd { d, a: x.r, b: y.r });
+                self.emit(Instruction::DynamicAdd { output: ValSlot(d), left: ValSlot(x.r), right: ValSlot(y.r) });
                 Op { k: Kind::Val, r: d }
             }
             HBin::DynNum(nop) => {
@@ -1861,52 +2018,75 @@ impl FnGen<'_, '_> {
                 let x = self.coerce(x, Kind::Val);
                 let y = self.coerce(y, Kind::Val);
                 let d = dst.unwrap_or_else(|| self.alloc_s());
-                self.emit(I::DynNum { op: nop, d, a: x.r, b: y.r });
+                self.emit(Instruction::DynamicArithmetic { op: nop, output: NumSlot(d), left: ValSlot(x.r), right: ValSlot(y.r) });
                 Op { k: Kind::Num, r: d }
+            }
+            HBin::DynNumeric(nop) => {
+                let x = self.coerce(x, Kind::Val);
+                let y = self.coerce(y, Kind::Val);
+                let d = dst.unwrap_or_else(|| self.alloc_v());
+                self.emit(Instruction::DynamicArithmeticToValue { op: nop, output: ValSlot(d), left: ValSlot(x.r), right: ValSlot(y.r) });
+                Op { k: Kind::Val, r: d }
             }
             HBin::DynCmp(c) => {
                 let x = self.coerce(x, Kind::Val);
                 let y = self.coerce(y, Kind::Val);
                 let d = dst.unwrap_or_else(|| self.alloc_s());
-                self.emit(I::DynCmp { op: c, d, a: x.r, b: y.r });
+                self.emit(Instruction::DynamicCompare { op: c, output: BoolSlot(d), left: ValSlot(x.r), right: ValSlot(y.r) });
                 Op { k: Kind::Bool, r: d }
             }
             HBin::In => {
                 let x = self.coerce(x, Kind::Val);
                 let y = self.coerce(y, Kind::Val);
                 let d = dst.unwrap_or_else(|| self.alloc_s());
-                self.emit(I::In { d, k: x.r, o: y.r });
+                self.emit(Instruction::In { output: BoolSlot(d), key: ValSlot(x.r), object: ValSlot(y.r) });
                 Op { k: Kind::Bool, r: d }
             }
         }
     }
 
-    fn update(&mut self, place: &Place, inc: bool, prefix: bool) -> Op {
+    /// `++`/`--` on a place; `big` when it holds a `bigint`.
+    fn update(&mut self, place: &Place, inc: bool, prefix: bool, big: bool) -> Op {
         let pr = self.eval_place(place);
+        if big {
+            let cur = self.load_place(&pr, Kind::Big);
+            let cur = self.coerce(cur, Kind::Big);
+            let old = if prefix {
+                cur
+            } else {
+                let t = self.alloc(Kind::Big);
+                self.mov(t, cur);
+                t
+            };
+            let one = self.alloc(Kind::Big);
+            self.load_big(1, one.r);
+            let new = self.alloc(Kind::Big);
+            let op = if inc { NumOp::Add } else { NumOp::Sub };
+            self.emit(Instruction::BigIntArithmetic { op, output: BigSlot(new.r), left: BigSlot(old.r), right: BigSlot(one.r) });
+            self.store_place(&pr, new);
+            return if prefix { new } else { old };
+        }
         let cur = self.load_place(&pr, Kind::Num);
         let cur = match cur.k {
+            Kind::Big => unreachable!(),
             Kind::Num => cur,
             Kind::Val => {
                 let d = self.alloc_s();
-                self.emit(I::ToNum { d, s: cur.r });
+                self.emit(Instruction::ToNumber { output: NumSlot(d), value: ValSlot(cur.r) });
                 Op { k: Kind::Num, r: d }
             }
             Kind::Bool => self.coerce(cur, Kind::Num),
         };
-        // Keep the old value (postfix) out of the variable's own register.
+        // Keep the old value (postfix) out of the variable's own slot.
         let old = if !prefix {
             let t = self.alloc_s();
-            self.emit(I::MovS { d: t, s: cur.r });
+            self.emit(Instruction::CopyNumber { to: NumSlot(t), from: NumSlot(cur.r) });
             Op { k: Kind::Num, r: t }
         } else {
             cur
         };
         let new = self.alloc_s();
-        self.emit(I::AddNK {
-            d: new,
-            a: old.r,
-            k: if inc { 1.0 } else { -1.0 },
-        });
+        self.emit(Instruction::AddConstant { output: NumSlot(new), left: NumSlot(old.r), constant: if inc { 1.0 } else { -1.0 } });
         let new = Op { k: Kind::Num, r: new };
         self.store_place(&pr, new);
         if prefix { new } else { old }
@@ -1916,7 +2096,7 @@ impl FnGen<'_, '_> {
 
     fn opt_check(&mut self, o: Op, opt: bool) {
         if opt {
-            let j = self.emit(I::JmpNullish { s: o.r, t: 0 });
+            let j = self.emit(Instruction::JumpIfNullish { when: true, value: ValSlot(o.r), to: 0 });
             self.opt_exits.last_mut().expect("optional link outside OptChain").push(j);
         }
     }
@@ -1928,7 +2108,11 @@ impl FnGen<'_, '_> {
                 let o = self.expr(obj);
                 let o = self.coerce(o, Kind::Val);
                 self.opt_check(o, *opt);
-                PlaceRef::Field { o: o.r, slot: *slot as u16 }
+                let name = match &obj.ty {
+                    Type::Class(c, _) => self.cg.hir.classes[*c as usize].fields.get(*slot as usize).cloned(),
+                    _ => None,
+                };
+                PlaceRef::Field { o: o.r, slot: *slot as u16, name }
             }
             Place::Prop { obj, name, opt } => {
                 let o = self.expr(obj);
@@ -1974,7 +2158,11 @@ impl FnGen<'_, '_> {
                 let o = self.expr(obj);
                 let o = self.coerce(o, Kind::Val);
                 self.opt_check(o, *opt);
-                PlaceRef::Accessor { o: o.r, get: *get, set: *set }
+                let class = match &obj.ty {
+                    Type::Class(c, _) => *c,
+                    _ => u32::MAX,
+                };
+                PlaceRef::Accessor { o: o.r, class, get: *get, set: *set }
             }
         }
     }
@@ -1985,78 +2173,88 @@ impl FnGen<'_, '_> {
             PlaceRef::Var(v) => {
                 let k = self.var_info(v).kind();
                 match self.home(v) {
-                    Home::S(r) => Op { k, r },
-                    Home::V(r) => Op { k: Kind::Val, r },
+                    Home::Scalar(r) => Op { k, r },
+                    Home::Value(r) => Op { k: Kind::Val, r },
                     Home::Cell(c) => {
                         let d = self.alloc_v();
-                        self.emit(I::CellGet { d, c });
+                        self.emit(Instruction::ReadCell { output: ValSlot(d), cell: ValSlot(c) });
                         Op { k: Kind::Val, r: d }
                     }
-                    Home::Up(i) => {
+                    Home::Capture(i) => {
                         let d = self.alloc_v();
-                        self.emit(I::UpGet { d, i });
+                        self.emit(Instruction::ReadCapture { output: ValSlot(d), capture: i });
                         Op { k: Kind::Val, r: d }
                     }
-                    Home::GS(g) => {
+                    Home::GlobalScalar(g) if k == Kind::Big => {
+                        let d = self.alloc(k);
+                        self.emit(Instruction::ReadGlobalBigInt { output: BigSlot(d.r), global: g });
+                        d
+                    }
+                    Home::GlobalScalar(g) => {
                         let d = self.alloc_s();
-                        self.emit(I::GetGS { d, g });
+                        if k == Kind::Bool {
+                            self.emit(Instruction::ReadGlobalBool { output: BoolSlot(d), global: g });
+                        } else {
+                            self.emit(Instruction::ReadGlobalNumber { output: NumSlot(d), global: g });
+                        }
                         Op { k, r: d }
                     }
-                    Home::GV(g) => {
+                    Home::GlobalValue(g) => {
                         let d = self.alloc_v();
-                        self.emit(I::GetGV { d, g });
+                        self.emit(Instruction::ReadGlobal { output: ValSlot(d), global: g });
                         Op { k: Kind::Val, r: d }
                     }
                 }
             }
-            PlaceRef::Field { o, slot, .. } => {
+            PlaceRef::Field { o, slot, ref name } => {
+                self.note_field(name);
                 if want == Kind::Num {
                     let d = self.alloc_s();
-                    self.emit(I::GetFieldN { d, o, i: slot });
+                    self.emit(Instruction::ReadFieldNumber { output: NumSlot(d), object: ValSlot(o), field: slot });
                     Op { k: Kind::Num, r: d }
                 } else {
                     let d = self.alloc_v();
-                    self.emit(I::GetField { d, o, i: slot });
+                    self.emit(Instruction::ReadField { output: ValSlot(d), object: ValSlot(o), field: slot });
                     Op { k: Kind::Val, r: d }
                 }
             }
             PlaceRef::Prop { o, p } => {
                 let d = self.alloc_v();
-                self.emit(I::GetProp { d, o, p });
+                self.emit(Instruction::ReadProperty { output: ValSlot(d), object: ValSlot(o), property: p });
                 Op { k: Kind::Val, r: d }
             }
             PlaceRef::Index { a, i, k } => {
                 if k == Kind::Num {
                     let d = self.alloc_s();
-                    self.emit(I::GetIdxN { d, a, i });
+                    self.emit(Instruction::ReadElementNumber { output: NumSlot(d), array: ValSlot(a), index: NumSlot(i) });
                     Op { k: Kind::Num, r: d }
                 } else {
                     let d = self.alloc_v();
-                    self.emit(I::GetIdxV { d, a, i });
+                    self.emit(Instruction::ReadElement { output: ValSlot(d), array: ValSlot(a), index: NumSlot(i) });
                     Op { k: Kind::Val, r: d }
                 }
             }
             PlaceRef::Dyn { o, k } => {
                 let d = self.alloc_v();
-                self.emit(I::GetDyn { d, o, k });
+                self.emit(Instruction::ReadDynamic { output: ValSlot(d), object: ValSlot(o), key: ValSlot(k) });
                 Op { k: Kind::Val, r: d }
             }
             PlaceRef::ArrLen { a } => {
                 let d = self.alloc_s();
-                self.emit(I::ArrLen { d, a });
+                self.emit(Instruction::ArrayLength { output: NumSlot(d), array: ValSlot(a) });
                 Op { k: Kind::Num, r: d }
             }
             PlaceRef::StrLen { s } => {
                 let d = self.alloc_s();
-                self.emit(I::StrLen { d, s });
+                self.emit(Instruction::StringLength { output: NumSlot(d), string: ValSlot(s) });
                 Op { k: Kind::Num, r: d }
             }
-            PlaceRef::Accessor { o, get, .. } => {
+            PlaceRef::Accessor { o, class, get, .. } => {
                 let d = self.alloc(if want == Kind::Num { Kind::Num } else { Kind::Val });
                 match get {
-                    Some(slot) => self.method_call_raw(slot, o, vec![], Some(d)),
+                    Some(slot) => self.method_call_raw(class, slot, o, vec![], Some(d)),
                     None => {
-                        self.emit(I::LoadUndef { d: d.r });
+                        self.emit(Instruction::LoadUndefined { output: ValSlot(d.r) });
                     }
                 }
                 d
@@ -2064,50 +2262,56 @@ impl FnGen<'_, '_> {
         }
     }
 
-    /// Virtual call `o.<vtable slot>(args)` with arguments already in registers.
-    fn method_call_raw(&mut self, slot: u32, o: R, args: Vec<(Kind, R)>, dst: Option<Op>) {
+    /// Virtual call `o.<vtable slot>(args)` with arguments already in slots.
+    fn method_call_raw(&mut self, class: u32, slot: u32, o: u16, args: Vec<(Kind, u16)>, dst: Option<Op>) {
         let n = args.len();
-        self.calls.push(CallInfo {
-            target: CallTarget::Method(slot),
-            this: Some(o),
+        self.calls.push(CallSite {
+            target: CallTarget::Method { class, slot },
+            this: Some(ValSlot(o)),
             args,
             spread: vec![false; n],
             has_spread: false,
-            dst: dst.map(|d| (d.k, d.r)),
+            output: dst.map(|d| (d.k, d.r)),
             packed_rest: false,
         });
         let ci = self.calls.len() as u32 - 1;
-        self.emit(I::Call { ci });
+        self.emit(Instruction::Call { site: ci });
     }
 
     fn store_var(&mut self, v: VarId, val: Op) {
         let k = self.var_info(v).kind();
         match self.home(v) {
-            Home::S(r) => {
+            Home::Scalar(r) => {
                 let val = self.coerce(val, k);
                 self.mov(Op { k, r }, val);
             }
-            Home::V(r) => {
+            Home::Value(r) => {
                 let val = self.coerce(val, Kind::Val);
                 self.mov(Op { k: Kind::Val, r }, val);
             }
             Home::Cell(c) => {
                 let val = self.coerce(val, k);
                 let val = self.coerce(val, Kind::Val);
-                self.emit(I::CellSet { c, s: val.r });
+                self.emit(Instruction::WriteCell { cell: ValSlot(c), value: ValSlot(val.r) });
             }
-            Home::Up(i) => {
+            Home::Capture(i) => {
                 let val = self.coerce(val, k);
                 let val = self.coerce(val, Kind::Val);
-                self.emit(I::UpSet { i, s: val.r });
+                self.emit(Instruction::WriteCapture { capture: i, value: ValSlot(val.r) });
             }
-            Home::GS(g) => {
+            Home::GlobalScalar(g) => {
                 let val = self.coerce(val, k);
-                self.emit(I::SetGS { g, s: val.r });
+                if k == Kind::Big {
+                    self.emit(Instruction::WriteGlobalBigInt { global: g, value: BigSlot(val.r) });
+                } else if k == Kind::Bool {
+                    self.emit(Instruction::WriteGlobalBool { global: g, value: BoolSlot(val.r) });
+                } else {
+                    self.emit(Instruction::WriteGlobalNumber { global: g, value: NumSlot(val.r) });
+                }
             }
-            Home::GV(g) => {
+            Home::GlobalValue(g) => {
                 let val = self.coerce(val, Kind::Val);
-                self.emit(I::SetGV { g, s: val.r });
+                self.emit(Instruction::WriteGlobal { global: g, value: ValSlot(val.r) });
             }
         }
     }
@@ -2115,39 +2319,40 @@ impl FnGen<'_, '_> {
     fn store_place(&mut self, p: &PlaceRef, val: Op) {
         match *p {
             PlaceRef::Var(v) => self.store_var(v, val),
-            PlaceRef::Field { o, slot, .. } => {
+            PlaceRef::Field { o, slot, ref name } => {
+                self.note_field(name);
                 if val.k == Kind::Num {
-                    self.emit(I::SetFieldN { o, i: slot, s: val.r });
+                    self.emit(Instruction::WriteFieldNumber { object: ValSlot(o), field: slot, value: NumSlot(val.r) });
                 } else {
                     let val = self.coerce(val, Kind::Val);
-                    self.emit(I::SetField { o, i: slot, s: val.r });
+                    self.emit(Instruction::WriteField { object: ValSlot(o), field: slot, value: ValSlot(val.r) });
                 }
             }
             PlaceRef::Prop { o, p } => {
                 let val = self.coerce(val, Kind::Val);
-                self.emit(I::SetProp { o, p, s: val.r });
+                self.emit(Instruction::WriteProperty { object: ValSlot(o), property: p, value: ValSlot(val.r) });
             }
             PlaceRef::Index { a, i, k } => {
                 if k == Kind::Num {
                     let val = self.coerce(val, Kind::Num);
-                    self.emit(I::SetIdxN { a, i, s: val.r });
+                    self.emit(Instruction::WriteElementNumber { array: ValSlot(a), index: NumSlot(i), value: NumSlot(val.r) });
                 } else {
                     let val = self.coerce(val, Kind::Val);
-                    self.emit(I::SetIdxV { a, i, s: val.r });
+                    self.emit(Instruction::WriteElement { array: ValSlot(a), index: NumSlot(i), value: ValSlot(val.r) });
                 }
             }
             PlaceRef::Dyn { o, k } => {
                 let val = self.coerce(val, Kind::Val);
-                self.emit(I::SetDyn { o, k, s: val.r });
+                self.emit(Instruction::WriteDynamic { object: ValSlot(o), key: ValSlot(k), value: ValSlot(val.r) });
             }
             PlaceRef::ArrLen { a } => {
                 let val = self.coerce(val, Kind::Num);
-                self.emit(I::SetArrLen { a, s: val.r });
+                self.emit(Instruction::SetArrayLength { array: ValSlot(a), length: NumSlot(val.r) });
             }
             PlaceRef::StrLen { .. } => {}
-            PlaceRef::Accessor { o, set, .. } => {
+            PlaceRef::Accessor { o, class, set, .. } => {
                 if let Some(slot) = set {
-                    self.method_call_raw(slot, o, vec![(val.k, val.r)], None);
+                    self.method_call_raw(class, slot, o, vec![(val.k, val.r)], None);
                 }
             }
         }
@@ -2199,10 +2404,10 @@ impl FnGen<'_, '_> {
             let a = self.expr(plain[0]);
             let res = self.alloc_s();
             if one {
-                self.emit(I::Math1 { op: n, d: res, s: a.r });
+                self.emit(Instruction::MathUnary { function: n, output: NumSlot(res), value: NumSlot(a.r) });
             } else {
                 let b = self.expr(plain[1]);
-                self.emit(I::Math2 { op: n, d: res, a: a.r, b: b.r });
+                self.emit(Instruction::MathBinary { function: n, output: NumSlot(res), left: NumSlot(a.r), right: NumSlot(b.r) });
             }
             if let Some(d) = dst {
                 let r = self.coerce(Op { k: Kind::Num, r: res }, d.k);
@@ -2223,17 +2428,17 @@ impl FnGen<'_, '_> {
                 let num_arr = matches!(&c.this.as_ref().unwrap().ty, Type::Array(e) if e.kind() == Kind::Num);
                 let v = self.expr(plain[0]);
                 if num_arr && v.k == Kind::Num {
-                    self.emit(I::PushN { a: t.r, s: v.r });
+                    self.emit(Instruction::PushNumber { array: ValSlot(t.r), value: NumSlot(v.r) });
                 } else {
                     let v = self.coerce(v, Kind::Val);
-                    self.emit(I::PushV { a: t.r, s: v.r });
+                    self.emit(Instruction::PushValue { array: ValSlot(t.r), value: ValSlot(v.r) });
                 }
                 true
             }
             (StrCharCodeAt, Some(t)) if plain.len() == 1 && plain[0].kind() == Kind::Num => {
                 let i = self.expr(plain[0]);
                 let res = self.alloc_s();
-                self.emit(I::CharCodeAt { d: res, s: t.r, i: i.r });
+                self.emit(Instruction::CharCodeAt { output: NumSlot(res), string: ValSlot(t.r), index: NumSlot(i.r) });
                 if let Some(d) = dst {
                     let r = self.coerce(Op { k: Kind::Num, r: res }, d.k);
                     self.mov(d, r);
@@ -2284,7 +2489,7 @@ impl FnGen<'_, '_> {
                 } else {
                     ek == Kind::Num
                 };
-                self.emit(I::NewArr { d, num });
+                self.emit(Instruction::NewArray { output: ValSlot(d), numbers: num });
                 Some(Op { k: Kind::Val, r: d })
             }
             ArrReduce => {
@@ -2302,9 +2507,9 @@ impl FnGen<'_, '_> {
         };
         let _ = map_num;
         let len = self.alloc_s();
-        self.emit(I::ArrLen { d: len, a: arr.r });
+        self.emit(Instruction::ArrayLength { output: NumSlot(len), array: ValSlot(arr.r) });
         let i = self.alloc_s();
-        self.emit(I::LoadN { d: i, v: 0.0 });
+        self.emit(Instruction::LoadNumber { output: NumSlot(i), value: 0.0 });
         let found = match n {
             ArrSome | ArrEvery | ArrFind | ArrFindIndex => {
                 let d = self.alloc(res_kind);
@@ -2317,12 +2522,12 @@ impl FnGen<'_, '_> {
         let m = self.mark();
         let x = self.alloc(ek);
         if ek == Kind::Num {
-            self.emit(I::GetIdxN { d: x.r, a: arr.r, i });
+            self.emit(Instruction::ReadElementNumber { output: NumSlot(x.r), array: ValSlot(arr.r), index: NumSlot(i) });
         } else {
-            self.emit(I::GetIdxV { d: x.r, a: arr.r, i });
+            self.emit(Instruction::ReadElement { output: ValSlot(x.r), array: ValSlot(arr.r), index: NumSlot(i) });
         }
         // Arguments in the callback's parameter kinds (exact for the common case).
-        let mut cargs: Vec<(Kind, R)> = Vec::new();
+        let mut cargs: Vec<(Kind, u16)> = Vec::new();
         let mut push_arg = |g: &mut Self, idx: usize, o: Op| {
             let k = cb_param_kinds.get(idx).copied().unwrap_or(o.k);
             let o = g.coerce(o, k);
@@ -2363,17 +2568,17 @@ impl FnGen<'_, '_> {
             self.inline_call(fid, &args, out);
         } else {
             let spread = vec![false; cargs.len()];
-            self.calls.push(CallInfo {
-                target: CallTarget::Value(f.r),
+            self.calls.push(CallSite {
+                target: CallTarget::Value(ValSlot(f.r)),
                 this: None,
                 args: cargs,
                 spread,
                 has_spread: false,
-                dst: out.map(|o| (o.k, o.r)),
+                output: out.map(|o| (o.k, o.r)),
                 packed_rest: false,
             });
             let ci = self.calls.len() as u32 - 1;
-            self.emit(I::Call { ci });
+            self.emit(Instruction::Call { site: ci });
         }
         let mut early = None;
         match n {
@@ -2381,20 +2586,20 @@ impl FnGen<'_, '_> {
                 let o = out.unwrap();
                 let r = res.unwrap();
                 if o.k == Kind::Num {
-                    self.emit(I::PushN { a: r.r, s: o.r });
+                    self.emit(Instruction::PushNumber { array: ValSlot(r.r), value: NumSlot(o.r) });
                 } else {
-                    self.emit(I::PushV { a: r.r, s: o.r });
+                    self.emit(Instruction::PushValue { array: ValSlot(r.r), value: ValSlot(o.r) });
                 }
             }
             ArrFilter => {
                 let o = out.unwrap();
                 let t = self.truthy(o);
-                let skip = self.emit(I::JmpF { c: t.r, t: 0 });
+                let skip = self.emit(Instruction::JumpIf { when: false, condition: BoolSlot(t.r), to: 0 });
                 let r = res.unwrap();
                 if x.k == Kind::Num {
-                    self.emit(I::PushN { a: r.r, s: x.r });
+                    self.emit(Instruction::PushNumber { array: ValSlot(r.r), value: NumSlot(x.r) });
                 } else {
-                    self.emit(I::PushV { a: r.r, s: x.r });
+                    self.emit(Instruction::PushValue { array: ValSlot(r.r), value: ValSlot(x.r) });
                 }
                 self.patch_here(skip);
             }
@@ -2402,24 +2607,18 @@ impl FnGen<'_, '_> {
                 let o = out.unwrap();
                 let t = self.truthy(o);
                 let j = if n == ArrEvery {
-                    self.emit(I::JmpF { c: t.r, t: 0 })
+                    self.emit(Instruction::JumpIf { when: false, condition: BoolSlot(t.r), to: 0 })
                 } else {
-                    self.emit(I::JmpT { c: t.r, t: 0 })
+                    self.emit(Instruction::JumpIf { when: true, condition: BoolSlot(t.r), to: 0 })
                 };
                 early = Some((j, x));
             }
             _ => {}
         }
         self.reset(m);
-        self.emit(I::AddNK { d: i, a: i, k: 1.0 });
+        self.emit(Instruction::AddConstant { output: NumSlot(i), left: NumSlot(i), constant: 1.0 });
         self.patch_here(to_test);
-        self.emit(I::JCmpN {
-            op: CmpOp::Lt,
-            sense: true,
-            a: i,
-            b: len,
-            t: top,
-        });
+        self.emit(Instruction::JumpIfCompare { op: CmpOp::Lt, when: true, left: NumSlot(i), right: NumSlot(len), to: top });
         // Loop finished without an early exit.
         let fd = found;
         match n {
@@ -2427,16 +2626,12 @@ impl FnGen<'_, '_> {
             ArrEvery => self.load_bool(fd.unwrap(), true),
             ArrFind => {
                 let d = fd.unwrap();
-                match d.k {
-                    Kind::Val => self.emit(I::LoadUndef { d: d.r }),
-                    Kind::Num => self.emit(I::LoadN { d: d.r, v: f64::NAN }),
-                    Kind::Bool => self.emit(I::LoadB { d: d.r, v: false }),
-                };
+                self.load_default(d);
             }
             ArrFindIndex => {
                 let d = fd.unwrap();
                 let o = self.alloc_s();
-                self.emit(I::LoadN { d: o, v: -1.0 });
+                self.emit(Instruction::LoadNumber { output: NumSlot(o), value: -1.0 });
                 let o = self.coerce(Op { k: Kind::Num, r: o }, d.k);
                 self.mov(d, o);
             }
@@ -2450,12 +2645,12 @@ impl FnGen<'_, '_> {
                 ArrSome => self.load_bool(d, true),
                 ArrEvery => self.load_bool(d, false),
                 ArrFind => {
-                    // x's register was released; re-read the element.
+                    // x's slot was released; re-read the element.
                     let xr = self.alloc(ek);
                     if ek == Kind::Num {
-                        self.emit(I::GetIdxN { d: xr.r, a: arr.r, i });
+                        self.emit(Instruction::ReadElementNumber { output: NumSlot(xr.r), array: ValSlot(arr.r), index: NumSlot(i) });
                     } else {
-                        self.emit(I::GetIdxV { d: xr.r, a: arr.r, i });
+                        self.emit(Instruction::ReadElement { output: ValSlot(xr.r), array: ValSlot(arr.r), index: NumSlot(i) });
                     }
                     let o = self.coerce(xr, d.k);
                     self.mov(d, o);
@@ -2475,7 +2670,7 @@ impl FnGen<'_, '_> {
                 ArrSome | ArrEvery | ArrFind | ArrFindIndex => fd.unwrap(),
                 _ => {
                     let u = self.alloc_v();
-                    self.emit(I::LoadUndef { d: u });
+                    self.emit(Instruction::LoadUndefined { output: ValSlot(u) });
                     Op { k: Kind::Val, r: u }
                 }
             };
@@ -2495,9 +2690,13 @@ impl FnGen<'_, '_> {
 
     fn load_default(&mut self, o: Op) {
         match o.k {
-            Kind::Val => self.emit(I::LoadUndef { d: o.r }),
-            Kind::Num => self.emit(I::LoadN { d: o.r, v: f64::NAN }),
-            Kind::Bool => self.emit(I::LoadB { d: o.r, v: false }),
+            Kind::Val => self.emit(Instruction::LoadUndefined { output: ValSlot(o.r) }),
+            Kind::Num => self.emit(Instruction::LoadNumber { output: NumSlot(o.r), value: f64::NAN }),
+            Kind::Bool => self.emit(Instruction::LoadBool { output: BoolSlot(o.r), value: false }),
+            Kind::Big => {
+                self.load_big(0, o.r);
+                0
+            }
         };
     }
 
@@ -2515,18 +2714,18 @@ impl FnGen<'_, '_> {
                 && let Some(a) = arg
                 && a.k == info.kind()
             {
-                self.homes.insert(p.var, if a.k == Kind::Val { Home::V(a.r) } else { Home::S(a.r) });
+                self.set_home(p.var, if a.k == Kind::Val { Home::Value(a.r) } else { Home::Scalar(a.r) });
                 continue;
             }
             if info.captured {
                 let c = self.alloc_v();
-                self.emit(I::NewCell { d: c });
+                self.emit(Instruction::NewCell { output: ValSlot(c) });
                 if let Some(a) = arg {
                     let a = self.coerce(a, info.kind());
                     let a = self.coerce(a, Kind::Val);
-                    self.emit(I::CellSet { c, s: a.r });
+                    self.emit(Instruction::WriteCell { cell: ValSlot(c), value: ValSlot(a.r) });
                 }
-                self.homes.insert(p.var, Home::Cell(c));
+                self.set_home(p.var, Home::Cell(c));
             } else {
                 let h = self.alloc(info.kind());
                 match arg {
@@ -2536,7 +2735,7 @@ impl FnGen<'_, '_> {
                     }
                     None => self.load_default(h),
                 }
-                self.homes.insert(p.var, if h.k == Kind::Val { Home::V(h.r) } else { Home::S(h.r) });
+                self.set_home(p.var, if h.k == Kind::Val { Home::Value(h.r) } else { Home::Scalar(h.r) });
             }
         }
         // A body that is a single `return e` needs no default for falling off the end.
@@ -2562,17 +2761,27 @@ impl FnGen<'_, '_> {
         self.reset(m);
     }
 
+    /// A BigInt's truthiness as a boolean; other kinds unchanged.
+    fn big_truthy(&mut self, o: Op) -> Op {
+        if o.k == Kind::Big { self.truthy(o) } else { o }
+    }
+
     fn truthy(&mut self, o: Op) -> Op {
         match o.k {
             Kind::Bool => o,
+            Kind::Big => {
+                let d = self.alloc_s();
+                self.emit(Instruction::BigIntIsTruthy { output: BoolSlot(d), value: BigSlot(o.r) });
+                Op { k: Kind::Bool, r: d }
+            }
             Kind::Num => {
                 let d = self.alloc_s();
-                self.emit(I::TruthyN { d, s: o.r });
+                self.emit(Instruction::NumberIsTruthy { output: BoolSlot(d), value: NumSlot(o.r) });
                 Op { k: Kind::Bool, r: d }
             }
             Kind::Val => {
                 let d = self.alloc_s();
-                self.emit(I::TruthyV { d, s: o.r });
+                self.emit(Instruction::IsTruthy { output: BoolSlot(d), value: ValSlot(o.r) });
                 Op { k: Kind::Bool, r: d }
             }
         }
@@ -2580,12 +2789,12 @@ impl FnGen<'_, '_> {
 
     fn load_bool(&mut self, d: Op, v: bool) {
         let t = self.alloc_s();
-        self.emit(I::LoadB { d: t, v });
+        self.emit(Instruction::LoadBool { output: BoolSlot(t), value: v });
         let o = self.coerce(Op { k: Kind::Bool, r: t }, d.k);
         self.mov(d, o);
     }
 
-    fn call_with_this(&mut self, c: &HCall, this: Option<R>, dst: Option<Op>) {
+    fn call_with_this(&mut self, c: &HCall, this: Option<u16>, dst: Option<Op>) {
         let (target, param_kinds, rest, pack) = match &c.callee {
             Callee::Direct { func, closure } => {
                 let hf = &self.cg.hir.funcs[*func as usize];
@@ -2595,7 +2804,7 @@ impl FnGen<'_, '_> {
                     Some(v) => {
                         let o = self.load_place(&PlaceRef::Var(v), Kind::Val);
                         let o = self.coerce(o, Kind::Val);
-                        CallTarget::Value(o.r)
+                        CallTarget::Value(ValSlot(o.r))
                     }
                     None => CallTarget::Direct(*func),
                 };
@@ -2607,12 +2816,17 @@ impl FnGen<'_, '_> {
                 if c.opt {
                     self.opt_check(o, true);
                 }
-                (CallTarget::Value(o.r), c.param_kinds.clone(), false, false)
+                (CallTarget::Value(ValSlot(o.r)), c.param_kinds.clone(), false, false)
             }
-            Callee::Method { vslot, .. } => (CallTarget::Method(*vslot), c.param_kinds.clone(), c.rest_at.is_some(), true),
+            Callee::Method { class, vslot } => (
+                CallTarget::Method { class: *class, slot: *vslot },
+                c.param_kinds.clone(),
+                c.rest_at.is_some(),
+                true,
+            ),
             Callee::Prop(name) => {
                 let p = self.prop_site(name);
-                (CallTarget::Prop(p), c.param_kinds.clone(), false, false)
+                (CallTarget::Property(p), c.param_kinds.clone(), false, false)
             }
             Callee::Native(n) => (CallTarget::Native(*n), None, false, false),
         };
@@ -2624,26 +2838,26 @@ impl FnGen<'_, '_> {
             None
         };
         let mut i = 0;
-        let mut rest_arr: Option<R> = None;
+        let mut rest_arr: Option<u16> = None;
         for a in &c.args {
             if let Some(ra) = rest_at
                 && i >= ra
             {
                 let arr = *rest_arr.get_or_insert_with(|| {
                     let d = self.alloc_v();
-                    self.code.push(I::NewArr { d, num: false });
+                    self.code.push(Instruction::NewArray { output: ValSlot(d), numbers: false });
                     d
                 });
                 match a {
                     HElem::Expr(e) => {
                         let o = self.expr(e);
                         let o = self.coerce(o, Kind::Val);
-                        self.emit(I::PushV { a: arr, s: o.r });
+                        self.emit(Instruction::PushValue { array: ValSlot(arr), value: ValSlot(o.r) });
                     }
                     HElem::Spread(e) => {
                         let o = self.expr(e);
                         let o = self.coerce(o, Kind::Val);
-                        self.emit(I::PushSpread { a: arr, s: o.r });
+                        self.emit(Instruction::PushSpread { array: ValSlot(arr), source: ValSlot(o.r) });
                     }
                 }
                 i += 1;
@@ -2671,40 +2885,36 @@ impl FnGen<'_, '_> {
             while args.len() < ra {
                 let k = param_kinds.as_ref().unwrap()[args.len()];
                 let o = self.alloc(k);
-                match k {
-                    Kind::Val => self.emit(I::LoadUndef { d: o.r }),
-                    Kind::Num => self.emit(I::LoadN { d: o.r, v: f64::NAN }),
-                    Kind::Bool => self.emit(I::LoadB { d: o.r, v: false }),
-                };
+                self.load_default(o);
                 args.push((k, o.r));
                 spread.push(false);
             }
             let arr = rest_arr.unwrap_or_else(|| {
                 let d = self.alloc_v();
-                self.emit(I::NewArr { d, num: false });
+                self.emit(Instruction::NewArray { output: ValSlot(d), numbers: false });
                 d
             });
             args.push((Kind::Val, arr));
             spread.push(false);
         }
-        let ci = CallInfo {
+        let ci = CallSite {
             target,
-            this,
+            this: this.map(ValSlot),
             args,
             has_spread: spread.iter().any(|x| *x),
             spread,
-            dst: dst.map(|d| (d.k, d.r)),
+            output: dst.map(|d| (d.k, d.r)),
             packed_rest: rest_at.is_some(),
         };
         self.calls.push(ci);
         let ci = self.calls.len() as u32 - 1;
-        self.emit(I::Call { ci });
+        self.emit(Instruction::Call { site: ci });
     }
 }
 
 // ───────────── HIR walkers ─────────────
 
-/// Numeric literals used inside loops (worth a dedicated register).
+/// Numeric literals used inside loops (worth a dedicated slot).
 fn collect_loop_nums(s: &HStmt, out: &mut Vec<f64>, hir: &HProgram) {
     match s {
         HStmt::Loop { .. } | HStmt::ForOf { .. } | HStmt::ForIn { .. } => collect_nums_stmt(s, out, hir),
@@ -2858,30 +3068,28 @@ fn c_ret_elem(args: &[HElem], n: Native, _elem: &Type) -> Option<Kind> {
     }
 }
 
-fn jump_target(i: &mut I) -> Option<&mut u32> {
+fn jump_target(i: &mut Instruction) -> Option<&mut u32> {
     match i {
-        I::Jmp { t }
-        | I::JmpT { t, .. }
-        | I::JmpF { t, .. }
-        | I::JCmpN { t, .. }
-        | I::JmpTV { t, .. }
-        | I::JmpFV { t, .. }
-        | I::JmpNullish { t, .. }
-        | I::JmpNotNullish { t, .. } => Some(t),
-        I::TryBegin { catch, .. } => Some(catch),
+        Instruction::Jump { to: t }
+        | Instruction::JumpIf { to: t, .. }
+        | Instruction::JumpIfCompare { to: t, .. }
+        | Instruction::JumpIfTruthy { to: t, .. }
+        | Instruction::JumpIfNullish { to: t, .. } => Some(t),
+        Instruction::TryBegin { catch, .. } => Some(catch),
         _ => None,
     }
 }
 
 /// Remove unconditional jumps to the next instruction and thread jumps to jumps.
-fn peephole(code: &mut Vec<I>) {
+/// Returns the old → new instruction index map when instructions were removed.
+fn peephole(code: &mut Vec<Instruction>) -> Option<Vec<u32>> {
     // Thread: a jump whose target is an unconditional jump goes straight to its target.
     for i in 0..code.len() {
         let mut ins = code[i];
         if let Some(t) = jump_target(&mut ins) {
             let mut tgt = *t;
             let mut hops = 0;
-            while let I::Jmp { t: next } = code[tgt as usize] {
+            while let Instruction::Jump { to: next } = code[tgt as usize] {
                 if next == tgt || hops > 8 {
                     break;
                 }
@@ -2895,10 +3103,10 @@ fn peephole(code: &mut Vec<I>) {
     let keep: Vec<bool> = code
         .iter()
         .enumerate()
-        .map(|(i, ins)| !matches!(ins, I::Jmp { t } if *t as usize == i + 1))
+        .map(|(i, ins)| !matches!(ins, Instruction::Jump { to: t } if *t as usize == i + 1))
         .collect();
     if keep.iter().all(|k| *k) {
-        return;
+        return None;
     }
     let mut new_index = Vec::with_capacity(code.len() + 1);
     let mut n = 0u32;
@@ -2920,4 +3128,5 @@ fn peephole(code: &mut Vec<I>) {
         out.push(ins);
     }
     *code = out;
+    Some(new_index)
 }

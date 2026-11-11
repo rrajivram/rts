@@ -40,12 +40,7 @@ fn main() -> ExitCode {
         }
     };
     if dump {
-        for (i, f) in prog.funcs.iter().enumerate() {
-            println!("fn #{i} {} (ns={}, nv={}, params={:?})", f.name, f.ns, f.nv, f.params);
-            for (pc, ins) in f.code.iter().enumerate() {
-                println!("  {pc:4}  {ins:?}");
-            }
-        }
+        print!("{}", rts::disasm::dump(&prog, false));
         return ExitCode::SUCCESS;
     }
     let mut vm = Vm::new(prog);

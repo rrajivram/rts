@@ -312,7 +312,7 @@ pub fn check_program(prelude: &[ast::Stmt], program: &[ast::Stmt], erase: bool) 
     let all: Vec<ast::Stmt> = prelude.iter().chain(program.iter()).cloned().collect();
     let body = c.check_block_in(&all, module.clone())?;
     c.stack.pop();
-    // Module variables only used by top-level code live in main's registers.
+    // Module variables only used by top-level code live in main's slots.
     let mut demoted = Vec::new();
     for v in module.decls.borrow().iter() {
         let i = *v as usize;
@@ -608,6 +608,7 @@ impl Checker {
         }
         Ok(match &**name {
             "number" => Type::Number,
+            "bigint" => Type::BigInt,
             "string" => Type::String,
             "boolean" => Type::Boolean,
             "void" => Type::Void,
@@ -673,7 +674,7 @@ impl Checker {
                 _ => Type::Any,
             },
             "Promise" | "PromiseLike" => return err("Promise types are not supported yet (no async)", span),
-            "symbol" | "bigint" | "Symbol" => return err(format!("'{name}' is not supported"), span),
+            "symbol" | "Symbol" => return err(format!("'{name}' is not supported"), span),
             "Iterable" | "IterableIterator" | "Iterator" | "ArrayLike" => Type::array(arg(0)),
             _ => return err(format!("cannot find type '{name}'"), span),
         })
@@ -1160,6 +1161,7 @@ impl Checker {
     fn literal_type(&self, e: &ast::Expr) -> Option<Type> {
         Some(match &e.kind {
             ast::ExprKind::Num(_) => Type::Number,
+            ast::ExprKind::BigInt(_) => Type::BigInt,
             ast::ExprKind::Str(_) | ast::ExprKind::Template { .. } => Type::String,
             ast::ExprKind::Bool(_) => Type::Boolean,
             ast::ExprKind::Unary(ast::UnaryOp::Neg, _) => Type::Number,
@@ -1872,6 +1874,7 @@ impl Checker {
                 fields: c.fields.iter().map(|f| f.name.clone()).collect(),
                 vtable: c.vtable.clone(),
                 ctor: c.ctor,
+                prelude: c.prelude_error,
             });
         }
         Ok(HProgram {

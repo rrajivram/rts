@@ -1,7 +1,8 @@
 //! Run-time values. All heap values are reference counted (`Rc`); there is no
-//! tracing garbage collector. Numbers and booleans in typed code never reach
-//! this module — they live unboxed in the VM's scalar registers.
+//! tracing garbage collector. Numbers, booleans and BigInts in typed code never
+//! reach this module — they live unboxed in the VM's number and boolean slots.
 
+pub mod bigint;
 pub mod natives;
 
 use std::cell::RefCell;
@@ -306,6 +307,10 @@ impl Hash for HKey {
                 s.s.hash(h);
             }
             Value::Bool(b) => b.hash(h),
+            Value::BigInt(n) => {
+                4u8.hash(h);
+                n.hash(h);
+            }
             Value::Undef => 2u8.hash(h),
             Value::Null => 3u8.hash(h),
             v => v.ptr_id().hash(h),
@@ -323,6 +328,8 @@ pub enum Value {
     Null,
     Bool(bool),
     Num(f64),
+    /// Boxed so the rare BigInt doesn't make every value 16-byte aligned.
+    BigInt(Rc<i128>),
     Str(Rc<JsStr>),
     Arr(Rc<Array>),
     Obj(Rc<Object>),
@@ -339,7 +346,7 @@ pub enum Value {
 const _: () = assert!(std::mem::size_of::<Value>() == 16);
 
 impl Value {
-    /// Drop a register's heap reference, if it holds one. Registers holding
+    /// Drop a slot's heap reference, if it holds one. Slots holding
     /// primitives keep their stale contents: nothing to free, nothing to do.
     #[inline(always)]
     pub fn release(&mut self) {
@@ -352,6 +359,10 @@ impl Value {
 impl Value {
     pub fn str(s: impl Into<Box<str>>) -> Value {
         Value::Str(JsStr::new(s))
+    }
+
+    pub fn bigint(n: i128) -> Value {
+        Value::BigInt(Rc::new(n))
     }
 
     pub fn ptr_id(&self) -> usize {
@@ -374,6 +385,7 @@ impl Value {
             Value::Undef | Value::Null => false,
             Value::Bool(b) => *b,
             Value::Num(n) => *n != 0.0 && !n.is_nan(),
+            Value::BigInt(n) => **n != 0,
             Value::Str(s) => !s.s.is_empty(),
             _ => true,
         }
@@ -388,6 +400,7 @@ impl Value {
             (Value::Undef, Value::Undef) | (Value::Null, Value::Null) => true,
             (Value::Bool(a), Value::Bool(b)) => a == b,
             (Value::Num(a), Value::Num(b)) => a == b,
+            (Value::BigInt(a), Value::BigInt(b)) => a == b,
             (Value::Str(a), Value::Str(b)) => Rc::ptr_eq(a, b) || a.s == b.s,
             (Value::Native(a), Value::Native(b)) => a == b,
             (a, b) => {
@@ -400,6 +413,11 @@ impl Value {
         match (self, other) {
             (a, b) if a.is_nullish() && b.is_nullish() => true,
             (a, b) if a.is_nullish() || b.is_nullish() => false,
+            (Value::BigInt(a), b) | (b, Value::BigInt(a)) if !matches!(b, Value::BigInt(_)) => match b {
+                Value::Str(s) => bigint::parse(&s.s) == Some(**a),
+                Value::Obj(_) | Value::Arr(_) => bigint::parse(&b.to_display()) == Some(**a),
+                b => bigint::cmp_number(**a, b.to_number()).is_some_and(|o| o.is_eq()),
+            },
             (Value::Num(_), Value::Str(_)) | (Value::Str(_), Value::Num(_)) | (Value::Bool(_), _) | (_, Value::Bool(_))
                 if !matches!((self, other), (Value::Bool(_), Value::Bool(_))) =>
             {
@@ -410,9 +428,12 @@ impl Value {
         }
     }
 
+    /// ToNumber, except that a BigInt converts to the nearest Number (as
+    /// `Number(x)` does) instead of throwing; operators check for BigInts first.
     pub fn to_number(&self) -> f64 {
         match self {
             Value::Num(n) => *n,
+            Value::BigInt(n) => **n as f64,
             Value::Bool(b) => *b as u8 as f64,
             Value::Undef => f64::NAN,
             Value::Null => 0.0,
@@ -432,6 +453,7 @@ impl Value {
             Value::Null => "object",
             Value::Bool(_) => "boolean",
             Value::Num(_) => "number",
+            Value::BigInt(_) => "bigint",
             Value::Str(_) => "string",
             Value::Func(_) | Value::Class(_) | Value::Native(_) => "function",
             _ => "object",
@@ -452,6 +474,7 @@ impl Value {
             Value::Null => "null".into(),
             Value::Bool(b) => b.to_string(),
             Value::Num(n) => num_to_string(*n),
+            Value::BigInt(n) => n.to_string(),
             Value::Str(s) => s.s.to_string(),
             Value::Arr(a) => a
                 .to_vec()
@@ -619,6 +642,7 @@ impl Insp<'_> {
         match v {
             Value::Str(s) => quote_str(&s.s),
             Value::Num(n) if *n == 0.0 && n.is_sign_negative() => "-0".into(),
+            Value::BigInt(n) => format!("{n}n"),
             Value::Func(f) => {
                 let name = (self.funcs)(f.func);
                 if name.is_empty() {
