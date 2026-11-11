@@ -2171,12 +2171,14 @@ impl Checker {
         let mut error_class = None;
         let mut type_error_class = None;
         let mut range_error_class = None;
+        let mut syntax_error_class = None;
         for (i, c) in self.classes.iter().enumerate() {
             if c.prelude_error {
                 match &*c.name {
                     "Error" => error_class = Some(i as u32),
                     "TypeError" => type_error_class = Some(i as u32),
                     "RangeError" => range_error_class = Some(i as u32),
+                    "SyntaxError" => syntax_error_class = Some(i as u32),
                     _ => {}
                 }
             }
@@ -2197,6 +2199,7 @@ impl Checker {
             error_class,
             type_error_class,
             range_error_class,
+            syntax_error_class,
         })
     }
 }

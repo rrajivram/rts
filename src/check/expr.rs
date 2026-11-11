@@ -1055,7 +1055,7 @@ impl Checker {
     /// `h.prop` for an already-checked receiver.
     pub fn member_read(&mut self, h: HExpr, prop: &Name, opt: bool, span: Span) -> CResult<HExpr> {
         let t = self.norm(&h.ty.non_null());
-        if let Type::Deferred(_) = t {
+        if let Type::Deferred(_) | Type::Never = t {
             return Ok(HExpr::read(Place::Prop { obj: h, name: prop.clone(), opt }, Type::Any));
         }
         // `T extends { length: number }`: read through the constraint.
@@ -1073,6 +1073,12 @@ impl Checker {
             }
             Type::String | Type::StrLit(_) if &**prop == "length" => {
                 return Ok(HExpr::read(Place::StrLen { obj: h, opt }, wrap_opt(Type::Number)));
+            }
+            Type::Class(..) | Type::Object(_) | Type::Iface(..) if &**prop == "constructor" => {
+                return Ok(HExpr::read(Place::Prop { obj: h, name: prop.clone(), opt }, Type::Any));
+            }
+            Type::ClassCtor(_) if &**prop == "name" => {
+                return Ok(HExpr::read(Place::Prop { obj: h, name: prop.clone(), opt }, Type::String));
             }
             // Properties added to a function object (`assert.ok = ok`).
             Type::Func(_) if !matches!(&**prop, "bind" | "call" | "apply") => {
@@ -1826,6 +1832,19 @@ impl Checker {
                 self.infer(&pv.clone(), &av.clone(), tps, subst);
             }
             (Type::Set(pk), Type::Set(ak)) => self.infer(&pk.clone(), &ak.clone(), tps, subst),
+            (Type::Promise(pt), Type::Promise(at)) => self.infer(&pt.clone(), &at.clone(), tps, subst),
+            (Type::Promise(pt), a) if !matches!(a, Type::Promise(_)) => self.infer(&pt.clone(), a, tps, subst),
+            (Type::Iter(pi), Type::Iter(ai)) => {
+                let (pi, ai) = (pi.clone(), ai.clone());
+                self.infer(&pi.yield_ty, &ai.yield_ty, tps, subst);
+                self.infer(&pi.return_ty, &ai.return_ty, tps, subst);
+            }
+            (Type::Iter(pi), a) if pi.kind == IterKind::Iterable => {
+                if let Some(e) = self.iter_elem(a) {
+                    let pi = pi.clone();
+                    self.infer(&pi.yield_ty, &e, tps, subst);
+                }
+            }
             (Type::Class(pc, pa), Type::Class(ac, aa)) if pc == ac => {
                 for (x, y) in pa.clone().iter().zip(aa.clone().iter()) {
                     self.infer(x, y, tps, subst);

@@ -1349,7 +1349,7 @@ impl Parser {
                 self.bump();
                 Ok(TypeExpr::StrLit(s))
             }
-            Tok::Template { quasis, exprs } if exprs.is_empty() => {
+            Tok::Template { quasis, exprs, .. } if exprs.is_empty() => {
                 self.bump();
                 Ok(TypeExpr::StrLit(quasis[0].clone()))
             }
@@ -1954,14 +1954,14 @@ impl Parser {
             } else if self.is("!") && !self.nl_before() && !self.is_at(1, "=") {
                 self.bump();
                 e = Self::mk(ExprKind::NonNull(Box::new(e)), start.to(self.prev_span()));
-            } else if let Tok::Template { quasis, exprs } = self.tok().clone() {
+            } else if let Tok::Template { quasis, exprs, raws } = self.tok().clone() {
                 // tag`a${x}b` → tag(<strings array>, x)
                 self.bump();
                 let tspan = start.to(self.prev_span());
                 let lit = |kind: ExprKind| ArrayElem::Expr(Self::mk(kind, tspan));
                 let mut strings = vec![lit(ExprKind::Num(quasis.len() as f64))];
                 strings.extend(quasis.iter().map(|q| lit(ExprKind::Str(q.clone()))));
-                strings.extend(quasis.iter().map(|q| lit(ExprKind::Str(q.clone()))));
+                strings.extend(raws.iter().map(|q| lit(ExprKind::Str(q.clone()))));
                 let template_object = Self::mk(
                     ExprKind::Call {
                         callee: Box::new(Self::mk(ExprKind::Ident("\u{1}templateObject".into()), tspan)),
@@ -2073,7 +2073,7 @@ impl Parser {
                 self.bump();
                 Ok(Self::mk(ExprKind::Regex(pattern, flags), start))
             }
-            Tok::Template { quasis, exprs } => {
+            Tok::Template { quasis, exprs, .. } => {
                 self.bump();
                 let mut es = Vec::new();
                 for toks in exprs {

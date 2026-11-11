@@ -15,6 +15,8 @@ pub enum Tok {
     Template {
         quasis: Vec<Rc<str>>,
         exprs: Vec<Vec<Token>>,
+        /// The quasis as written, escapes unprocessed (`String.raw`).
+        raws: Vec<Rc<str>>,
     },
     Ident(Rc<str>),
     /// `/pattern/flags`
@@ -381,6 +383,8 @@ impl<'a> Lexer<'a> {
         self.pos += 1;
         let mut quasis = Vec::new();
         let mut exprs = Vec::new();
+        let mut raws = Vec::new();
+        let mut raw_start = self.pos;
         let mut cur = String::new();
         loop {
             if self.pos >= self.src.len() {
@@ -388,9 +392,10 @@ impl<'a> Lexer<'a> {
             }
             let c = self.peek(0);
             if c == b'`' {
+                raws.push(self.text[raw_start..self.pos].into());
                 self.pos += 1;
                 quasis.push(cur.into());
-                return Ok(Tok::Template { quasis, exprs });
+                return Ok(Tok::Template { quasis, exprs, raws });
             }
             if c == b'\\' {
                 self.pos += 1;
@@ -398,6 +403,7 @@ impl<'a> Lexer<'a> {
                 continue;
             }
             if c == b'$' && self.peek(1) == b'{' {
+                raws.push(self.text[raw_start..self.pos].into());
                 self.pos += 2;
                 quasis.push(std::mem::take(&mut cur).into());
                 let mut sub = Lexer {
@@ -414,6 +420,7 @@ impl<'a> Lexer<'a> {
                     nl_before: true,
                 });
                 self.pos = sub.pos;
+                raw_start = self.pos;
                 exprs.push(toks);
                 continue;
             }

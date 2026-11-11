@@ -129,7 +129,7 @@ pub fn compile(hir: &HProgram) -> Program {
         error_class: hir.error_class,
         type_error_class: hir.type_error_class,
         range_error_class: hir.range_error_class,
-        syntax_error_class: None,
+        syntax_error_class: hir.syntax_error_class,
     }
 }
 

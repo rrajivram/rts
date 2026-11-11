@@ -3,13 +3,15 @@
 rts is a TypeScript runtime written in Rust. It has **no garbage collector**
 and **uses static types to choose storage and instructions ahead of time**.
 
-This is a proof of concept. It runs a useful subset of TypeScript directly from
-source, with no transpile step. The long-term goal is to run arbitrary npm
-packages.
+This is a proof of concept. It runs TypeScript (and plain JavaScript)
+directly from source, with no transpile step: ES modules and CommonJS,
+generators, async/await with Node's event loop ordering, regular
+expressions, and the commonly used parts of Node's built-in modules. The
+long-term goal is to run arbitrary npm packages.
 
 ```sh
 cargo build --release
-./target/release/rts program.ts           # run
+./target/release/rts program.ts [args…]   # run (imports are loaded from disk)
 ./target/release/rts --dump program.ts    # show the typed bytecode
 ./target/release/rts --no-types program.ts  # ignore all type information (experiment)
 tests/run.sh                              # conformance tests (compared against Node)
@@ -45,6 +47,15 @@ See [DESIGN.md](DESIGN.md) for details. In short:
   Structural types and `any` use shape-keyed inline caches.
 - **Arrays.** `number[]` uses `Vec<f64>` storage. It degrades to `Vec<Value>`
   if something writes a non-number into it through `any`.
+- **Modules.** The checker is whole-program: every module is a scope, and an
+  import binds the importing scope's name to the exporting module's own
+  variable. Imports are live bindings with no run-time lookup, and a typed
+  export stays typed across files.
+- **Generators and async functions** run in ordinary frames. `yield` and
+  `await` move the frame's slots into a heap `Coroutine`, and resuming moves
+  them back, so a generator's `number` locals stay unboxed while it is
+  suspended. Promises, microtasks and timers follow the ECMAScript job model:
+  callback order matches Node.
 
 ### Optimizations that rely on knowing types
 
@@ -118,19 +129,18 @@ V8's interpreter (`node --jitless`) is shown for reference.
 
 | program | typed | untyped | **types buy** | node --jitless |
 |---|---:|---:|---:|---:|
-| array_sum | 60.6 ms | 191.8 ms | **3.2×** | 187.6 ms |
-| complex | 8.3 ms | 26.1 ms | **3.1×** | 58.4 ms |
-| closures (map/filter/reduce) | 135.5 ms | 396.0 ms | **2.9×** | 184.4 ms |
-| nbody | 225.6 ms | 566.8 ms | **2.5×** | 462.6 ms |
-| strings | 43.5 ms | 102.7 ms | **2.4×** | 110.0 ms |
-| fib | 59.0 ms | 116.8 ms | **2.0×** | 85.0 ms |
-| loop | 91.2 ms | 177.5 ms | **1.9×** | 129.2 ms |
-| complex_untyped (only inferred types) | 15.0 ms | 26.0 ms | **1.7×** | 59.0 ms |
-| alloc_churn | 311.3 ms | 497.6 ms | **1.6×** | 359.5 ms |
-| bigint | 67.7 ms | 189.7 ms | **2.8×** | 190.5 ms |
+| array_sum | 65.3 ms | 189.7 ms | **2.9×** | 188.9 ms |
+| complex | 9.9 ms | 24.4 ms | **2.5×** | 57.8 ms |
+| closures (map/filter/reduce) | 139.3 ms | 433.4 ms | **3.1×** | 183.7 ms |
+| nbody | 240.5 ms | 629.7 ms | **2.6×** | 465.9 ms |
+| strings | 45.2 ms | 108.0 ms | **2.4×** | 108.4 ms |
+| fib | 62.2 ms | 116.5 ms | **1.9×** | 86.0 ms |
+| loop | 80.4 ms | 191.5 ms | **2.4×** | 128.6 ms |
+| complex_untyped (only inferred types) | 15.5 ms | 24.6 ms | **1.6×** | 58.7 ms |
+| alloc_churn | 359.2 ms | 551.8 ms | **1.5×** | 361.7 ms |
+| bigint | 65.4 ms | 177.2 ms | **2.7×** | 177.9 ms |
 
-Types make every program faster, by 1.6× to 3.2×. (The bigint row was measured
-later than the others, on the same machine.) The untyped engine is a
+Types make every program faster, by 1.5× to 3.1×. The untyped engine is a
 fair baseline: it is in the same range as V8's interpreter, faster on two
 programs and up to about 2× slower on the rest. The typed engine beats V8's
 interpreter on all of them.
@@ -170,87 +180,141 @@ without types:
 
 The last one is the 2.9× on `closures`.
 
-## Supported TypeScript (POC subset)
+## Supported TypeScript and Node
 
-- **Types:** primitives (including `bigint`), literal types, arrays, tuples, functions, object
-  types, interfaces (including recursive, generic, `extends`, merging), type
-  aliases, unions, intersections of object types, enums (numeric and string),
-  classes and generics, `keyof`, `typeof`, `Record`, `Partial`, `Readonly`,
-  `Map<K,V>`, `Set<T>`.
+Everything in `tests/programs/` runs with output identical to Node
+(`node --experimental-transform-types`), including uncaught-rejection and
+microtask ordering.
+
+- **Modules:** `import`/`export` in all forms (default, named, namespace,
+  `export *`, `export * as ns`, re-exports, `import type`), cyclic imports,
+  JSON modules, `import.meta`, dynamic `import()`, top-level `await`.
+  Resolution follows Node: relative paths (a `./x.js` specifier finds
+  `./x.ts`), `node_modules` with `package.json` `exports` (conditions and
+  `./*` patterns), `module` and `main`. **CommonJS** works too: `require`,
+  `module.exports`/`exports`, `__dirname`, CommonJS packages imported from
+  ES modules. `.js` files are checked without types (everything is `any`).
+  TypeScript `namespace` blocks become modules of their own.
+- **Generators and async:** `function*`, `yield`, `yield*`, `return()`/
+  `throw()` with `finally`, user iterables via `[Symbol.iterator]`, `for-of`
+  with early-exit cleanup, spread and destructuring of iterables; `async`
+  functions, methods and arrows, `await`, async generators and `for await`;
+  `Promise` (`then`/`catch`/`finally`, `all`, `allSettled`, `race`, `any`,
+  `withResolvers`), `queueMicrotask`, `setTimeout`/`setInterval`/
+  `setImmediate`, `process.nextTick`, unhandled rejections (exit code 1).
+- **Types:** primitives (including `bigint` and `symbol`), literal types,
+  arrays, tuples, functions, object types, interfaces (recursive, generic,
+  `extends`, merging), type aliases, unions, intersections, enums, classes
+  and generics, `keyof`, `typeof`, indexed access `T[K]`, mapped types
+  (`{ [K in keyof T]?: T[K] }`, with `+`/`-` modifiers), conditional types
+  with `infer`, template literal types (as `string`), `Promise<T>`,
+  `Generator`/`Iterable`/`AsyncIterable`, `Record`, `Partial`, `Required`,
+  `Readonly`, `Pick`-style aliases, `Awaited`, `ReturnType`, type predicates
+  and assertion functions. A deferred type (one that depends on unknown type
+  parameters) behaves like `any` until its parameters are known.
 - **Narrowing:** `typeof`, `===`/`!==` with `null`, `undefined` or literals,
-  truthiness, `instanceof`, discriminant properties (`if`/`switch`),
-  `Array.isArray`, `in`, and narrowing after early `return`/`throw`.
-- **Classes:** fields, parameter properties, constructors, methods, getters
-  and setters, `extends`/`super`, abstract classes, static members, virtual
-  dispatch.
+  truthiness, `instanceof`, discriminant properties (`if`/`switch`, including
+  `default`), `Array.isArray`, `in`, and narrowing after early `return`/`throw`.
+- **Classes:** fields, `#private` fields, parameter properties, constructors,
+  methods, getters and setters, `extends`/`super`, abstract classes, static
+  members and static blocks, class expressions, virtual dispatch, `toString()`
+  used by string conversion.
 - **Functions:** closures with per-iteration loop bindings, arrows, defaults,
-  optional and rest parameters, destructuring parameters, named function
-  expressions, generic inference (including from callbacks).
+  optional and rest parameters, destructuring parameters, `arguments`, named
+  function expressions, generic inference (including from callbacks and
+  promises), `bind`/`call`/`apply`, tagged templates and `String.raw`.
+- **Objects:** literals with getters/setters, computed keys, methods,
+  spread, object rest destructuring, symbol keys.
 - **Statements:** all loops, labels, `switch`, `try`/`catch`/`finally`
-  (including `return` through `finally`), destructuring (array/object,
-  defaults, rest), spread, optional chaining, `??`, template literals.
-- **Built-ins:** `console`, `Math`, `JSON`, `Object.keys/values/entries/assign`,
-  `Number.*`, `parseInt`/`parseFloat`, `String`, most string and array
-  methods, `Map`, `Set`, and `Error`/`TypeError`/`RangeError` (written in
-  TypeScript in `src/prelude.ts`).
+  (including `return` through `finally`), destructuring, spread, optional
+  chaining (`a?.b`, `f?.()`), `??`/`??=`, template literals.
+- **Built-ins:** `console` (`log`, `error`, `dir`, `group`, `count`, `time`,
+  `table`, format strings like `%s %d %j`), `Math`, `JSON` (replacer,
+  reviver, `toJSON`), `Object` (`keys`, `entries`, `assign`, `defineProperty`,
+  `create`, `groupBy`, …), `Number`, `String`, `Array` (including `toSorted`,
+  `with`, `findLast`), `Map`, `Set`, `WeakMap`/`WeakSet` (a Map/Set: without
+  a tracing collector there is nothing weak references would add), `RegExp`
+  (literals, named groups, lookaround, backreferences, `g`/`y`/`i`/`m`/`s`,
+  via `fancy-regex`), `Date` (local time from the OS time zone),
+  `Symbol`, `structuredClone`, `globalThis`, `encodeURIComponent` and
+  friends, and the `Error` family with `cause` (written in TypeScript in
+  `src/prelude.ts`).
+- **Node:** `process` (`argv`, `env`, `exit`, `exitCode`, `cwd`, `platform`,
+  `stdout.write`, `nextTick`, `hrtime.bigint`), and built-in modules written
+  in TypeScript in `src/node/`: `node:fs` (synchronous API, `promises`, and
+  callbacks; strings only, no `Buffer` yet), `node:path`, `node:events`
+  (`EventEmitter`), `node:util` (`format`, `inspect`, `promisify`),
+  `node:os`, `node:assert`, `node:url` (file URLs), `node:timers/promises`,
+  `node:crypto` (`randomUUID`, non-cryptographic).
 - **BigInts** are 128-bit integers (`i128`), as in rjs. That covers the
   usual uses (64-bit IDs, nanosecond timestamps, modular arithmetic) without
   a heap allocation per value. A result outside ±2^127 throws
   `RangeError: Maximum BigInt size exceeded`, where Node would keep growing.
   Typed `bigint` values are unboxed (`BigIntArithmetic` on two-slot
-  `BigSlot`s); `any` values holding BigInts are boxed and checked. Mixing
-  `bigint` and `number` in arithmetic is a compile error, as in TypeScript.
-  Supported: literals (`10n`, `0xffn`), all operators except `>>>`,
-  `BigInt(x)`, `Number(x)`, `String(x)`, `.toString(radix)`, comparison
-  with numbers and strings, `Map`/`Set` keys, `typeof`.
+  `BigSlot`s); `any` values holding BigInts are boxed and checked.
 - `console.log` formatting follows Node's `util.inspect` (line breaking and
   array grouping), so test output can be compared with Node byte for byte.
+
+### Not supported yet
+
+- Decorators, `enum`-less `declare` ambient modules' contents (they are
+  skipped), `with`, `eval`/`new Function`, `Proxy`, `Reflect`, and
+  property attributes (`enumerable: false`, real freezing).
+- Prototype chains on plain objects (`Object.create(proto)` copies),
+  `new` on a class value of unknown type.
+- `Buffer`, `TextEncoder`/`TextDecoder`, `URL`, `fetch`, `http`, `net`,
+  `child_process`, `worker_threads`, `Intl`.
+- Stack traces: errors have no `stack` contents and `console.log(err)`
+  prints `Name: message` without Node's `at …` lines.
+- `yield*` inside async generators; `await` of `for await` iterator
+  `return()` on early exit.
+- Type-checking is deliberately lenient where TypeScript's rules are deep
+  (overload resolution, variance, excess property checks). Unsoundness is
+  caught at run time by checked unboxing instead.
 
 ## Next steps
 
 Roughly in order of what's needed to run real npm packages:
 
-1. **Modules.** `import`/`export` across files, Node resolution, and
-   `package.json` `exports`. The checker is whole-program, so each module can
-   be a scope within one program.
-2. **Generators and async/await.** Frames already live on explicit VM stacks
-   and calls don't recurse in Rust, so a suspended frame can be moved into a
-   heap object and resumed later. Promises and an event-loop microtask queue
-   build on that.
+1. **`Buffer`, `TextEncoder`, `URL`, `fetch`/`http`.** Most packages that do
+   I/O need at least `Buffer`. `node:fs` currently reads and writes strings.
+2. **Error locations.** Uncaught errors have no stack trace yet. A pc → source
+   line table is reserved (`FuncCode::lines`); `Error.stack` should be
+   filled from it.
 3. **Reference cycles.** In order:
    1. Static analysis of the class field graph, since most types cannot form
       cycles.
    2. Inferred `weak` back-references (parent pointers).
    3. A trial-deletion cycle collector limited to cycle-capable types.
-4. **Unboxed object fields.** Store `number` fields as `f64` in the object
+4. **Prototype chains and property attributes** for plain objects
+   (`Object.create(proto)`, `defineProperty` with `enumerable`/`writable`),
+   `Proxy`/`Reflect`, decorators.
+5. **Unboxed object fields.** Store `number` fields as `f64` in the object
    layout. Today `ReadFieldNumber` pays a `RefCell` borrow and a tag check, which is
    the main cost in `nbody`.
-5. **Faster calls.** Calls cost about 30ns. To reduce that: inline small
+6. **Faster calls.** Calls cost about 30ns. To reduce that: inline small
    non-recursive functions (the HOF inliner already does this for callbacks),
    use a slimmer frame layout, and use direct-threaded dispatch.
-6. **`.d.ts` and JavaScript files.** npm packages ship JS plus declarations.
-   Plain JS is all `any`; it already runs on the dynamic paths, but slowly.
-   Types from `.d.ts` files would give typed boundaries.
-7. **Missing language features:** regular expressions, symbols and
-   iterators (`for-of` over user iterables), class expressions, computed keys,
-   object-literal getters, `Date`, mapped and conditional types,
-   static blocks, and labeled `continue` in inlined callbacks.
-8. **Error locations.** Uncaught errors have no stack trace yet. A pc → source
-   line table is reserved (`FuncCode::lines`).
+7. **`.d.ts` files.** npm packages ship JS plus declarations. JS already
+   runs (untyped); types from `.d.ts` files would give typed boundaries.
 
 ## Layout
 
 | path | contents |
 |---|---|
 | `src/lexer.rs`, `src/parser.rs`, `src/ast.rs` | front end |
+| `src/module.rs` | module loading and Node-style resolution; export tables |
 | `src/types.rs` | types and storage kinds |
-| `src/check/` | checker: declarations and classes (`mod.rs`), expressions and calls (`expr.rs`), statements and narrowing (`stmt.rs`), built-in signatures (`builtins.rs`) |
+| `src/check/` | checker: declarations, classes and type-level evaluation (`mod.rs`), expressions and calls (`expr.rs`), statements and narrowing (`stmt.rs`), modules (`modules.rs`), built-in signatures (`builtins.rs`) |
 | `src/hir.rs` | typed IR |
 | `src/codegen.rs` | slot allocation, lowering, inlining, peephole |
 | `src/bytecode.rs` | the instruction set: `Instruction`, slots, call sites |
 | `src/disasm.rs` | `--dump`: instructions with slots shown by variable name |
 | `src/vm.rs` | the interpreter |
-| `src/runtime/` | values, objects, shapes, `inspect`, natives, BigInt arithmetic (`bigint.rs`) |
+| `src/vm_task.rs` | generators, async functions, promises, the event loop, iteration |
+| `src/runtime/` | values, objects, shapes, `inspect`, natives, BigInt arithmetic (`bigint.rs`), regular expressions (`regexp.rs`), coroutine and promise types (`task.rs`) |
+| `src/prelude.ts`, `src/prelude_date.ts` | built-in classes written in TypeScript (`Error` family; `Date`, compiled only when used) |
+| `src/node/` | Node built-in modules in TypeScript, and their natives (`natives.rs`) |
 | `tests/programs/` | programs whose output must match Node |
 | `tests/rts/` | rts-specific behaviour (checked `any` boundaries) |
 | `bench/` | benchmarks and runner |

@@ -81,6 +81,7 @@ pub struct HProgram {
     pub error_class: Option<ClassId>,
     pub type_error_class: Option<ClassId>,
     pub range_error_class: Option<ClassId>,
+    pub syntax_error_class: Option<ClassId>,
 }
 
 // ───────────────────────────── statements ─────────────────────────────

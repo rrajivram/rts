@@ -198,7 +198,7 @@ impl Shape {
         }
         let mut keys = self.keys.clone();
         keys.push(name.clone());
-        let s = Shape::new(keys);
+        let s = if self.null_proto { Shape::new_null_proto(keys) } else { Shape::new(keys) };
         // Big (dictionary-like) objects don't cache transitions.
         if self.keys.len() < 64 {
             self.transitions.borrow_mut().insert(name.clone(), s.clone());

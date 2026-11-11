@@ -83,6 +83,11 @@ natives! {
     DateNowMs = "now", DateOffset = "", DateZoneName = "", DateParse = "parse", DeepEqual = "isDeepStrictEqual",
     ObjectIs = "is", EncodeUriComponent = "encodeURIComponent", EncodeUri = "encodeURI",
     DecodeUriComponent = "decodeURIComponent", DecodeUri = "decodeURI", NoOp = "",
+    ConsoleDir = "dir", ConsoleGroup = "group", ConsoleGroupEnd = "groupEnd", ConsoleAssert = "assert",
+    ConsoleCount = "count", ConsoleCountReset = "countReset", ConsoleTime = "time", ConsoleTimeEnd = "timeEnd",
+    ConsoleTable = "table", ObjDefineProperty = "defineProperty", ObjCreate = "create",
+    ObjGetPrototypeOf = "getPrototypeOf", ObjSetPrototypeOf = "setPrototypeOf", ObjIsFrozen = "isFrozen",
+    ObjGroupBy = "groupBy", ObjHasOwn = "hasOwn", StrRaw = "raw",
 }
 
 impl Native {
@@ -137,7 +142,10 @@ pub fn math1(n: Native, x: f64) -> f64 {
     match n {
         Native::MathFloor => x.floor(),
         Native::MathCeil => x.ceil(),
-        Native::MathRound => (x + 0.5).floor(),
+        Native::MathRound => {
+            let r = (x + 0.5).floor();
+            if r == 0.0 && x < 0.0 { -0.0 } else { r }
+        }
         Native::MathTrunc => x.trunc(),
         Native::MathSqrt => x.sqrt(),
         Native::MathAbs => x.abs(),
@@ -522,6 +530,108 @@ fn json_quote(s: &str, out: &mut String) {
         }
     }
     out.push('"');
+}
+
+fn is_callable_value(v: &Value) -> bool {
+    matches!(v, Value::Func(_) | Value::Native(_) | Value::Bound(_))
+}
+
+/// Whether JSON.stringify needs the slow path (replacer or `toJSON`).
+fn json_needs_prepare(args: &[Value]) -> bool {
+    fn has_to_json(v: &Value, depth: usize) -> bool {
+        if depth > 64 {
+            return false;
+        }
+        match v {
+            Value::Obj(o) => {
+                o.get("toJSON").is_some()
+                    || o.class.as_ref().is_some_and(|c| c.methods.contains_key("toJSON") && &*c.name != "Date")
+                    || o.keys().iter().any(|k| o.get(k).is_some_and(|x| has_to_json(&x, depth + 1)))
+            }
+            Value::Arr(a) => a.to_vec().iter().any(|x| has_to_json(x, depth + 1)),
+            _ => false,
+        }
+    }
+    matches!(args.get(1), Some(Value::Func(_) | Value::Native(_) | Value::Bound(_) | Value::Arr(_))) || has_to_json(&arg(args, 0), 0)
+}
+
+/// SerializeJSONProperty's value step: `toJSON`, then the replacer, then
+/// the same for children. None = omit.
+fn json_prepare(vm: &mut Vm, holder: &Value, key: Value, v: Value, replacer: &Value, depth: usize) -> Result<Option<Value>, Value> {
+    if depth > 1000 {
+        return Err(vm.range_error("Maximum call stack size exceeded".into()));
+    }
+    let mut v = v;
+    if let Value::Obj(_) = &v {
+        let f = vm.get_property(&v, "toJSON")?;
+        if is_callable_value(&f) {
+            v = vm.call(&f, v.clone(), vec![key.clone()])?;
+        }
+    }
+    if is_callable_value(replacer) {
+        v = vm.call(replacer, holder.clone(), vec![key, v])?;
+    }
+    Ok(Some(match &v {
+        Value::Arr(a) => {
+            let mut out = Vec::new();
+            for (i, x) in a.to_vec().into_iter().enumerate() {
+                out.push(json_prepare(vm, &v, Value::str(i.to_string()), x, replacer, depth + 1)?.unwrap_or(Value::Null));
+            }
+            Value::Arr(make_array(out))
+        }
+        Value::Obj(o) => {
+            let allowed: Option<Vec<String>> = match replacer {
+                Value::Arr(list) => Some(list.to_vec().iter().map(|k| k.to_js_string().s.to_string()).collect()),
+                _ => None,
+            };
+            let mut keys = Vec::new();
+            let mut vals = Vec::new();
+            let names: Vec<Rc<str>> = match &allowed {
+                Some(list) => list.iter().filter(|k| o.get(k).is_some()).map(|k| Rc::from(k.as_str())).collect(),
+                None => object_keys(o),
+            };
+            for k in names {
+                let x = o.get(&k).unwrap_or(Value::Undef);
+                if let Some(x) = json_prepare(vm, &v, Value::Str(JsStr::new(&*k)), x, replacer, depth + 1)? {
+                    if matches!(x, Value::Undef | Value::Func(_) | Value::Native(_)) {
+                        continue;
+                    }
+                    keys.push(k);
+                    vals.push(x);
+                }
+            }
+            Value::Obj(Object::new(Shape::new(keys), vals, None))
+        }
+        Value::Undef | Value::Func(_) | Value::Native(_) | Value::Bound(_) => return Ok(None),
+        _ => v.clone(),
+    }))
+}
+
+/// JSON.parse's reviver, applied bottom-up.
+fn json_revive(vm: &mut Vm, holder: &Value, key: Value, reviver: &Value) -> Result<Value, Value> {
+    let v = get_dyn(holder, &key);
+    match &v {
+        Value::Arr(a) => {
+            for i in 0..a.len() {
+                let k = Value::str(i.to_string());
+                let x = json_revive(vm, &v, k.clone(), reviver)?;
+                set_dyn(&v, &Value::Num(i as f64), x);
+            }
+        }
+        Value::Obj(o) => {
+            for k in o.keys() {
+                let kv = Value::Str(JsStr::new(&*k));
+                let x = json_revive(vm, &v, kv, reviver)?;
+                if matches!(x, Value::Undef) {
+                    o.delete(&k);
+                } else {
+                    o.set(&k, x);
+                }
+            }
+        }
+        _ => {}
+    }
+    vm.call(reviver, holder.clone(), vec![key, v])
 }
 
 /// Parse JSON text (used by the module loader for package.json).
@@ -1455,6 +1565,18 @@ pub fn call_native(vm: &mut Vm, n: Native, this: Value, args: Vec<Value>) -> NRe
             }
             Value::Obj(o)
         }
+        JsonStringify if json_needs_prepare(&args) => {
+            // A replacer or toJSON methods: build the value to serialize first.
+            let replacer = arg(&args, 1);
+            let root = Value::Obj(Object::new(Shape::new(vec!["".into()]), vec![arg(&args, 0)], None));
+            let v = json_prepare(vm, &root, Value::str(""), arg(&args, 0), &replacer, 0)?;
+            let mut rest = args.clone();
+            rest[0] = v.unwrap_or(Value::Undef);
+            if rest.len() > 1 {
+                rest[1] = Value::Undef;
+            }
+            call_native(vm, JsonStringify, Value::Undef, rest)?
+        }
         JsonStringify => {
             let indent = match args.get(2) {
                 Some(Value::Num(n)) => " ".repeat((*n as usize).min(10)),
@@ -1477,6 +1599,10 @@ pub fn call_native(vm: &mut Vm, n: Native, this: Value, args: Vec<Value>) -> NRe
             let v = p.value();
             p.ws();
             match v {
+                Ok(v) if p.i == p.b.len() && is_callable_value(&arg(&args, 1)) => {
+                    let root = Value::Obj(Object::new(Shape::new(vec!["".into()]), vec![v.clone()], None));
+                    json_revive(vm, &root, Value::str(""), &arg(&args, 1))?
+                }
                 Ok(v) if p.i == p.b.len() => v,
                 Ok(_) => return Err(vm.syntax_error(format!("Unexpected non-whitespace character after JSON at position {}", p.i))),
                 Err(m) => return Err(vm.syntax_error(m)),

@@ -7,12 +7,13 @@ This is a proof of concept. The long-term goal is to run arbitrary npm packages.
 ## Pipeline
 
 ```
-source ──lexer──▶ tokens ──parser──▶ AST ──checker──▶ typed HIR ──codegen──▶ instructions ──▶ VM
+files ──loader──▶ modules (ASTs) ──checker──▶ typed HIR ──codegen──▶ instructions ──▶ VM + event loop
 ```
 
 | module | job |
 |---|---|
-| `lexer` | Tokens with byte spans. Template literals are lexed as one token holding the parts. |
+| `module` | Loads the entry file and everything it imports or `require`s, resolving specifiers as Node does, and orders modules for evaluation. All files share one offset space for spans (`error::Sources`), so an error names its file. |
+| `lexer` | Tokens with byte spans. Template literals are lexed as one token holding the parts (cooked and raw). A `/` where an expression may start begins a regular expression. |
 | `parser` | Hand-written recursive descent with Pratt expression parsing. Arrow functions and `<T>(…)` generic calls are found by speculative parsing (save the token position and restore it on failure). |
 | `ast` | The untyped syntax tree. Type annotations are kept as `TypeExpr`. |
 | `types` | Semantic types (`Type`), assignability, and the mapping from a type to a storage **kind**. |
@@ -153,26 +154,105 @@ around them. Monomorphization can come later.
   3. A trial-deletion cycle collector (Bacon–Rajan) restricted to
      cycle-capable types.
 
-## Supported subset (POC)
+## Modules
 
-**Types:** `number`, `bigint` (128-bit), `boolean`, `string`, `void`, `null`, `undefined`, `any`,
-`unknown`, `never`, literal types, `T[]` and `Array<T>`, tuples (as arrays),
-function types, object type literals, interfaces (including `extends`), type
-aliases, unions with narrowing, classes, numeric enums, and generic functions
-and classes (erased).
+`module.rs` loads every module the entry file reaches through `import`,
+`export … from`, `require("…")` and `import("…")` with a literal
+specifier. Specifiers resolve like Node: relative files (with TypeScript's
+`./x.js` → `./x.ts` mapping), directories (`index.*`, `package.json`
+`main`), and bare names through `node_modules` (`exports` with
+conditions and `./*` patterns, then `module`/`main`). `node:` names and
+bare built-in names load the TypeScript sources in `src/node/`.
 
-**Statements:** `let`/`const`/`var`, `if`, `while`, `do`, `for`, `for-of`, `for-in`,
-`break`/`continue` (with labels), `switch`, `return`, `throw`/`try`/`catch`,
-functions, classes (fields, constructors, methods, `extends`, `super`, parameter
-properties, static methods), `interface`, `type`, `enum`.
+The checker is whole-program. Each module is a scope under the global scope
+(built-ins and the prelude). `check/modules.rs` hoists the declarations of
+*every* module first (types, then values), then binds each import by copying
+the exporter's binding (the same `VarId`, class or interface) into the
+importing scope, then checks module bodies in evaluation order (depth-first
+post-order, as Node does) as parts of the one top-level function. So an
+import costs nothing at run time, it is live (a re-assigned `let` export is
+seen by importers), cycles work for anything used after both modules have run,
+and types flow across files unchanged. `ns.x` for a namespace import is
+rewritten to the binding of `x`; `ns` used as a value becomes an object of
+the exports.
 
-**Expressions:** the usual operators, template literals, optional chaining `?.`,
-`??`, arrows and closures, `new`, object and array literals, spread, destructuring,
-getters and setters, `as`, `!`, `typeof`, and `instanceof`.
+CommonJS files (`.cjs`, or `.js` without `import`/`export`) are wrapped:
+`module`, `exports`, `__filename` and `__dirname` are declared before the
+body and `module.exports` is captured after it; that value is the module's
+default export, and `require` of the module evaluates to it. JavaScript
+files are checked with every binding `any` (per function and class, so a
+typed module calling into JavaScript stays typed).
 
-**Narrowing:** `typeof x === "…"`, `x === null` / `undefined`, truthiness,
-`instanceof`, and discriminant property checks. Narrowing applies in branches
-and after an `if` whose branch always exits.
+## Generators, async functions and the event loop
 
-**Not yet supported:** async/await, generators, modules, decorators, regular
-expressions, symbols and user-defined iterators. See README "Next steps".
+A generator or async function runs in an ordinary frame with ordinary
+instructions; four instructions suspend it:
+
+- `CreateGenerator` (first instruction of a generator body, after parameter
+  setup) moves the frame's slots and `try` handlers into a new `Coroutine`,
+  pops the frame and returns the generator object.
+- `Yield { value, received, mode }` does the same and hands `value` to the
+  resumer. Resuming (`next`/`throw`/`return`, or a `for-of` step) pushes a
+  frame on top of the stack, moves the slots back, writes the resumption
+  value into `received` and its kind into `mode`, and runs the interpreter
+  until the next suspension. Codegen follows each `Yield` with
+  `mode == 1 → throw`, `mode == 2 → return` (through `finally` blocks).
+- `StartAsync` gives an async call a promise; the frame keeps running.
+- `Await { value, received, mode }` suspends until a promise settles. The
+  first `await` of a call returns the promise to the caller.
+
+Typed slots are copied as raw words, so a suspended generator's `number`
+loop counter stays an unboxed `f64`. Coroutine frames are recorded in a side
+stack (`Vm::co_frames`) rather than in `Frame`, so ordinary calls don't pay
+for them.
+
+Promises (`runtime/task.rs`, `vm_task.rs`) implement the ECMAScript job
+model: settling a promise queues a microtask per reaction, resolving with a
+thenable queues a `ResolveThenable` job, and `await` uses `PromiseResolve`
+plus one reaction. That is what makes callback order identical to Node.
+After the top-level code, the event loop drains `process.nextTick`
+callbacks and microtasks, then runs due timers (each followed by a
+microtask drain) and immediates, sleeping until the next timer. A promise
+rejected with no handler when the microtask queue empties ends the program,
+as in Node.
+
+The iterator protocol (`GetIterator`, `IteratorStep`, `IteratorClose`,
+`IteratorResume` for `yield*`) has native fast paths for generators and
+built-in iterators; anything else calls `[Symbol.iterator]()` and `next()`.
+A `for-of` over an iterator is wrapped in a handler so that `break`,
+`return` and exceptions call the iterator's `return()`. Loops over values
+statically known to be arrays, strings, maps or sets keep the indexed fast
+path. These rarely hot instructions are executed out of line
+(`Vm::exec_extended`), which keeps the main interpreter loop small.
+
+## Symbols, regular expressions, and the prelude
+
+A symbol-keyed property is stored under a key string no program can spell
+(`"\u{2}Symbol.iterator"`), so objects and inline caches need nothing
+new; key enumeration skips them and `inspect` shows them as Node does.
+Regular expressions are translated from JavaScript syntax to `fancy-regex`
+(backreferences, lookaround, named groups; ASCII `\d`/`\w`), with UTF-16
+indices at the boundary.
+
+Built-in classes that are easier to write in TypeScript than in Rust live in
+`src/prelude.ts` (the `Error` family) and `src/prelude_date.ts` (`Date`,
+compiled only into programs that mention it), and Node's modules in
+`src/node/*.ts`, calling natives named `__rts_*`.
+
+## Slot stacks
+
+The scalar and value slot stacks are reserved once (32 MB of address space
+each, zeroed lazily by the OS, so only used pages cost memory) and never
+reallocated. A running frame's slot pointers therefore stay valid across
+calls, getters and resumed generators; a frame that does not fit is a
+`RangeError` ("Maximum call stack size exceeded").
+
+## Supported language
+
+See the README ("Supported TypeScript and Node") for the full list. In
+brief: modules (ES and CommonJS), generators and async functions, classes
+and generics, mapped/conditional/indexed types, regular expressions,
+symbols and iterators, and the common Node globals and built-in modules.
+
+**Not yet supported:** decorators, `Proxy`/`Reflect`, prototype chains on
+plain objects, `Buffer` and the networking modules. See README.

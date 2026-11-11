@@ -530,6 +530,211 @@ pub fn call_more(vm: &mut Vm, n: Native, args: Vec<Value>) -> Result<Value, Valu
             }
         }
         NoOp => Value::Undef,
+        n if (n as u16) >= (ConsoleDir as u16) => return call_console_object(vm, n, args),
         _ => return call(vm, n, Value::Undef, args),
     })
+}
+
+/// console.group indentation, counters and timers; Object helpers.
+pub fn call_console_object(vm: &mut Vm, n: Native, args: Vec<Value>) -> Result<Value, Value> {
+    use Native::*;
+    let label = |args: &[Value]| match args.first() {
+        None | Some(Value::Undef) => "default".to_string(),
+        Some(v) => s(v),
+    };
+    Ok(match n {
+        ConsoleDir => {
+            let line = vm.inspect(&arg(&args, 0));
+            vm.print(&line);
+            Value::Undef
+        }
+        ConsoleGroup => {
+            if !args.is_empty() {
+                let line = format_args(vm, &args);
+                vm.print(&line);
+            }
+            vm.console_indent += 2;
+            Value::Undef
+        }
+        ConsoleGroupEnd => {
+            vm.console_indent = vm.console_indent.saturating_sub(2);
+            Value::Undef
+        }
+        ConsoleAssert => {
+            if !arg(&args, 0).truthy() {
+                let rest = &args[args.len().min(1)..];
+                let msg = if rest.is_empty() { "Assertion failed".to_string() } else { format!("Assertion failed: {}", format_args(vm, rest)) };
+                vm.eprint(&msg);
+            }
+            Value::Undef
+        }
+        ConsoleCount => {
+            let l = label(&args);
+            let c = vm.console_counts.entry(l.clone()).or_insert(0);
+            *c += 1;
+            let line = format!("{l}: {c}");
+            vm.print(&line);
+            Value::Undef
+        }
+        ConsoleCountReset => {
+            vm.console_counts.remove(&label(&args));
+            Value::Undef
+        }
+        ConsoleTime => {
+            let now = vm.now_ms();
+            vm.console_timers.insert(label(&args), now);
+            Value::Undef
+        }
+        ConsoleTimeEnd => {
+            let l = label(&args);
+            if let Some(t) = vm.console_timers.get(&l).copied() {
+                let ms = vm.now_ms() - t;
+                let line = format!("{l}: {:.3}ms", ms);
+                vm.print(&line);
+            }
+            Value::Undef
+        }
+        ConsoleTable => {
+            let t = console_table(vm, &arg(&args, 0));
+            vm.print(&t);
+            Value::Undef
+        }
+        ObjDefineProperty => {
+            let (o, k, d) = (arg(&args, 0), arg(&args, 1), arg(&args, 2));
+            let Value::Obj(target) = &o else {
+                crate::runtime::natives::set_dyn(&o, &k, vm.get_property(&d, "value")?);
+                return Ok(o);
+            };
+            let key: Rc<str> = (&*k.to_js_string().s).into();
+            let get = vm.get_property(&d, "get")?;
+            let set = vm.get_property(&d, "set")?;
+            if !matches!(get, Value::Undef) || !matches!(set, Value::Undef) {
+                target.set(&key, Value::Accessor(Rc::new(crate::runtime::task::Accessor { get, set })));
+            } else {
+                let v = vm.get_property(&d, "value")?;
+                target.set(&key, v);
+            }
+            o
+        }
+        ObjCreate => match arg(&args, 0) {
+            Value::Null => Value::Obj(Object::new(Shape::new_null_proto(vec![]), vec![], None)),
+            Value::Obj(p) => {
+                // No prototype chains: copy the prototype's properties.
+                let keys = p.keys();
+                let vals = keys.iter().map(|k| p.get(k).unwrap_or(Value::Undef)).collect();
+                Value::Obj(Object::new(Shape::new(keys), vals, p.class.clone()))
+            }
+            _ => Value::Obj(Object::new(Shape::new(vec![]), vec![], None)),
+        },
+        ObjGetPrototypeOf => match arg(&args, 0) {
+            Value::Obj(o) if o.inner.borrow().shape.null_proto => Value::Null,
+            Value::Obj(o) if o.class.is_some() => Value::Class(o.class.clone().unwrap()),
+            _ => Value::Obj(Object::new(Shape::new(vec![]), vec![], None)),
+        },
+        ObjSetPrototypeOf => arg(&args, 0),
+        ObjIsFrozen => Value::Bool(false),
+        ObjHasOwn => {
+            let k = arg(&args, 1).to_js_string();
+            Value::Bool(match arg(&args, 0) {
+                Value::Obj(o) => o.get(&k.s).is_some(),
+                Value::Arr(a) => k.s.parse::<usize>().is_ok_and(|i| i < a.len()),
+                _ => false,
+            })
+        }
+        ObjGroupBy => {
+            let items = crate::runtime::natives::iterate(vm, &arg(&args, 0))?;
+            let f = arg(&args, 1);
+            let out = Object::new(Shape::new_null_proto(vec![]), vec![], None);
+            for (i, x) in items.into_iter().enumerate() {
+                let k = vm.call(&f, Value::Undef, vec![x.clone(), Value::Num(i as f64)])?;
+                let key: Rc<str> = (&*k.to_js_string().s).into();
+                match out.get(&key) {
+                    Some(Value::Arr(a)) => a.push(x),
+                    _ => out.set(&key, Value::Arr(make_array(vec![x]))),
+                }
+            }
+            Value::Obj(out)
+        }
+        StrRaw => {
+            // String.raw(strings, ...subs)
+            let strings = arg(&args, 0);
+            let raw = vm.get_property(&strings, "raw")?;
+            let parts = crate::runtime::natives::iterate(vm, &raw)?;
+            let mut out = String::new();
+            for (i, p) in parts.iter().enumerate() {
+                out.push_str(&s(p));
+                if i + 1 < parts.len()
+                    && let Some(v) = args.get(i + 1)
+                {
+                    out.push_str(&s(v));
+                }
+            }
+            Value::str(out)
+        }
+        _ => unreachable!(),
+    })
+}
+
+/// `console.table` for arrays of objects/values.
+fn console_table(vm: &mut Vm, data: &Value) -> String {
+    let rows: Vec<(String, Value)> = match data {
+        Value::Arr(a) => a.to_vec().into_iter().enumerate().map(|(i, v)| (i.to_string(), v)).collect(),
+        Value::Obj(o) => o.keys().into_iter().map(|k| (k.to_string(), o.get(&k).unwrap_or(Value::Undef))).collect(),
+        v => return vm.inspect(v),
+    };
+    let mut cols: Vec<String> = Vec::new();
+    let mut has_values = false;
+    for (_, v) in &rows {
+        match v {
+            Value::Obj(o) => {
+                for k in o.keys() {
+                    if !cols.iter().any(|c| **c == *k) {
+                        cols.push(k.to_string());
+                    }
+                }
+            }
+            _ => has_values = true,
+        }
+    }
+    let mut header = vec!["(index)".to_string()];
+    header.extend(cols.iter().cloned());
+    if has_values {
+        header.push("Values".into());
+    }
+    let mut table: Vec<Vec<String>> = Vec::new();
+    for (i, v) in &rows {
+        let mut line = vec![i.clone()];
+        for c in &cols {
+            line.push(match v {
+                Value::Obj(o) => o.get(c).map(|x| vm.inspect_depth(&x, 0)).unwrap_or_default(),
+                _ => String::new(),
+            });
+        }
+        if has_values {
+            line.push(if matches!(v, Value::Obj(_)) { String::new() } else { vm.inspect(v) });
+        }
+        table.push(line);
+    }
+    let width = |s: &str| s.chars().count();
+    let widths: Vec<usize> = (0..header.len())
+        .map(|c| std::iter::once(&header[c]).chain(table.iter().map(|r| &r[c])).map(|s| width(s) + 2).max().unwrap_or(2))
+        .collect();
+    let line = |l: &str, m: &str, r: &str| format!("{l}{}{r}", widths.iter().map(|w| "─".repeat(*w)).collect::<Vec<_>>().join(m));
+    let row = |cells: &[String]| {
+        format!(
+            "│{}│",
+            cells
+                .iter()
+                .zip(&widths)
+                .map(|(c, w)| format!(" {c}{} ", " ".repeat(w - 2 - width(c))))
+                .collect::<Vec<_>>()
+                .join("│")
+        )
+    };
+    let mut out = vec![line("┌", "┬", "┐"), row(&header), line("├", "┼", "┤")];
+    for r in &table {
+        out.push(row(r));
+    }
+    out.push(line("└", "┴", "┘"));
+    out.join("\n")
 }

@@ -238,8 +238,17 @@ impl Checker {
             },
             BuiltinNs::Console => match name {
                 "log" | "info" | "debug" => m(ConsoleLog, ft(vec![rest("args", any())], Type::Void)),
-                "error" => m(ConsoleError, ft(vec![rest("args", any())], Type::Void)),
+                "error" | "trace" => m(ConsoleError, ft(vec![rest("args", any())], Type::Void)),
                 "warn" => m(ConsoleWarn, ft(vec![rest("args", any())], Type::Void)),
+                "dir" => m(ConsoleDir, ft(vec![opt("value", any()), opt("options", any())], Type::Void)),
+                "group" | "groupCollapsed" => m(ConsoleGroup, ft(vec![rest("label", any())], Type::Void)),
+                "groupEnd" => m(ConsoleGroupEnd, ft(vec![], Type::Void)),
+                "assert" => m(ConsoleAssert, ft(vec![opt("value", any()), rest("args", any())], Type::Void)),
+                "count" => m(ConsoleCount, ft(vec![opt("label", any())], Type::Void)),
+                "countReset" => m(ConsoleCountReset, ft(vec![opt("label", any())], Type::Void)),
+                "time" => m(ConsoleTime, ft(vec![opt("label", any())], Type::Void)),
+                "timeEnd" | "timeLog" => m(ConsoleTimeEnd, ft(vec![opt("label", any()), rest("args", any())], Type::Void)),
+                "table" => m(ConsoleTable, ft(vec![opt("data", any())], Type::Void)),
                 _ => None,
             },
             BuiltinNs::Json => match name {
@@ -247,11 +256,20 @@ impl Checker {
                     JsonStringify,
                     ft(vec![p("value", any()), opt("replacer", any()), opt("space", any())], string()),
                 ),
-                "parse" => m(JsonParse, ft(vec![p("text", string())], any())),
+                "parse" => m(JsonParse, ft(vec![p("text", string()), opt("reviver", any())], any())),
                 _ => None,
             },
             BuiltinNs::Object => match name {
                 "is" => m(ObjectIs, ft(vec![p("a", any()), p("b", any())], boolean())),
+                "defineProperty" => m(ObjDefineProperty, ft(vec![p("o", any()), p("key", any()), p("desc", any())], any())),
+                "create" => m(ObjCreate, ft(vec![p("proto", any()), opt("props", any())], any())),
+                "getPrototypeOf" => m(ObjGetPrototypeOf, ft(vec![p("o", any())], any())),
+                "setPrototypeOf" => m(ObjSetPrototypeOf, ft(vec![p("o", any()), p("proto", any())], any())),
+                "getOwnPropertyNames" => m(ObjKeys, ft(vec![p("o", any())], Type::array(string()))),
+                "isFrozen" | "isSealed" => m(ObjIsFrozen, ft(vec![p("o", any())], boolean())),
+                "seal" | "preventExtensions" => m(ObjFreeze, ft(vec![p("o", any())], any())),
+                "groupBy" => m(ObjGroupBy, ft(vec![p("items", any()), p("f", Type::Func(ft(vec![p("x", any()), p("i", num())], any())))], any())),
+                "hasOwn" => m(ObjHasOwn, ft(vec![p("o", any()), p("key", any())], boolean())),
                 "keys" => m(ObjKeys, ft(vec![p("o", any())], Type::array(string()))),
                 "values" => m(ObjValues, ft(vec![p("o", any())], Type::array(any()))),
                 "entries" => m(
@@ -282,6 +300,7 @@ impl Checker {
             },
             BuiltinNs::String => match name {
                 "fromCharCode" => m(StrFromCharCode, ft(vec![rest("codes", num())], string())),
+                "raw" => m(StrRaw, ft(vec![p("strings", any()), rest("subs", any())], string())),
                 _ => None,
             },
             BuiltinNs::Array => match name {

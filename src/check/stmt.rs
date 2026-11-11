@@ -965,6 +965,11 @@ impl Checker {
                             if c.test.is_some() && !pending_labels.is_empty() {
                                 let refs = self.refine_switch(d, &pending_labels)?;
                                 self.apply(&refs);
+                            } else if c.test.is_none() && pending_labels.is_empty() {
+                                // `default:` sees what no other case matched.
+                                let others: Vec<&Expr> = cases.iter().filter_map(|c| c.test.as_ref()).collect();
+                                let refs = self.refine_switch_default(d, &others)?;
+                                self.apply(&refs);
                             }
                             pending_labels.clear();
                         }
@@ -1263,6 +1268,31 @@ impl Checker {
     }
 
     /// Narrowing for a switch case body (labels that fall into it).
+    /// Narrowing for `default:`: the discriminant matched none of `labels`.
+    fn refine_switch_default(&mut self, d: &Expr, labels: &[&Expr]) -> CResult<Vec<(String, Type)>> {
+        let mut out = Vec::new();
+        let lits: Vec<Type> = labels.iter().filter_map(|l| literal_of(l)).collect();
+        if lits.len() != labels.len() || lits.is_empty() {
+            return Ok(out);
+        }
+        if let Some((k, mut t)) = self.current_type(d)? {
+            for l in &lits {
+                t = narrow_eq(&t, l, false, false);
+            }
+            out.push((k, t));
+        }
+        if let ExprKind::Member { obj, prop, optional: false } = &d.kind
+            && let Some((ok, mut ot)) = self.current_type(obj)?
+            && matches!(ot, Type::Union(_))
+        {
+            for l in &lits {
+                ot = self.filter_discriminant(&ot, prop, l, false);
+            }
+            out.push((ok, ot));
+        }
+        Ok(out)
+    }
+
     fn refine_switch(&mut self, d: &Expr, labels: &[&Expr]) -> CResult<Vec<(String, Type)>> {
         let mut out = Vec::new();
         let lits: Vec<Type> = labels.iter().filter_map(|l| literal_of(l)).collect();

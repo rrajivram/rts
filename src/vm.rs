@@ -104,6 +104,10 @@ pub struct Vm {
     /// coroutine), innermost last. Kept apart from `Frame` so ordinary calls
     /// don't pay for it.
     co_frames: Vec<(usize, Rc<Coroutine>)>,
+    /// `console.group` indentation, `console.count` and `console.time` state.
+    pub console_indent: usize,
+    pub console_counts: rustc_hash::FxHashMap<String, u32>,
+    pub console_timers: rustc_hash::FxHashMap<String, f64>,
 }
 
 /// A number slot's contents as an f64, and an f64 as number slot contents.
@@ -260,6 +264,9 @@ impl Vm {
             args: Vec::new(),
             process: None,
             co_frames: Vec::new(),
+            console_indent: 0,
+            console_counts: Default::default(),
+            console_timers: Default::default(),
             prog,
         }
     }
@@ -267,6 +274,13 @@ impl Vm {
     // ───────────── services for natives ─────────────
 
     pub fn print(&mut self, s: &str) {
+        if self.console_indent > 0 {
+            let pad = " ".repeat(self.console_indent);
+            for line in s.split('\n') {
+                let _ = writeln!(self.out, "{pad}{line}");
+            }
+            return;
+        }
         let _ = writeln!(self.out, "{s}");
     }
     pub fn eprint(&mut self, s: &str) {
@@ -771,6 +785,12 @@ impl Vm {
                 if let Some(x) = found {
                     return self.read_accessor(x, recv);
                 }
+                if name == "constructor" {
+                    return Ok(match &o.class {
+                        Some(c) => Value::Class(c.clone()),
+                        None => Value::Undef,
+                    });
+                }
                 if let Some(g) = Self::accessor(o, "get", name) {
                     let f = Value::Func(Rc::new(Closure { func: g, caps: Box::new([]), props: Default::default() }));
                     return self.call(&f, recv.clone(), vec![]);
@@ -782,6 +802,11 @@ impl Vm {
                 recv.to_display()
             ))),
             Value::Arr(a) if name == "length" => Ok(Value::Num(a.len() as f64)),
+            Value::Class(c) if name == "name" => Ok(Value::Str(JsStr::new(&*c.name))),
+            Value::Func(f) if (name == "name" || name == "length") && f.props.borrow().as_ref().is_none_or(|p| p.get(name).is_none()) => {
+                let fc = &self.prog.funcs[f.func as usize];
+                Ok(if name == "name" { Value::Str(JsStr::new(&*fc.name)) } else { Value::Num(fc.params.len() as f64) })
+            }
             Value::Str(s) if name == "length" => Ok(Value::Num(s.len16() as f64)),
             v => {
                 let r = get_dyn(v, &site.key);
