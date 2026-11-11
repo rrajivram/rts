@@ -193,6 +193,12 @@ pub enum ExprKind {
     NonNull(Box<Expr>),
     Seq(Vec<Expr>),
     Paren(Box<Expr>),
+    Await(Box<Expr>),
+    /// `yield x`, `yield`, `yield* x` (delegate).
+    Yield {
+        arg: Option<Box<Expr>>,
+        delegate: bool,
+    },
 }
 
 // ───────────────────────────── functions & classes ─────────────────────────────
@@ -361,6 +367,8 @@ pub enum StmtKind {
         pat: Pattern,
         iter: Expr,
         body: Box<Stmt>,
+        /// `for await`
+        is_await: bool,
     },
     ForIn {
         kind: VarKind,
@@ -381,4 +389,286 @@ pub enum StmtKind {
     Switch(Expr, Vec<Case>),
     Labeled(Name, Box<Stmt>),
     Empty,
+    Import(Rc<ImportDecl>),
+    Export(Rc<ExportDecl>),
+}
+
+// ───────────────────────────── modules ─────────────────────────────
+
+/// `import d, * as ns from "m"`, `import { a, b as c } from "m"`, `import "m"`.
+#[derive(Debug, Clone)]
+pub struct ImportDecl {
+    pub default: Option<Name>,
+    pub namespace: Option<Name>,
+    pub named: Vec<ImportSpec>,
+    pub from: Name,
+    /// `import type …`: erased.
+    pub type_only: bool,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone)]
+pub struct ImportSpec {
+    pub imported: Name,
+    pub local: Name,
+    pub type_only: bool,
+}
+
+#[derive(Debug, Clone)]
+pub enum ExportDecl {
+    /// `export const/let/function/class/interface/type/enum …`
+    Decl(Stmt),
+    /// `export default function …` / `export default class …` (named or not).
+    DefaultDecl(Stmt),
+    /// `export default <expr>`
+    DefaultExpr(Expr),
+    /// `export { a, b as c }` or `export { a } from "m"`: (local, exported).
+    Named {
+        specs: Vec<(Name, Name)>,
+        from: Option<Name>,
+        span: Span,
+    },
+    /// `export * from "m"` / `export * as ns from "m"`
+    All { from: Name, alias: Option<Name>, span: Span },
+}
+
+// ───────────────────────────── traversal ─────────────────────────────
+
+/// Visit every expression in `stmts` (including inside nested functions and
+/// classes), parents before children. `f` may replace the expression; the
+/// replacement's children are visited next.
+pub fn visit_exprs_mut(stmts: &mut [Stmt], f: &mut dyn FnMut(&mut Expr)) {
+    for s in stmts {
+        visit_stmt(s, f);
+    }
+}
+
+fn visit_stmt(s: &mut Stmt, f: &mut dyn FnMut(&mut Expr)) {
+    match &mut s.kind {
+        StmtKind::Var { decls, .. } => {
+            for d in decls {
+                visit_pattern(&mut d.pat, f);
+                if let Some(e) = &mut d.init {
+                    visit_expr(e, f);
+                }
+            }
+        }
+        StmtKind::Func(func) => visit_function(Rc::make_mut(func), f),
+        StmtKind::Class(c) => visit_class(Rc::make_mut(c), f),
+        StmtKind::Expr(e) | StmtKind::Throw(e) => visit_expr(e, f),
+        StmtKind::Return(e) => {
+            if let Some(e) = e {
+                visit_expr(e, f);
+            }
+        }
+        StmtKind::Block(b) => visit_exprs_mut(b, f),
+        StmtKind::If(c, t, e) => {
+            visit_expr(c, f);
+            visit_stmt(t, f);
+            if let Some(e) = e {
+                visit_stmt(e, f);
+            }
+        }
+        StmtKind::While(c, b) => {
+            visit_expr(c, f);
+            visit_stmt(b, f);
+        }
+        StmtKind::DoWhile(b, c) => {
+            visit_stmt(b, f);
+            visit_expr(c, f);
+        }
+        StmtKind::For { init, test, update, body } => {
+            if let Some(i) = init {
+                visit_stmt(i, f);
+            }
+            if let Some(t) = test {
+                visit_expr(t, f);
+            }
+            if let Some(u) = update {
+                visit_expr(u, f);
+            }
+            visit_stmt(body, f);
+        }
+        StmtKind::ForOf { pat, iter, body, .. } => {
+            visit_pattern(pat, f);
+            visit_expr(iter, f);
+            visit_stmt(body, f);
+        }
+        StmtKind::ForIn { obj, body, .. } => {
+            visit_expr(obj, f);
+            visit_stmt(body, f);
+        }
+        StmtKind::Try { block, handler, finalizer, param } => {
+            visit_exprs_mut(block, f);
+            if let Some(p) = param {
+                visit_pattern(p, f);
+            }
+            if let Some(h) = handler {
+                visit_exprs_mut(h, f);
+            }
+            if let Some(fin) = finalizer {
+                visit_exprs_mut(fin, f);
+            }
+        }
+        StmtKind::Switch(d, cases) => {
+            visit_expr(d, f);
+            for c in cases {
+                if let Some(t) = &mut c.test {
+                    visit_expr(t, f);
+                }
+                visit_exprs_mut(&mut c.body, f);
+            }
+        }
+        StmtKind::Labeled(_, b) => visit_stmt(b, f),
+        StmtKind::Export(e) => match Rc::make_mut(e) {
+            ExportDecl::Decl(s) | ExportDecl::DefaultDecl(s) => visit_stmt(s, f),
+            ExportDecl::DefaultExpr(e) => visit_expr(e, f),
+            _ => {}
+        },
+        StmtKind::Interface { .. } | StmtKind::TypeAlias { .. } | StmtKind::Enum { .. } => {
+            if let StmtKind::Enum { members, .. } = &mut s.kind {
+                for (_, init, _) in members {
+                    if let Some(e) = init {
+                        visit_expr(e, f);
+                    }
+                }
+            }
+        }
+        StmtKind::Break(_) | StmtKind::Continue(_) | StmtKind::Empty | StmtKind::Import(_) => {}
+    }
+}
+
+fn visit_pattern(p: &mut Pattern, f: &mut dyn FnMut(&mut Expr)) {
+    match p {
+        Pattern::Ident(..) => {}
+        Pattern::Object { props, rest, .. } => {
+            for (_, p, d) in props {
+                visit_pattern(p, f);
+                if let Some(d) = d {
+                    visit_expr(d, f);
+                }
+            }
+            if let Some(r) = rest {
+                visit_pattern(r, f);
+            }
+        }
+        Pattern::Array { elems, rest, .. } => {
+            for (p, d) in elems.iter_mut().flatten() {
+                visit_pattern(p, f);
+                if let Some(d) = d {
+                    visit_expr(d, f);
+                }
+            }
+            if let Some(r) = rest {
+                visit_pattern(r, f);
+            }
+        }
+    }
+}
+
+fn visit_function(func: &mut Function, f: &mut dyn FnMut(&mut Expr)) {
+    for p in &mut func.params {
+        visit_pattern(&mut p.pat, f);
+        if let Some(d) = &mut p.default {
+            visit_expr(d, f);
+        }
+    }
+    match &mut func.body {
+        Some(Body::Block(b)) => visit_exprs_mut(b, f),
+        Some(Body::Expr(e)) => visit_expr(e, f),
+        None => {}
+    }
+}
+
+fn visit_class(c: &mut ClassDecl, f: &mut dyn FnMut(&mut Expr)) {
+    if let Some((e, _)) = &mut c.extends {
+        visit_expr(e, f);
+    }
+    for m in &mut c.members {
+        match m {
+            ClassMember::Field { init, .. } => {
+                if let Some(e) = init {
+                    visit_expr(e, f);
+                }
+            }
+            ClassMember::Method { func, .. } | ClassMember::Constructor(func) => visit_function(Rc::make_mut(func), f),
+            ClassMember::StaticBlock(b) => visit_exprs_mut(b, f),
+        }
+    }
+}
+
+fn visit_elems(elems: &mut [ArrayElem], f: &mut dyn FnMut(&mut Expr)) {
+    for e in elems {
+        match e {
+            ArrayElem::Expr(e) | ArrayElem::Spread(e) => visit_expr(e, f),
+            ArrayElem::Hole => {}
+        }
+    }
+}
+
+pub fn visit_expr(e: &mut Expr, f: &mut dyn FnMut(&mut Expr)) {
+    f(e);
+    match &mut e.kind {
+        ExprKind::Template { exprs, .. } => {
+            for x in exprs {
+                visit_expr(x, f);
+            }
+        }
+        ExprKind::Array(elems) => visit_elems(elems, f),
+        ExprKind::Object(props) => {
+            for p in props {
+                match p {
+                    ObjProp::Init { key, value } => {
+                        if let PropKey::Computed(k) = key {
+                            visit_expr(k, f);
+                        }
+                        visit_expr(value, f);
+                    }
+                    ObjProp::Spread(x) => visit_expr(x, f),
+                }
+            }
+        }
+        ExprKind::Func(func) => visit_function(Rc::make_mut(func), f),
+        ExprKind::Class(c) => visit_class(Rc::make_mut(c), f),
+        ExprKind::Unary(_, x)
+        | ExprKind::Update { target: x, .. }
+        | ExprKind::OptChain(x)
+        | ExprKind::As(x, _)
+        | ExprKind::Satisfies(x, _)
+        | ExprKind::NonNull(x)
+        | ExprKind::Paren(x)
+        | ExprKind::Await(x)
+        | ExprKind::Member { obj: x, .. } => visit_expr(x, f),
+        ExprKind::Yield { arg, .. } => {
+            if let Some(x) = arg {
+                visit_expr(x, f);
+            }
+        }
+        ExprKind::Binary(_, a, b) | ExprKind::Logical(_, a, b) | ExprKind::Assign(_, a, b) | ExprKind::Index { obj: a, index: b, .. } => {
+            visit_expr(a, f);
+            visit_expr(b, f);
+        }
+        ExprKind::Cond(a, b, c) => {
+            visit_expr(a, f);
+            visit_expr(b, f);
+            visit_expr(c, f);
+        }
+        ExprKind::Call { callee, args, .. } | ExprKind::New { callee, args, .. } => {
+            visit_expr(callee, f);
+            visit_elems(args, f);
+        }
+        ExprKind::Seq(xs) => {
+            for x in xs {
+                visit_expr(x, f);
+            }
+        }
+        ExprKind::Num(_)
+        | ExprKind::BigInt(_)
+        | ExprKind::Str(_)
+        | ExprKind::Bool(_)
+        | ExprKind::Null
+        | ExprKind::This
+        | ExprKind::Super
+        | ExprKind::Ident(_) => {}
+    }
 }

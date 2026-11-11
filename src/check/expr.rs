@@ -23,6 +23,8 @@ impl Checker {
     pub fn check_expr(&mut self, e: &Expr, want: Option<&Type>) -> CResult<HExpr> {
         let span = e.span;
         Ok(match &e.kind {
+            ExprKind::Await(x) => self.check_await(x, want, e.span)?,
+            ExprKind::Yield { arg, delegate } => self.check_yield(arg.as_deref(), *delegate, e.span)?,
             ExprKind::Num(v) => HExpr::num(*v),
             ExprKind::BigInt(v) => HExpr::new(HK::BigInt(*v), Type::BigInt),
             ExprKind::Str(s) => HExpr::new(HK::Str(s.clone()), Type::StrLit(s.clone())),
@@ -127,6 +129,69 @@ impl Checker {
         })
     }
 
+    fn check_await(&mut self, x: &Expr, want: Option<&Type>, span: Span) -> CResult<HExpr> {
+        self.allow_await(span)?;
+        let want_p = want.map(|w| Type::union([w.clone(), Type::promise(w.clone())]));
+        let h = self.check_expr(x, want_p.as_ref())?;
+        let t = if self.erase { Type::Any } else { h.ty.awaited() };
+        Ok(HExpr::new(HK::Await(Box::new(h)), t))
+    }
+
+    /// `await` is allowed in async functions and at the top level of a module
+    /// (which then runs as an async function).
+    pub fn allow_await(&mut self, span: Span) -> CResult<()> {
+        if self.ctx().func == MAIN {
+            self.ctx_mut().is_async = true;
+            return Ok(());
+        }
+        if !self.ctx().is_async {
+            return err("'await' is only allowed in async functions and at the top level of a module", span);
+        }
+        Ok(())
+    }
+
+    fn check_yield(&mut self, arg: Option<&Expr>, delegate: bool, span: Span) -> CResult<HExpr> {
+        if !self.ctx().is_generator {
+            return err("'yield' is only allowed in generator functions", span);
+        }
+        let is_async = self.ctx().is_async;
+        if delegate {
+            let Some(x) = arg else { return err("'yield*' needs an operand", span) };
+            if is_async {
+                return err("'yield*' in async generators is not supported yet", span);
+            }
+            let h = self.check_expr(x, None)?;
+            let Some(elem) = self.iter_elem(&h.ty) else {
+                return err(format!("type '{}' is not iterable", self.show(&h.ty)), x.span);
+            };
+            self.ctx_mut().yields.push(elem);
+            let t = match &h.ty {
+                Type::Iter(it) => it.return_ty.clone(),
+                _ => Type::Any,
+            };
+            let t = if self.erase || matches!(t, Type::Void) { Type::Any } else { t };
+            return Ok(HExpr::new(HK::YieldStar(Box::new(h)), t));
+        }
+        let want = self.ctx().yield_ty.clone();
+        let h = match arg {
+            Some(x) => {
+                let want_p = match (&want, is_async) {
+                    (Some(w), true) => Some(Type::union([w.clone(), Type::promise(w.clone())])),
+                    (w, _) => w.clone(),
+                };
+                self.check_expr(x, want_p.as_ref())?
+            }
+            None => HExpr::undefined(),
+        };
+        let yielded = if is_async { h.ty.awaited() } else { h.ty.clone() };
+        if let Some(w) = &want {
+            self.expect_assignable(&yielded, w, arg.map_or(span, |a| a.span))?;
+        }
+        self.ctx_mut().yields.push(yielded);
+        let t = if self.erase { Type::Any } else { self.ctx().next_ty.clone() };
+        Ok(HExpr::new(HK::Yield(Box::new(h)), t))
+    }
+
     fn check_template(&mut self, quasis: &[Name], exprs: &[Expr]) -> CResult<HExpr> {
         if exprs.is_empty() {
             return Ok(HExpr::new(HK::Str(quasis[0].clone()), Type::StrLit(quasis[0].clone())));
@@ -171,7 +236,14 @@ impl Checker {
         match self.lookup_val(n) {
             Some(VB::Var(v)) => {
                 if self.var_pending[v as usize] {
-                    return err(format!("variable '{n}' is used before its declaration"), span);
+                    // Inside a nested function the read happens later, when the
+                    // variable is initialized (its type isn't known yet).
+                    let owner = self.vars[v as usize].owner.unwrap_or(MAIN);
+                    if owner == self.ctx().func || (self.vars[v as usize].owner.is_none() && self.ctx().func == MAIN) {
+                        return err(format!("variable '{n}' is used before its declaration"), span);
+                    }
+                    self.note_var_use(v);
+                    return Ok(HExpr::read(Place::Var(v), Type::Any));
                 }
                 if let Some(c) = &self.var_const_val[v as usize] {
                     return Ok(c.clone());
@@ -201,6 +273,7 @@ impl Checker {
                 _ => err(format!("'{n}' cannot be used as a value"), span),
             },
             Some(VB::NativeFn(f)) => Ok(HExpr::new(HK::NativeFn(f), Type::Func(global_fn_type(f)))),
+            Some(VB::Namespace(m)) => self.namespace_object(m, span),
             None => err(format!("cannot find name '{n}'"), span),
         }
     }
@@ -619,6 +692,12 @@ impl Checker {
                 ExprKind::Ident(n) => match self.lookup_val(n) {
                     Some(VB::Class(c)) => Ok(HExpr::new(HK::InstanceOf(Box::new(ha), c), Type::Boolean)),
                     Some(VB::Builtin(BuiltinNs::Array)) => Ok(self.native_call(Native::ArrIsArray, None, vec![HElem::Expr(ha)], Type::Boolean)),
+                    Some(VB::Builtin(BuiltinNs::Promise | BuiltinNs::MapCtor | BuiltinNs::SetCtor | BuiltinNs::Object)) | None
+                        if matches!(&**n, "Promise" | "Map" | "Set" | "Object" | "Function" | "Date" | "RegExp" | "Symbol") =>
+                    {
+                        let args = vec![HElem::Expr(ha), HElem::Expr(HExpr::str(n))];
+                        Ok(self.native_call(Native::IsInstanceOfBuiltin, None, args, Type::Boolean))
+                    }
                     _ => err(format!("'instanceof {n}' is not supported"), b.span),
                 },
                 _ => err("the right side of 'instanceof' must be a class name", b.span),
@@ -1063,6 +1142,16 @@ impl Checker {
                                 return self.check_array_from(args, span);
                             }
                             let (hargs, ret, _) = self.check_args(&ft, args, &explicit, span)?;
+                            let ret = match nat {
+                                Native::PromiseAll | Native::PromiseAllSettled | Native::PromiseRace | Native::PromiseAny => {
+                                    let at = match hargs.first() {
+                                        Some(HElem::Expr(h)) => Some(h.ty.clone()),
+                                        _ => None,
+                                    };
+                                    self.promise_combinator_type(nat, at.as_ref())
+                                }
+                                _ => ret,
+                            };
                             return Ok(self.native_call(nat, None, hargs, ret));
                         }
                         Some(VB::Class(cid)) => {
@@ -1632,6 +1721,31 @@ impl Checker {
                 let (hargs, _, subst) = self.check_args(&ft, args, &ex, span)?;
                 let targs: Vec<Type> = tps.iter().map(|t| subst.get(t).cloned().unwrap_or(Type::Any)).collect();
                 Ok(HExpr::new(HK::New { class: cid, args: hargs }, Type::Class(cid, targs.into())))
+            }
+            Some(VB::Builtin(BuiltinNs::Promise)) => {
+                let mut t = explicit.first().cloned();
+                if t.is_none()
+                    && let Some(Type::Promise(w)) = want.map(|w| self.pick_member(w, |t| matches!(t, Type::Promise(_))))
+                {
+                    t = Some((*w).clone());
+                }
+                let t = t.unwrap_or(Type::Any);
+                let fnt = |params: Vec<FParam>| Type::func(params, Type::Void);
+                let fp = |name: &str, ty: Type, optional: bool| FParam {
+                    name: name.into(),
+                    ty,
+                    optional,
+                    rest: false,
+                };
+                let resolve = fnt(vec![fp("value", Type::union([t.clone(), Type::promise(t.clone())]), true)]);
+                let reject = fnt(vec![fp("reason", Type::Any, true)]);
+                let exec = Rc::new(FuncType {
+                    tparams: vec![],
+                    params: vec![fp("executor", fnt(vec![fp("resolve", resolve, false), fp("reject", reject, false)]), false)],
+                    ret: Type::Void,
+                });
+                let (hargs, _, _) = self.check_args(&exec, args, &[], span)?;
+                Ok(HExpr::new(HK::NewBuiltin(Native::PromiseNew, hargs), Type::promise(t)))
             }
             Some(VB::Builtin(BuiltinNs::MapCtor)) => {
                 let (mut k, mut v) = (explicit.first().cloned(), explicit.get(1).cloned());

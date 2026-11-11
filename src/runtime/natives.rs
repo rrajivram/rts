@@ -60,6 +60,23 @@ natives! {
     SetNew = "Set", SetAdd = "add", SetHas = "has", SetDelete = "delete", SetClear = "clear", SetSize = "size",
     SetForEach = "forEach", SetValues = "values",
     DateNow = "now", PerfNow = "now",
+    GenNext = "next", GenReturn = "return", GenThrow = "throw", IterSelf = "\u{2}Symbol.iterator",
+    SymbolFn = "Symbol", SymbolFor = "for",
+    PromiseNew = "Promise", PromiseResolveFunction = "", PromiseRejectFunction = "", PromiseThunk = "",
+    PromiseThen = "then", PromiseCatch = "catch", PromiseFinally = "finally", PromiseResolve = "resolve",
+    PromiseReject = "reject", PromiseAll = "all", PromiseAllSettled = "allSettled", PromiseAny = "any",
+    PromiseRace = "race", PromiseWithResolvers = "withResolvers",
+    SetTimeout = "setTimeout", SetInterval = "setInterval", SetImmediate = "setImmediate",
+    ClearTimeout = "clearTimeout", QueueMicrotask = "queueMicrotask", NextTick = "nextTick",
+    FunctionBind = "bind", FunctionCall = "call", FunctionApply = "apply",
+    SymbolWellKnown = "", IsInstanceOfBuiltin = "",
+}
+
+impl Native {
+    /// Implemented in `vm_task.rs` (generators, promises, timers, functions).
+    pub fn is_task(self) -> bool {
+        (self as u16) >= (Native::GenNext as u16)
+    }
 }
 
 fn arg(args: &[Value], i: usize) -> Value {
@@ -388,7 +405,8 @@ fn contains_bigint(v: &Value, depth: usize) -> bool {
 
 pub fn json_stringify(v: &Value, indent: &str, cur: &str, out: &mut String) -> bool {
     match v {
-        Value::Undef | Value::Func(_) | Value::Native(_) | Value::Class(_) => return false,
+        Value::Undef | Value::Func(_) | Value::Native(_) | Value::Class(_) | Value::Bound(_) | Value::Symbol(_) => return false,
+        Value::Gen(_) | Value::Promise(_) | Value::Iter(_) => out.push_str("{}"),
         // JSON.stringify checks for BigInts (a TypeError) before getting here.
         Value::BigInt(n) => out.push_str(&n.to_string()),
         Value::Null => out.push_str("null"),
@@ -436,6 +454,9 @@ pub fn json_stringify(v: &Value, indent: &str, cur: &str, out: &mut String) -> b
             out.push('{');
             let mut first = true;
             for (k, x) in keys.iter().zip(vals.iter()) {
+                if task::is_symbol_key(k) {
+                    continue;
+                }
                 let mark = out.len();
                 if !first {
                     out.push(',');
@@ -483,6 +504,14 @@ fn json_quote(s: &str, out: &mut String) {
         }
     }
     out.push('"');
+}
+
+/// Parse JSON text (used by the module loader for package.json).
+pub fn parse_json(s: &str) -> Option<Value> {
+    let mut p = JsonParser { b: s.as_bytes(), s, i: 0 };
+    let v = p.value().ok()?;
+    p.ws();
+    (p.i == p.b.len()).then_some(v)
 }
 
 struct JsonParser<'a> {
@@ -667,6 +696,15 @@ pub fn iterate(vm: &mut Vm, v: &Value) -> Result<Vec<Value>, Value> {
             .map(|(k, x)| Value::Arr(Array::new_val(vec![k.0.clone(), x.clone()])))
             .collect(),
         Value::Set(s) => s.borrow().iter().map(|k| k.0.clone()).collect(),
+        Value::Iter(i) => i.rest(),
+        Value::Gen(_) | Value::Obj(_) => {
+            let it = vm.get_iterator(v)?;
+            let mut out = Vec::new();
+            while let Some(x) = vm.iterator_step(&it)? {
+                out.push(x);
+            }
+            out
+        }
         v => return Err(vm.type_error(format!("{} is not iterable", v.type_of()))),
     })
 }
@@ -677,6 +715,7 @@ pub fn call_native(vm: &mut Vm, n: Native, this: Value, args: Vec<Value>) -> NRe
         Err(vm.type_error(m))
     }
     Ok(match n {
+        n if n.is_task() => return crate::vm::call_task_native(vm, n, this, args),
         ConsoleLog | ConsoleError | ConsoleWarn => {
             let line = args
                 .iter()
@@ -1481,6 +1520,7 @@ pub fn call_native(vm: &mut Vm, n: Native, this: Value, args: Vec<Value>) -> NRe
                 .map_or(0.0, |d| d.as_millis() as f64),
         ),
         PerfNow => Value::Num(vm.start.elapsed().as_secs_f64() * 1000.0),
+        _ => unreachable!(),
     })
 }
 
@@ -1612,6 +1652,10 @@ pub fn method_by_name(recv: &Value, name: &str) -> Option<Native> {
         Value::BigInt(_) => &[NumToString],
         Value::Map(_) => &[MapGet, MapSet, MapHas, MapDelete, MapClear, MapForEach, MapKeys, MapValues, MapEntries],
         Value::Set(_) => &[SetAdd, SetHas, SetDelete, SetClear, SetForEach, SetValues],
+        Value::Gen(_) => &[GenNext, GenReturn, GenThrow, IterSelf],
+        Value::Iter(_) => &[GenNext, IterSelf],
+        Value::Promise(_) => &[PromiseThen, PromiseCatch, PromiseFinally],
+        Value::Func(_) | Value::Native(_) | Value::Bound(_) => &[FunctionBind, FunctionCall, FunctionApply],
         _ => &[],
     };
     all.iter().copied().find(|n| n.name() == name).or(match (recv, name) {

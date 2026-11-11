@@ -63,6 +63,8 @@ struct TryCtx {
     finalizer: Option<Vec<HStmt>>,
     /// Has an active TryBegin handler that must be popped when jumping out.
     has_handler: bool,
+    /// A `for-of` iterator (in this value slot) to close when jumping out.
+    close_iterator: Option<u16>,
 }
 
 pub fn compile(hir: &HProgram) -> Program {
@@ -235,6 +237,11 @@ impl<'a> Codegen<'a> {
             }
             g.bind_arrival(p.var, p.arrival, r);
         }
+        if hf.is_generator {
+            g.emit(Instruction::CreateGenerator);
+        } else if hf.is_async {
+            g.emit(Instruction::StartAsync);
+        }
         for st in &hf.body {
             g.stmt(st);
         }
@@ -249,6 +256,8 @@ impl<'a> Codegen<'a> {
         }
         let name = hf.name.clone();
         FunctionCode {
+            id: fid,
+            is_async: hf.is_async,
             name,
             code: g.code,
             scalar_slots: g.max_s as usize,
@@ -404,7 +413,9 @@ impl FnGen<'_, '_> {
             | Instruction::JumpIf { to: t, .. }
             | Instruction::JumpIfCompare { to: t, .. }
             | Instruction::JumpIfTruthy { to: t, .. }
-            | Instruction::JumpIfNullish { to: t, .. } => *t = target,
+            | Instruction::JumpIfNullish { to: t, .. }
+            | Instruction::IteratorStep { to: t, .. }
+            | Instruction::UnpackIteratorResult { to: t, .. } => *t = target,
             Instruction::TryBegin { catch, .. } => *catch = target,
             other => panic!("patching non-jump {other:?}"),
         }
@@ -767,7 +778,11 @@ impl FnGen<'_, '_> {
                     self.patch_here(b);
                 }
             }
-            HStmt::ForOf { label, elem, iter, body } | HStmt::ForIn {
+            HStmt::ForOf { label, elem, iter, body, is_await: true } => self.for_await(label, *elem, iter, body),
+            HStmt::ForOf { label, elem, iter, body, .. } if !matches!(iter.ty.non_null(), Type::Array(_) | Type::Tuple(_) | Type::String | Type::StrLit(_) | Type::Map(..) | Type::Set(_)) => {
+                self.for_of_iterator(label, *elem, iter, body)
+            }
+            HStmt::ForOf { label, elem, iter, body, .. } | HStmt::ForIn {
                 label,
                 key: elem,
                 obj: iter,
@@ -926,6 +941,189 @@ impl FnGen<'_, '_> {
         }
     }
 
+    /// A number slot holding `v` (for comparing a resume mode).
+    fn num_const(&mut self, v: f64) -> u16 {
+        if let Some(r) = self.num_regs.get(&v.to_bits()) {
+            return *r;
+        }
+        let r = self.alloc_s();
+        self.emit(Instruction::LoadNumber { output: NumSlot(r), value: v });
+        r
+    }
+
+    /// `await` the value in slot `v`: a rejection throws. Result in a value slot.
+    fn await_value(&mut self, v: u16) -> Op {
+        let received = self.alloc_v();
+        let mode = self.alloc_s();
+        self.emit(Instruction::Await { value: ValSlot(v), received: ValSlot(received), mode: NumSlot(mode) });
+        let zero = self.num_const(0.0);
+        let j = self.emit(Instruction::JumpIfCompare { op: CmpOp::Eq, when: true, left: NumSlot(mode), right: NumSlot(zero), to: 0 });
+        self.emit(Instruction::Throw { value: ValSlot(received) });
+        self.patch_here(j);
+        Op { k: Kind::Val, r: received }
+    }
+
+    /// Return the value in `o` from the function, running finalizers.
+    fn return_op(&mut self, o: Op) {
+        let t = self.alloc(Kind::Val);
+        let o = self.coerce(o, Kind::Val);
+        self.mov(t, o);
+        self.exit_tries(0);
+        self.emit(Instruction::ReturnValue { value: ValSlot(t.r) });
+    }
+
+    /// `yield` the value in slot `v`, then act on how the generator was
+    /// resumed: `throw(e)` throws, `return(x)` returns.
+    fn yield_value(&mut self, v: u16) -> Op {
+        let received = self.alloc_v();
+        let mode = self.alloc_s();
+        self.emit(Instruction::Yield { value: ValSlot(v), received: ValSlot(received), mode: NumSlot(mode) });
+        let one = self.num_const(1.0);
+        let not_throw = self.emit(Instruction::JumpIfCompare { op: CmpOp::Eq, when: false, left: NumSlot(mode), right: NumSlot(one), to: 0 });
+        self.emit(Instruction::Throw { value: ValSlot(received) });
+        self.patch_here(not_throw);
+        let two = self.num_const(2.0);
+        let not_return = self.emit(Instruction::JumpIfCompare { op: CmpOp::Eq, when: false, left: NumSlot(mode), right: NumSlot(two), to: 0 });
+        let m = self.mark();
+        self.return_op(Op { k: Kind::Val, r: received });
+        self.reset(m);
+        self.patch_here(not_return);
+        Op { k: Kind::Val, r: received }
+    }
+
+    /// `yield* v`: forward every resumption to the inner iterator.
+    fn yield_star(&mut self, v: u16) -> Op {
+        let it = self.alloc_v();
+        self.emit(Instruction::GetIterator { value: ValSlot(v), output: ValSlot(it) });
+        let received = self.alloc_v();
+        self.emit(Instruction::LoadUndefined { output: ValSlot(received) });
+        let mode = self.alloc_s();
+        self.emit(Instruction::LoadNumber { output: NumSlot(mode), value: 0.0 });
+        let res = self.alloc_v();
+        let done = self.alloc_s();
+        let top = self.here();
+        self.emit(Instruction::IteratorResume {
+            iterator: ValSlot(it),
+            mode: NumSlot(mode),
+            value: ValSlot(received),
+            output: ValSlot(res),
+            done: BoolSlot(done),
+        });
+        let exit = self.emit(Instruction::JumpIf { when: true, condition: BoolSlot(done), to: 0 });
+        self.emit(Instruction::Yield { value: ValSlot(res), received: ValSlot(received), mode: NumSlot(mode) });
+        self.emit(Instruction::Jump { to: top });
+        self.patch_here(exit);
+        let two = self.num_const(2.0);
+        let not_return = self.emit(Instruction::JumpIfCompare { op: CmpOp::Eq, when: false, left: NumSlot(mode), right: NumSlot(two), to: 0 });
+        let m = self.mark();
+        self.return_op(Op { k: Kind::Val, r: res });
+        self.reset(m);
+        self.patch_here(not_return);
+        Op { k: Kind::Val, r: res }
+    }
+
+    /// Bind the loop variable from the element in slot `el` and run the body.
+    fn loop_body(&mut self, elem: VarId, el: u16, body: &[HStmt]) {
+        let bm = self.mark();
+        let ek = self.var_info(elem).kind();
+        let el = self.coerce(Op { k: Kind::Val, r: el }, ek);
+        self.homes.remove(&elem);
+        self.init_var(elem, Some(el));
+        self.block(body);
+        self.reset(bm);
+    }
+
+    /// `for (x of iterable)` through the iterator protocol (generators,
+    /// user iterables, `any`). Leaving early calls the iterator's `return()`.
+    fn for_of_iterator(&mut self, label: &Option<Name>, elem: VarId, iter: &HExpr, body: &[HStmt]) {
+        let m = self.mark();
+        let src = self.expr(iter);
+        let src = self.coerce(src, Kind::Val);
+        let it = self.alloc_v();
+        self.emit(Instruction::GetIterator { value: ValSlot(src.r), output: ValSlot(it) });
+        let exc = self.alloc_v();
+        let begin = self.emit(Instruction::TryBegin { catch: 0, exception: ValSlot(exc) });
+        self.tries.push(TryCtx {
+            finalizer: None,
+            has_handler: true,
+            close_iterator: Some(it),
+        });
+        self.loops.push(LoopCtx {
+            label: label.clone(),
+            is_switch: false,
+            breaks: vec![],
+            continues: vec![],
+            try_depth: self.tries.len(),
+        });
+        let el = self.alloc_v();
+        let top = self.here();
+        let exit = self.emit(Instruction::IteratorStep { iterator: ValSlot(it), output: ValSlot(el), to: 0 });
+        self.loop_body(elem, el, body);
+        self.emit(Instruction::Jump { to: top });
+        let ctx = self.loops.pop().unwrap();
+        for c in ctx.continues {
+            self.patch(c, top);
+        }
+        // `break`: close the iterator; running out: it is already done.
+        let has_breaks = !ctx.breaks.is_empty();
+        for b in ctx.breaks {
+            self.patch_here(b);
+        }
+        if has_breaks {
+            self.emit(Instruction::IteratorClose { iterator: ValSlot(it) });
+        }
+        self.patch_here(exit);
+        self.tries.pop();
+        self.emit(Instruction::TryEnd);
+        let end = self.jump_placeholder();
+        // An exception in the body: close the iterator, then rethrow.
+        self.patch_here(begin);
+        self.emit(Instruction::IteratorClose { iterator: ValSlot(it) });
+        self.emit(Instruction::Throw { value: ValSlot(exc) });
+        self.patch_here(end);
+        self.emit(Instruction::LoadUndefined { output: ValSlot(it) });
+        self.reset(m);
+    }
+
+    /// `for await (x of iterable)`
+    fn for_await(&mut self, label: &Option<Name>, elem: VarId, iter: &HExpr, body: &[HStmt]) {
+        let m = self.mark();
+        let src = self.expr(iter);
+        let src = self.coerce(src, Kind::Val);
+        let it = self.alloc_v();
+        let sync = self.alloc_s();
+        self.emit(Instruction::GetAsyncIterator { value: ValSlot(src.r), output: ValSlot(it), is_sync: BoolSlot(sync) });
+        self.loops.push(LoopCtx {
+            label: label.clone(),
+            is_switch: false,
+            breaks: vec![],
+            continues: vec![],
+            try_depth: self.tries.len(),
+        });
+        let res = self.alloc_v();
+        let el = self.alloc_v();
+        let top = self.here();
+        self.emit(Instruction::IteratorNextResult { iterator: ValSlot(it), output: ValSlot(res) });
+        let r = self.await_value(res);
+        let exit = self.emit(Instruction::UnpackIteratorResult { result: ValSlot(r.r), output: ValSlot(el), to: 0 });
+        let async_it = self.emit(Instruction::JumpIf { when: false, condition: BoolSlot(sync), to: 0 });
+        let v = self.await_value(el);
+        self.emit(Instruction::CopyValue { to: ValSlot(el), from: ValSlot(v.r) });
+        self.patch_here(async_it);
+        self.loop_body(elem, el, body);
+        self.emit(Instruction::Jump { to: top });
+        let ctx = self.loops.pop().unwrap();
+        for c in ctx.continues {
+            self.patch(c, top);
+        }
+        self.patch_here(exit);
+        for b in ctx.breaks {
+            self.patch_here(b);
+        }
+        self.emit(Instruction::LoadUndefined { output: ValSlot(it) });
+        self.reset(m);
+    }
+
     fn patch_all_here(&mut self, js: Vec<usize>) {
         for j in js {
             self.patch_here(j);
@@ -939,6 +1137,9 @@ impl FnGen<'_, '_> {
             i -= 1;
             if self.tries[i].has_handler {
                 self.emit(Instruction::TryEnd);
+            }
+            if let Some(it) = self.tries[i].close_iterator {
+                self.emit(Instruction::IteratorClose { iterator: ValSlot(it) });
             }
             if let Some(f) = self.tries[i].finalizer.clone() {
                 // Run the finalizer outside its own region.
@@ -955,6 +1156,7 @@ impl FnGen<'_, '_> {
         self.tries.push(TryCtx {
             finalizer: finalizer.cloned(),
             has_handler: true,
+            close_iterator: None,
         });
         self.block(block);
         self.tries.pop();
@@ -974,6 +1176,7 @@ impl FnGen<'_, '_> {
                 self.tries.push(TryCtx {
                     finalizer: finalizer.cloned(),
                     has_handler: true,
+                    close_iterator: None,
                 });
                 (Some(exc2), Some(b2))
             } else {
@@ -1364,6 +1567,22 @@ impl FnGen<'_, '_> {
                 let kk = self.konst(Value::Native(*n));
                 self.emit(Instruction::LoadConstant { output: ValSlot(d), constant: kk });
                 Op { k: Kind::Val, r: d }
+            }
+            HK::Await(x) => {
+                let v = self.expr(x);
+                let v = self.coerce(v, Kind::Val);
+                self.await_value(v.r)
+            }
+            HK::Yield(x) => {
+                let v = self.expr(x);
+                let v = self.coerce(v, Kind::Val);
+                let v = if self.cg.hir.funcs[self.fid as usize].is_async { self.await_value(v.r) } else { v };
+                self.yield_value(v.r)
+            }
+            HK::YieldStar(x) => {
+                let v = self.expr(x);
+                let v = self.coerce(v, Kind::Val);
+                self.yield_star(v.r)
             }
             HK::Delete(o, key) => {
                 let o = self.expr(o);
@@ -2683,6 +2902,8 @@ impl FnGen<'_, '_> {
     fn can_inline(&self, fid: FuncId) -> bool {
         let hf = &self.cg.hir.funcs[fid as usize];
         hf.this_var.is_none()
+            && !hf.is_async
+            && !hf.is_generator
             && hf.params.iter().all(|p| p.default.is_none() && !p.rest)
             && self.inline.len() < 4
             && hf.free.iter().all(|v| self.homes.contains_key(v) || self.cg.globals.contains_key(v))
@@ -3019,7 +3240,9 @@ fn collect_nums_expr(e: &HExpr, out: &mut Vec<f64>, hir: &HProgram) {
                 }
             }
         }
-        HK::Unary(_, x) | HK::Cast(x) | HK::OptChain(x) | HK::InstanceOf(x, _) => collect_nums_expr(x, out, hir),
+        HK::Unary(_, x) | HK::Cast(x) | HK::OptChain(x) | HK::InstanceOf(x, _) | HK::Await(x) | HK::Yield(x) | HK::YieldStar(x) => {
+            collect_nums_expr(x, out, hir)
+        }
         HK::Binary(_, a, b) | HK::Logical(_, a, b) | HK::Delete(a, b) => {
             collect_nums_expr(a, out, hir);
             collect_nums_expr(b, out, hir);
@@ -3074,7 +3297,9 @@ fn jump_target(i: &mut Instruction) -> Option<&mut u32> {
         | Instruction::JumpIf { to: t, .. }
         | Instruction::JumpIfCompare { to: t, .. }
         | Instruction::JumpIfTruthy { to: t, .. }
-        | Instruction::JumpIfNullish { to: t, .. } => Some(t),
+        | Instruction::JumpIfNullish { to: t, .. }
+        | Instruction::IteratorStep { to: t, .. }
+        | Instruction::UnpackIteratorResult { to: t, .. } => Some(t),
         Instruction::TryBegin { catch, .. } => Some(catch),
         _ => None,
     }

@@ -57,3 +57,51 @@ impl fmt::Display for CompileError {
         f.write_str(&self.message)
     }
 }
+
+/// Every source file of a program, laid out one after another in a single
+/// offset space: a span's offset identifies both the file and the position.
+#[derive(Debug, Default)]
+pub struct Sources {
+    pub files: Vec<SourceFile>,
+    next: usize,
+}
+
+#[derive(Debug)]
+pub struct SourceFile {
+    /// Path as shown in messages.
+    pub name: String,
+    pub src: String,
+    pub base: usize,
+}
+
+impl Sources {
+    /// Add a file; returns its base offset (pass it to `lexer::tokenize_at`).
+    pub fn add(&mut self, name: String, src: String) -> usize {
+        let base = self.next;
+        // Leave a gap so an end-of-file span never lands in the next file.
+        self.next += src.len() + 1;
+        self.files.push(SourceFile { name, src, base });
+        base
+    }
+
+    pub fn file_at(&self, offset: u32) -> Option<&SourceFile> {
+        self.files.iter().rev().find(|f| f.base <= offset as usize)
+    }
+
+    /// `file:line:col: error: message` plus the offending source line.
+    pub fn render(&self, e: &CompileError) -> String {
+        match self.file_at(e.span.start) {
+            Some(f) => {
+                let local = CompileError {
+                    message: e.message.clone(),
+                    span: Span {
+                        start: e.span.start - f.base as u32,
+                        end: e.span.end.saturating_sub(f.base as u32),
+                    },
+                };
+                local.render(&f.name, &f.src)
+            }
+            None => format!("error: {}", e.message),
+        }
+    }
+}

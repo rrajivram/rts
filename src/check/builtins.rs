@@ -20,6 +20,8 @@ pub fn install_globals(module: &Rc<Scope>) {
         ("Boolean", BuiltinNs::Boolean),
         ("Map", BuiltinNs::MapCtor),
         ("Set", BuiltinNs::SetCtor),
+        ("Promise", BuiltinNs::Promise),
+        ("Symbol", BuiltinNs::Symbol),
     ] {
         v.insert(n.into(), VB::Builtin(ns));
     }
@@ -29,6 +31,13 @@ pub fn install_globals(module: &Rc<Scope>) {
         ("isNaN", Native::IsNaN),
         ("isFinite", Native::IsFinite),
         ("BigInt", Native::BigIntFn),
+        ("setTimeout", Native::SetTimeout),
+        ("setInterval", Native::SetInterval),
+        ("setImmediate", Native::SetImmediate),
+        ("clearTimeout", Native::ClearTimeout),
+        ("clearInterval", Native::ClearTimeout),
+        ("clearImmediate", Native::ClearTimeout),
+        ("queueMicrotask", Native::QueueMicrotask),
     ] {
         v.insert(n.into(), VB::NativeFn(f));
     }
@@ -100,6 +109,10 @@ pub fn global_fn_type(n: Native) -> Rc<FuncType> {
         Native::NumberFn => ft(vec![opt("x", any())], num()),
         Native::BooleanFn => ft(vec![opt("x", any())], boolean()),
         Native::BigIntFn => ft(vec![p("x", any())], Type::BigInt),
+        Native::SetTimeout | Native::SetInterval => ft(vec![p("callback", any()), opt("ms", num()), rest("args", any())], num()),
+        Native::SetImmediate => ft(vec![p("callback", any()), rest("args", any())], num()),
+        Native::ClearTimeout => ft(vec![opt("id", any())], Type::Void),
+        Native::QueueMicrotask => ft(vec![p("callback", Type::func(vec![], Type::Void))], Type::Void),
         _ => ft(vec![rest("args", any())], any()),
     }
 }
@@ -107,6 +120,34 @@ pub fn global_fn_type(n: Native) -> Rc<FuncType> {
 impl Checker {
     pub fn ns_member(&mut self, ns: BuiltinNs, name: &str) -> Option<NsMember> {
         use Native::*;
+        let t = Type::Param(self.tp_t);
+        let tt = self.tp_t;
+        match ns {
+            BuiltinNs::Promise => {
+                let any_p = || Type::promise(any());
+                return Some(match name {
+                    "resolve" => NsMember::Method(PromiseResolve, gft(vec![tt], vec![opt("value", t.clone())], Type::promise(t))),
+                    "reject" => NsMember::Method(PromiseReject, ft(vec![opt("reason", any())], Type::promise(Type::Never))),
+                    // Result types are refined from the argument (see `promise_combinator_type`).
+                    "all" => NsMember::Method(PromiseAll, ft(vec![p("values", any())], any_p())),
+                    "allSettled" => NsMember::Method(PromiseAllSettled, ft(vec![p("values", any())], any_p())),
+                    "race" => NsMember::Method(PromiseRace, ft(vec![p("values", any())], any_p())),
+                    "any" => NsMember::Method(PromiseAny, ft(vec![p("values", any())], any_p())),
+                    "withResolvers" => NsMember::Method(PromiseWithResolvers, ft(vec![], any())),
+                    _ => return None,
+                });
+            }
+            BuiltinNs::Symbol => {
+                return match name {
+                    "for" => Some(NsMember::Method(SymbolFor, ft(vec![p("key", string())], Type::Symbol))),
+                    "iterator" | "asyncIterator" | "hasInstance" | "toPrimitive" | "toStringTag" | "species" => Some(NsMember::Const(
+                        self.native_call(SymbolWellKnown, None, vec![crate::hir::HElem::Expr(HExpr::str(name))], Type::Symbol),
+                    )),
+                    _ => None,
+                };
+            }
+            _ => {}
+        }
         let c = |v: f64| Some(NsMember::Const(HExpr::num(v)));
         let m = |n: Native, f: Rc<FuncType>| Some(NsMember::Method(n, f));
         let n1 = || ft(vec![p("x", num())], num());
@@ -335,6 +376,36 @@ impl Checker {
                 "toString" => r(NumToString, ft(vec![opt("radix", num())], string())),
                 _ => None,
             },
+            Type::Promise(t) => {
+                let t = (**t).clone();
+                let cb = |param: Type| Type::Func(ft(vec![p("value", param)], u.clone()));
+                match name {
+                    "then" => r(
+                        PromiseThen,
+                        gft(vec![tu], vec![opt("onfulfilled", cb(t.clone())), opt("onrejected", cb(any()))], Type::promise(u.clone())),
+                    ),
+                    "catch" => r(PromiseCatch, gft(vec![tu], vec![opt("onrejected", cb(any()))], Type::promise(Type::union([t, u.clone()])))),
+                    "finally" => r(PromiseFinally, ft(vec![opt("onfinally", Type::func(vec![], any()))], recv.clone())),
+                    _ => None,
+                }
+            }
+            Type::Iter(it) => {
+                let res = super::iter_result_type(it.yield_ty.clone(), it.return_ty.clone());
+                let res = if it.is_async { Type::promise(res) } else { res };
+                match name {
+                    "next" => r(GenNext, ft(vec![opt("value", it.next_ty.clone())], res)),
+                    "return" => r(GenReturn, ft(vec![opt("value", any())], res)),
+                    "throw" => r(GenThrow, ft(vec![opt("e", any())], res)),
+                    "\u{2}Symbol.iterator" | "\u{2}Symbol.asyncIterator" => r(IterSelf, ft(vec![], recv.clone())),
+                    _ => None,
+                }
+            }
+            Type::Func(f) => match name {
+                "bind" => r(FunctionBind, ft(vec![opt("thisArg", any()), rest("args", any())], recv.clone())),
+                "call" => r(FunctionCall, ft(vec![opt("thisArg", any()), rest("args", any())], f.ret.clone())),
+                "apply" => r(FunctionApply, ft(vec![opt("thisArg", any()), opt("args", any())], f.ret.clone())),
+                _ => None,
+            },
             Type::Boolean | Type::BoolLit(_) => match name {
                 "toString" => r(StrToString, ft(vec![], string())),
                 _ => None,
@@ -387,6 +458,8 @@ impl Checker {
             Type::Map(k, v) => Type::Tuple(vec![(**k).clone(), (**v).clone()].into()),
             Type::Set(e) => (**e).clone(),
             Type::Any => Type::Any,
+            Type::Iter(it) if !it.is_async => it.yield_ty.clone(),
+            Type::Iter(_) => return None,
             Type::Union(ts) => {
                 let mut out = Vec::new();
                 for m in ts.iter() {
@@ -397,7 +470,70 @@ impl Checker {
                 }
                 Type::union(out)
             }
-            _ => return None,
+            t => {
+                // An object with a [Symbol.iterator]() method.
+                let o = self.obj_view(t)?;
+                let f = o.prop("\u{2}Symbol.iterator")?.ty.clone();
+                let Type::Func(ft) = f else { return Some(Type::Any) };
+                match &ft.ret {
+                    Type::Iter(it) => it.yield_ty.clone(),
+                    r => self.iterator_value_type(&r.clone()).unwrap_or(Type::Any),
+                }
+            }
+        })
+    }
+
+    /// Element type of `for await` over an object with [Symbol.asyncIterator]().
+    pub fn async_iter_elem(&mut self, t: &Type) -> Option<Type> {
+        match t {
+            Type::Any => Some(Type::Any),
+            Type::Iter(it) if it.is_async => Some(it.yield_ty.clone()),
+            t => {
+                let o = self.obj_view(t)?;
+                let f = o.prop("\u{2}Symbol.asyncIterator")?.ty.clone();
+                let Type::Func(ft) = f else { return Some(Type::Any) };
+                Some(match &ft.ret {
+                    Type::Iter(it) => it.yield_ty.clone(),
+                    r => self.iterator_value_type(&r.clone()).map(|t| t.awaited()).unwrap_or(Type::Any),
+                })
+            }
+        }
+    }
+
+    /// The `value` type of what an iterator object's `next()` returns.
+    pub fn iterator_value_type(&mut self, it: &Type) -> Option<Type> {
+        let o = self.obj_view(it)?;
+        let Type::Func(next) = o.prop("next")?.ty.clone() else { return None };
+        let ret = next.ret.awaited();
+        let mut out = Vec::new();
+        for m in ret.members() {
+            if let Some(r) = self.obj_view(&m) {
+                let done_true = r.prop("done").is_some_and(|d| d.ty == Type::BoolLit(true));
+                if !done_true && let Some(v) = r.prop("value") {
+                    out.push(v.ty.clone());
+                }
+            }
+        }
+        Some(Type::union(out))
+    }
+}
+
+impl Checker {
+    /// `Promise.all([a, b])`: a promise of the awaited element types.
+    pub fn promise_combinator_type(&mut self, n: Native, arg: Option<&Type>) -> Type {
+        let Some(t) = arg else { return Type::promise(Type::Any) };
+        let elems = match t {
+            Type::Tuple(ts) => Some(ts.iter().map(|t| t.awaited()).collect::<Vec<_>>()),
+            _ => None,
+        };
+        let elem = self.iter_elem(t).unwrap_or(Type::Any).awaited();
+        Type::promise(match n {
+            Native::PromiseAll => match elems {
+                Some(ts) => Type::Tuple(ts.into()),
+                None => Type::array(elem),
+            },
+            Native::PromiseRace | Native::PromiseAny => elem,
+            _ => Type::array(Type::Any),
         })
     }
 }

@@ -39,16 +39,22 @@ const PUNCTS: &[&str] = &[
 ];
 
 pub fn tokenize(src: &str) -> Result<Vec<Token>, CompileError> {
+    tokenize_at(src, 0)
+}
+
+/// Tokenize a file whose first byte is at offset `base` of the program's
+/// combined source space (see `error::Sources`), so spans identify the file.
+pub fn tokenize_at(src: &str, base: usize) -> Result<Vec<Token>, CompileError> {
     let mut lx = Lexer {
         src: src.as_bytes(),
         text: src,
         pos: 0,
-        base: 0,
+        base,
     };
     let mut toks = lx.run(false)?;
     toks.push(Token {
         tok: Tok::Eof,
-        span: Span::new(src.len(), src.len()),
+        span: Span::new(base + src.len(), base + src.len()),
         nl_before: true,
     });
     Ok(toks)

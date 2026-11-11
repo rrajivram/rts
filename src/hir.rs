@@ -52,6 +52,11 @@ pub struct HFunc {
     /// Destructuring of parameters etc. happens in the body; nothing else here.
     pub is_ctor: bool,
     pub class: Option<ClassId>,
+    /// `async function` / `async function*`: starts with `StartAsync` (or
+    /// `CreateGenerator`) and its `await`s suspend.
+    pub is_async: bool,
+    /// `function*`: starts with `CreateGenerator`.
+    pub is_generator: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -106,6 +111,8 @@ pub enum HStmt {
         elem: VarId,
         iter: HExpr,
         body: Vec<HStmt>,
+        /// `for await`
+        is_await: bool,
     },
     ForIn {
         label: Option<Name>,
@@ -341,6 +348,12 @@ pub enum HK {
     NativeFn(Native),
     /// `delete obj[key]`
     Delete(Box<HExpr>, Box<HExpr>),
+    /// `await x`
+    Await(Box<HExpr>),
+    /// `yield x` (`x` is `undefined` for a bare `yield`)
+    Yield(Box<HExpr>),
+    /// `yield* x`
+    YieldStar(Box<HExpr>),
 }
 
 impl HExpr {

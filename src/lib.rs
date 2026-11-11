@@ -11,6 +11,8 @@ pub mod disasm;
 pub mod error;
 pub mod hir;
 pub mod lexer;
+pub mod module;
+pub mod node;
 pub mod parser;
 pub mod runtime;
 pub mod types;
@@ -20,17 +22,17 @@ use error::CompileError;
 
 pub const PRELUDE: &str = include_str!("prelude.ts");
 
-/// Compile TypeScript source to a bytecode program.
-pub fn compile(src: &str) -> Result<bytecode::Program, (CompileError, bool)> {
-    compile_with(src, false)
-}
-
-/// `erase_types`: ignore all static type knowledge (every binding is `any`).
-/// Used to measure what types are worth on the same engine.
-pub fn compile_with(src: &str, erase_types: bool) -> Result<bytecode::Program, (CompileError, bool)> {
-    let prelude = parser::parse_program(lexer::tokenize(PRELUDE).map_err(|e| (e, true))?).map_err(|e| (e, true))?;
-    let toks = lexer::tokenize(src).map_err(|e| (e, false))?;
-    let program = parser::parse_program(toks).map_err(|e| (e, false))?;
-    let hir = check::check_program(&prelude, &program, erase_types).map_err(|e| (e, false))?;
-    Ok(codegen::compile(&hir))
+/// Compile the program whose entry module is `path` (with source `src`).
+/// Imported modules are loaded from disk. Errors are rendered with their
+/// file and line.
+pub fn compile_file(path: &std::path::Path, src: String, erase_types: bool) -> Result<bytecode::Program, String> {
+    let mut sources = error::Sources::default();
+    let base = sources.add("<prelude>".into(), PRELUDE.into());
+    let r = (|| {
+        let prelude = parser::parse_program(lexer::tokenize_at(PRELUDE, base)?)?;
+        let graph = module::load(path, src, &mut sources)?;
+        let hir = check::check_program(&prelude, &graph, erase_types)?;
+        Ok(codegen::compile(&hir))
+    })();
+    r.map_err(|e: CompileError| sources.render(&e))
 }

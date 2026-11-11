@@ -224,9 +224,14 @@ impl Checker {
 
     fn check_block_inner(&mut self, stmts: &[Stmt], scope: &Rc<Scope>) -> CResult<Vec<HStmt>> {
         let mut out = Vec::new();
-        let mut funcs: Vec<FuncId> = Vec::new();
+        let classes = self.hoist_types(stmts, scope)?;
+        let funcs = self.hoist_values(stmts, scope, &mut out)?;
+        self.check_hoisted(stmts, out, funcs, classes)
+    }
+
+    /// Pass 1 of a block: declare its classes, interfaces, type aliases and enums.
+    pub fn hoist_types(&mut self, stmts: &[Stmt], scope: &Rc<Scope>) -> CResult<Vec<ClassId>> {
         let mut classes: Vec<ClassId> = Vec::new();
-        // Pass 1: types.
         for s in stmts {
             match &s.kind {
                 StmtKind::Class(c) => {
@@ -326,7 +331,13 @@ impl Checker {
                 _ => {}
             }
         }
-        // Pass 2: values (functions and variables).
+        Ok(classes)
+    }
+
+    /// Pass 2 of a block: declare its functions (creating their closures at
+    /// the top of `out`) and variables.
+    pub fn hoist_values(&mut self, stmts: &[Stmt], scope: &Rc<Scope>, out: &mut Vec<HStmt>) -> CResult<Vec<FuncId>> {
+        let mut funcs: Vec<FuncId> = Vec::new();
         for s in stmts {
             match &s.kind {
                 StmtKind::Func(f) => {
@@ -371,7 +382,11 @@ impl Checker {
                 _ => {}
             }
         }
-        // Pass 3: statements in order, with flow narrowing.
+        Ok(funcs)
+    }
+
+    /// Pass 3 of a block: its statements in order, with flow narrowing.
+    pub fn check_hoisted(&mut self, stmts: &[Stmt], mut out: Vec<HStmt>, funcs: Vec<FuncId>, classes: Vec<ClassId>) -> CResult<Vec<HStmt>> {
         for s in stmts {
             let hs = self.check_stmt(s, None)?;
             out.extend(hs);
@@ -497,6 +512,7 @@ impl Checker {
     pub fn check_stmt(&mut self, s: &Stmt, label: Option<Name>) -> CResult<Vec<HStmt>> {
         let span = s.span;
         Ok(match &s.kind {
+            StmtKind::Import(_) | StmtKind::Export(_) => return err("import and export are only allowed at the top level of a module", span),
             StmtKind::Empty
             | StmtKind::Func(_)
             | StmtKind::Interface { .. }
@@ -730,11 +746,20 @@ impl Checker {
                 let vars = scope.decls.borrow().clone();
                 vec![HStmt::Block(r?, vars)]
             }
-            StmtKind::ForOf { kind, pat, iter, body } => {
+            StmtKind::ForOf { kind, pat, iter, body, is_await } => {
+                if *is_await {
+                    self.allow_await(span)?;
+                }
                 let hi = self.check_expr(iter, None)?;
-                let Some(et) = self.iter_elem(&hi.ty) else {
+                let et = match (&hi.ty, *is_await) {
+                    (Type::Iter(it), true) if it.is_async => Some(it.yield_ty.clone()),
+                    (t, true) => self.async_iter_elem(t).or_else(|| self.iter_elem(t).map(|e| e.awaited())),
+                    (t, false) => self.iter_elem(t),
+                };
+                let Some(et) = et else {
                     return err(format!("type '{}' is not iterable", self.show(&hi.ty)), iter.span);
                 };
+                let et = if self.erase { Type::Any } else { et };
                 self.loop_invalidate(s);
                 let scope = self.push_scope();
                 let r = (|| -> CResult<HStmt> {
@@ -764,6 +789,7 @@ impl Checker {
                         elem,
                         iter: hi,
                         body: vec![HStmt::Block(b, vars)],
+                        is_await: *is_await,
                     })
                 })();
                 self.pop_scope();
@@ -797,20 +823,29 @@ impl Checker {
                     return err("'return' outside of a function", span);
                 }
                 let want = self.ctx().ret.clone();
+                // An async function may return a promise of its result type.
+                let is_async = self.ctx().is_async && !self.ctx().is_generator;
                 match v {
                     Some(e) => {
-                        let h = self.check_expr(e, want.as_ref())?;
+                        let want_e = match (&want, is_async) {
+                            (Some(w), true) => Some(Type::union([w.clone(), Type::promise(w.clone())])),
+                            (w, _) => w.clone(),
+                        };
+                        let h = self.check_expr(e, want_e.as_ref())?;
+                        let got = if is_async { h.ty.awaited() } else { h.ty.clone() };
                         if let Some(w) = &want {
-                            if !matches!(w, Type::Void) || !matches!(h.ty, Type::Undefined | Type::Void) {
-                                if matches!(w, Type::Void) {
+                            if !matches!(w, Type::Void) || !matches!(got, Type::Undefined | Type::Void) {
+                                if matches!(w, Type::Void) && !is_async {
                                     return err("a 'void' function cannot return a value", e.span);
                                 }
-                                self.expect_assignable(&h.ty, w, e.span)?;
+                                if !matches!(w, Type::Void) {
+                                    self.expect_assignable(&got, w, e.span)?;
+                                }
                             }
                         }
-                        self.ctx_mut().returns.push(h.ty.clone());
+                        self.ctx_mut().returns.push(got);
                         let h = match &want {
-                            Some(w) if !matches!(w, Type::Void) => h.cast(w.clone()),
+                            Some(w) if !matches!(w, Type::Void) && !is_async => h.cast(w.clone()),
                             _ => h,
                         };
                         vec![HStmt::Return(Some(h))]

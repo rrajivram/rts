@@ -76,7 +76,9 @@ fn jump_target(ins: &Instruction) -> Option<u32> {
         | Instruction::JumpIf { to, .. }
         | Instruction::JumpIfCompare { to, .. }
         | Instruction::JumpIfTruthy { to, .. }
-        | Instruction::JumpIfNullish { to, .. } => Some(to),
+        | Instruction::JumpIfNullish { to, .. }
+        | Instruction::IteratorStep { to, .. }
+        | Instruction::UnpackIteratorResult { to, .. } => Some(to),
         Instruction::TryBegin { catch, .. } => Some(catch),
         _ => None,
     }

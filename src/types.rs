@@ -90,6 +90,29 @@ pub enum BuiltinNs {
     Boolean,
     MapCtor,
     SetCtor,
+    Promise,
+    Symbol,
+}
+
+/// Which iteration interface an `Iter` type is. They differ only in what
+/// is assignable to them: anything iterable is an `Iterable`, only iterator
+/// objects are `Iterator`s.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IterKind {
+    Generator,
+    Iterator,
+    IterableIterator,
+    Iterable,
+}
+
+/// `Generator<T, TReturn, TNext>` and the iteration interfaces.
+#[derive(Debug, Clone, PartialEq)]
+pub struct IterType {
+    pub kind: IterKind,
+    pub is_async: bool,
+    pub yield_ty: Type,
+    pub return_ty: Type,
+    pub next_ty: Type,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -124,6 +147,10 @@ pub enum Type {
     Map(Rc<Type>, Rc<Type>),
     Set(Rc<Type>),
     Builtin(BuiltinNs),
+    Symbol,
+    /// `Promise<T>` (never a promise of a promise: see `Type::promise`).
+    Promise(Rc<Type>),
+    Iter(Rc<IterType>),
 }
 
 impl Type {
@@ -149,6 +176,30 @@ impl Type {
 
     pub fn array(t: Type) -> Type {
         Type::Array(Rc::new(t))
+    }
+
+    /// `Promise<T>`, flattening `Promise<Promise<T>>` as `await` does.
+    pub fn promise(t: Type) -> Type {
+        Type::Promise(Rc::new(t.awaited()))
+    }
+
+    /// The type `await x` produces for an `x` of this type.
+    pub fn awaited(&self) -> Type {
+        match self {
+            Type::Promise(t) => t.awaited(),
+            Type::Union(ts) => Type::union(ts.iter().map(|t| t.awaited())),
+            t => t.clone(),
+        }
+    }
+
+    pub fn iter(kind: IterKind, is_async: bool, yield_ty: Type, return_ty: Type, next_ty: Type) -> Type {
+        Type::Iter(Rc::new(IterType {
+            kind,
+            is_async,
+            yield_ty,
+            return_ty,
+            next_ty,
+        }))
     }
 
     pub fn func(params: Vec<FParam>, ret: Type) -> Type {
@@ -362,6 +413,21 @@ impl<N: TypeNames> fmt::Display for Disp<'_, N> {
             Type::Map(k, v) => write!(f, "Map<{}, {}>", d(k), d(v)),
             Type::Set(t) => write!(f, "Set<{}>", d(t)),
             Type::Builtin(b) => write!(f, "{b:?}"),
+            Type::Symbol => write!(f, "symbol"),
+            Type::Promise(t) => write!(f, "Promise<{}>", d(t)),
+            Type::Iter(it) => {
+                let name = match it.kind {
+                    IterKind::Generator => "Generator",
+                    IterKind::Iterator => "Iterator",
+                    IterKind::IterableIterator => "IterableIterator",
+                    IterKind::Iterable => "Iterable",
+                };
+                let prefix = if it.is_async { "Async" } else { "" };
+                match it.kind {
+                    IterKind::Generator => write!(f, "{prefix}{name}<{}, {}, {}>", d(&it.yield_ty), d(&it.return_ty), d(&it.next_ty)),
+                    _ => write!(f, "{prefix}{name}<{}>", d(&it.yield_ty)),
+                }
+            }
         }
     }
 }

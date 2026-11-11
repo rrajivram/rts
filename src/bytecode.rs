@@ -343,6 +343,40 @@ pub enum Instruction {
     TryBegin { catch: Target, exception: ValSlot },
     /// End the innermost `try` block.
     TryEnd,
+
+    // ── iteration ──
+    /// `output = value[Symbol.iterator]()` (generators and arrays iterate natively).
+    GetIterator { value: ValSlot, output: ValSlot },
+    /// `for await`: `output = value[Symbol.asyncIterator]()`, or its sync
+    /// iterator (then `is_sync` is set and each value must be awaited too).
+    GetAsyncIterator { value: ValSlot, output: ValSlot, is_sync: BoolSlot },
+    /// Advance `iterator`: the next value into `output`, or jump to `to` when done.
+    IteratorStep { iterator: ValSlot, output: ValSlot, to: Target },
+    /// `output = iterator.next()`, unexamined (`for await` awaits it).
+    IteratorNextResult { iterator: ValSlot, output: ValSlot },
+    /// Read an iterator result object: its `value` into `output`; jump to `to` if `done`.
+    UnpackIteratorResult { result: ValSlot, output: ValSlot, to: Target },
+    /// Leaving a `for-of` early: call `iterator.return()` if it has one.
+    IteratorClose { iterator: ValSlot },
+    /// `yield*`: resume `iterator` the way this generator was resumed
+    /// (`mode`: 0 next, 1 throw, 2 return, with `value`). The result's value
+    /// goes to `output`; `done` is set when the inner iterator finished.
+    IteratorResume { iterator: ValSlot, mode: NumSlot, value: ValSlot, output: ValSlot, done: BoolSlot },
+
+    // ── generators and async functions ──
+    /// First instruction of a generator body (after parameter setup): suspend
+    /// the frame into a new generator object and return that to the caller.
+    CreateGenerator,
+    /// First instruction of an async function body: give the frame a promise
+    /// to settle when it returns or throws, and keep running.
+    StartAsync,
+    /// Suspend this generator, handing `value` to whoever resumed it. When
+    /// resumed, the value passed in arrives in `received` and how it was
+    /// resumed in `mode` (0 `next`, 1 `throw`, 2 `return`).
+    Yield { value: ValSlot, received: ValSlot, mode: NumSlot },
+    /// Suspend until `value` (made a promise) settles: its value arrives in
+    /// `received`, with `mode` 0 if it fulfilled and 1 if it rejected.
+    Await { value: ValSlot, received: ValSlot, mode: NumSlot },
 }
 
 const _: () = assert!(std::mem::size_of::<Instruction>() == 16);
@@ -400,6 +434,17 @@ pub struct PropertySite {
     pub is_length: bool,
 }
 
+impl PropertySite {
+    pub fn new(name: &str) -> PropertySite {
+        PropertySite {
+            name: name.into(),
+            key: Value::str(name),
+            cache: PropCache::default(),
+            is_length: name == "length",
+        }
+    }
+}
+
 /// What a slot holds from one instruction on, for `--dump`.
 #[derive(Debug, Clone)]
 pub struct SlotName {
@@ -416,6 +461,8 @@ pub struct SlotName {
 /// A compiled function.
 #[derive(Debug, Default)]
 pub struct FunctionCode {
+    /// Index in `Program::funcs`.
+    pub id: u32,
     pub name: Rc<str>,
     pub code: Vec<Instruction>,
     /// How many number/boolean slots and value slots a frame needs.
@@ -424,6 +471,8 @@ pub struct FunctionCode {
     /// Slot types of the parameters (after `this`, which is value slot 0).
     pub params: Vec<Kind>,
     pub rest: bool,
+    /// An async function or async generator.
+    pub is_async: bool,
     pub constants: Vec<Value>,
     pub call_sites: Vec<CallSite>,
     pub property_sites: Vec<PropertySite>,

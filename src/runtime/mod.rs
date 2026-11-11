@@ -4,6 +4,7 @@
 
 pub mod bigint;
 pub mod natives;
+pub mod task;
 
 use std::cell::RefCell;
 use std::fmt::Write as _;
@@ -341,6 +342,14 @@ pub enum Value {
     Set(Rc<SetObj>),
     /// A built-in function used as a value.
     Native(Native),
+    /// A bound function (`f.bind(…)`, a promise's resolve/reject functions).
+    Bound(Rc<task::Bound>),
+    Symbol(Rc<task::Symbol>),
+    /// A generator object (also the state of an async function, internally).
+    Gen(Rc<task::Coroutine>),
+    Promise(Rc<task::Promise>),
+    /// A built-in iterator (`arr.values()`, `map.entries()`, …).
+    Iter(Rc<task::NativeIter>),
 }
 
 const _: () = assert!(std::mem::size_of::<Value>() == 16);
@@ -376,6 +385,11 @@ impl Value {
             Value::Map(m) => Rc::as_ptr(m) as *const () as usize,
             Value::Set(s) => Rc::as_ptr(s) as *const () as usize,
             Value::Native(n) => *n as usize,
+            Value::Bound(b) => Rc::as_ptr(b) as *const () as usize,
+            Value::Symbol(x) => Rc::as_ptr(x) as *const () as usize,
+            Value::Gen(g) => Rc::as_ptr(g) as *const () as usize,
+            Value::Promise(p) => Rc::as_ptr(p) as *const () as usize,
+            Value::Iter(i) => Rc::as_ptr(i) as *const () as usize,
             _ => 0,
         }
     }
@@ -455,7 +469,8 @@ impl Value {
             Value::Num(_) => "number",
             Value::BigInt(_) => "bigint",
             Value::Str(_) => "string",
-            Value::Func(_) | Value::Class(_) | Value::Native(_) => "function",
+            Value::Func(_) | Value::Class(_) | Value::Native(_) | Value::Bound(_) => "function",
+            Value::Symbol(_) => "symbol",
             _ => "object",
         }
     }
@@ -464,6 +479,8 @@ impl Value {
     pub fn to_js_string(&self) -> Rc<JsStr> {
         match self {
             Value::Str(s) => s.clone(),
+            // As a property key: the symbol's hidden key string.
+            Value::Symbol(s) => JsStr::new(&*s.key),
             v => JsStr::new(v.to_display()),
         }
     }
@@ -495,13 +512,33 @@ impl Value {
                 }
                 "[object Object]".into()
             }
-            Value::Func(_) | Value::Native(_) => "function () { [native code] }".into(),
+            Value::Func(_) | Value::Native(_) | Value::Bound(_) => "function () { [native code] }".into(),
+            Value::Symbol(s) => format!("Symbol({})", s.description.as_deref().unwrap_or("")),
+            Value::Gen(_) => "[object Generator]".into(),
+            Value::Promise(_) => "[object Promise]".into(),
+            Value::Iter(i) => format!("[object {}]", i.kind),
             Value::Class(c) => format!("class {} {{ }}", c.name),
             Value::Map(_) => "[object Map]".into(),
             Value::Set(_) => "[object Set]".into(),
             Value::Cell(c) => c.borrow().to_display(),
         }
     }
+}
+
+impl Value {
+    fn to_display_with(self, f: impl FnOnce(&Value) -> String) -> String {
+        f(&self)
+    }
+}
+
+/// How a symbol key prints: `Symbol(Symbol.iterator)`, `Symbol(desc)`.
+pub fn symbol_key_display(key_body: &str) -> String {
+    // User symbols are "<id>:<description>"; well-known ones "Symbol.x".
+    let desc = match key_body.split_once(':') {
+        Some((id, d)) if id.chars().all(|c| c.is_ascii_digit()) => d,
+        _ => key_body,
+    };
+    format!("Symbol({desc})")
 }
 
 pub fn str_to_number(s: &str) -> f64 {
@@ -631,6 +668,9 @@ fn quote_str(s: &str) -> String {
 }
 
 fn key_str(k: &str) -> String {
+    if let Some(name) = k.strip_prefix(task::SYMBOL_PREFIX) {
+        return format!("[{}]", symbol_key_display(name));
+    }
     let ident = !k.is_empty()
         && !k.chars().next().unwrap().is_ascii_digit()
         && k.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '$');
@@ -652,7 +692,26 @@ impl Insp<'_> {
                 }
             }
             Value::Native(n) => format!("[Function: {}]", n.name()),
+            Value::Bound(b) => match &b.target {
+                Value::Func(f) => format!("[Function: bound {}]", (self.funcs)(f.func)),
+                Value::Native(n) if !n.name().is_empty() => format!("[Function: bound {}]", n.name()),
+                _ => "[Function (anonymous)]".into(),
+            },
             Value::Class(c) => format!("[class {}]", c.name),
+            Value::Symbol(s) => format!("Symbol({})", s.description.as_deref().unwrap_or("")),
+            Value::Iter(i) => format!("Object [{}] {{}}", i.kind),
+            Value::Gen(g) => match g.kind {
+                task::CoKind::AsyncGenerator => "Object [AsyncGenerator] {}".into(),
+                _ => "Object [Generator] {}".into(),
+            },
+            Value::Promise(p) => {
+                let inner = match &*p.state.borrow() {
+                    task::PromiseState::Pending(_) => "<pending>".to_string(),
+                    task::PromiseState::Fulfilled(v) => v.clone().to_display_with(|v| self.value(v, depth + 1)),
+                    task::PromiseState::Rejected(v) => format!("<rejected> {}", v.clone().to_display_with(|v| self.value(v, depth + 1))),
+                };
+                format!("Promise {{ {inner} }}")
+            }
             Value::Arr(_) | Value::Obj(_) | Value::Map(_) | Value::Set(_) => self.compound(v, depth),
             v => v.to_display(),
         }

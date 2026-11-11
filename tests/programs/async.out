@@ -1,0 +1,37 @@
+sync start
+main start
+sync end
+a 0
+b 0
+Promise { 42 } true
+microtask
+then 1
+a 1
+b 1
+a 2
+nested inner
+finally
+chain at 20
+timeout 0
+x = 3
+service 42
+produced 0
+all 7 11
+caught nope
+[
+  { status: 'fulfilled', value: 1 },
+  { status: 'rejected', reason: 'bad' }
+]
+produced 1
+produced 2
+awaited p1
+awaited plain
+total 3
+race fast
+any 2
+main end
+main resolved
+timeout 60
+interval done
+timeout 150
+Promise { 42 }

@@ -229,6 +229,179 @@ impl Parser {
         })
     }
 
+    /// The string after `from` (or after `import` for a bare import).
+    fn module_specifier(&mut self) -> PResult<Name> {
+        match self.tok().clone() {
+            Tok::Str(s) => {
+                self.bump();
+                Ok(s)
+            }
+            _ => self.err(format!("expected a module specifier string, found {}", self.describe())),
+        }
+    }
+
+    /// Skip `with { type: "json" }` / `assert { … }` import attributes.
+    fn import_attributes(&mut self) -> PResult<()> {
+        if (self.is_kw("with") || self.is_kw("assert")) && !self.nl_before() && self.is_at(1, "{") {
+            self.bump();
+            self.bump();
+            while !self.eat("}") {
+                if self.at_eof() {
+                    return self.err("expected '}'");
+                }
+                self.bump();
+            }
+        }
+        Ok(())
+    }
+
+    fn import_decl(&mut self) -> PResult<StmtKind> {
+        let span = self.span();
+        self.expect_kw("import")?;
+        let mut d = ImportDecl {
+            default: None,
+            namespace: None,
+            named: vec![],
+            from: "".into(),
+            type_only: false,
+            span,
+        };
+        if let Tok::Str(_) = self.tok() {
+            d.from = self.module_specifier()?;
+            self.import_attributes()?;
+            self.semi()?;
+            return Ok(StmtKind::Import(Rc::new(d)));
+        }
+        // `import type X from`, `import type { … }`, but not `import type from "m"`.
+        if self.is_kw("type") && !self.is_kw_at(1, "from") && !self.is_at(1, ",") {
+            self.bump();
+            d.type_only = true;
+        }
+        if let Tok::Ident(_) = self.tok() {
+            d.default = Some(self.binding_ident()?);
+            if !self.eat(",") {
+                return self.import_from(d);
+            }
+        }
+        if self.eat("*") {
+            self.expect_kw("as")?;
+            d.namespace = Some(self.binding_ident()?);
+        } else {
+            self.expect("{")?;
+            while !self.eat("}") {
+                let mut type_only = false;
+                if self.is_kw("type") && !self.is_at(1, ",") && !self.is_at(1, "}") && !self.is_kw_at(1, "as") {
+                    self.bump();
+                    type_only = true;
+                }
+                let imported = self.prop_name()?;
+                let local = if self.eat_kw("as") { self.binding_ident()? } else { imported.clone() };
+                d.named.push(ImportSpec { imported, local, type_only });
+                if !self.eat(",") {
+                    self.expect("}")?;
+                    break;
+                }
+            }
+        }
+        self.import_from(d)
+    }
+
+    fn import_from(&mut self, mut d: ImportDecl) -> PResult<StmtKind> {
+        self.expect_kw("from")?;
+        d.from = self.module_specifier()?;
+        self.import_attributes()?;
+        self.semi()?;
+        Ok(StmtKind::Import(Rc::new(d)))
+    }
+
+    fn export_decl(&mut self) -> PResult<StmtKind> {
+        let span = self.prev_span();
+        if self.eat_kw("default") {
+            let start = self.span();
+            let is_decl = self.is_kw("function")
+                || self.is_kw("class")
+                || (self.is_kw("abstract") && self.is_kw_at(1, "class"))
+                || (self.is_kw("async") && self.is_kw_at(1, "function"))
+                || (self.is_kw("interface") && matches!(self.tok_at(1), Tok::Ident(_)));
+            if is_decl {
+                let kind = match &*self.ident_text() {
+                    "function" => StmtKind::Func(Rc::new(self.function(true, false)?)),
+                    "async" => {
+                        self.bump();
+                        StmtKind::Func(Rc::new(self.function(true, true)?))
+                    }
+                    "abstract" => {
+                        self.bump();
+                        StmtKind::Class(Rc::new(self.class(true)?))
+                    }
+                    "interface" => self.interface()?,
+                    _ => StmtKind::Class(Rc::new(self.class(false)?)),
+                };
+                let stmt = Stmt {
+                    kind,
+                    span: start.to(self.prev_span()),
+                };
+                return Ok(StmtKind::Export(Rc::new(ExportDecl::DefaultDecl(stmt))));
+            }
+            let e = self.assign_expr()?;
+            self.semi()?;
+            return Ok(StmtKind::Export(Rc::new(ExportDecl::DefaultExpr(e))));
+        }
+        if self.eat("*") {
+            let alias = if self.eat_kw("as") { Some(self.prop_name()?) } else { None };
+            self.expect_kw("from")?;
+            let from = self.module_specifier()?;
+            self.import_attributes()?;
+            self.semi()?;
+            return Ok(StmtKind::Export(Rc::new(ExportDecl::All { from, alias, span })));
+        }
+        let type_only = self.is_kw("type") && self.is_at(1, "{");
+        if type_only {
+            self.bump();
+        }
+        if self.eat("{") {
+            let mut specs = Vec::new();
+            while !self.eat("}") {
+                if self.is_kw("type") && !self.is_at(1, ",") && !self.is_at(1, "}") && !self.is_kw_at(1, "as") {
+                    self.bump();
+                }
+                let local = self.prop_name()?;
+                let exported = if self.eat_kw("as") { self.prop_name()? } else { local.clone() };
+                specs.push((local, exported));
+                if !self.eat(",") {
+                    self.expect("}")?;
+                    break;
+                }
+            }
+            let from = if self.eat_kw("from") { Some(self.module_specifier()?) } else { None };
+            self.import_attributes()?;
+            self.semi()?;
+            return Ok(StmtKind::Export(Rc::new(ExportDecl::Named { specs, from, span })));
+        }
+        let stmt = self.statement()?;
+        Ok(StmtKind::Export(Rc::new(ExportDecl::Decl(stmt))))
+    }
+
+    /// `[Symbol.iterator]` as a member name: the symbol's property key.
+    fn well_known_symbol_key(&mut self) -> Option<Name> {
+        if self.is("[") && self.is_kw_at(1, "Symbol") && self.is_at(2, ".") && self.is_at(4, "]")
+            && let Tok::Ident(n) = self.tok_at(3).clone()
+        {
+            for _ in 0..5 {
+                self.bump();
+            }
+            return Some(format!("\u{2}Symbol.{n}").into());
+        }
+        None
+    }
+
+    fn ident_text(&self) -> Name {
+        match self.tok() {
+            Tok::Ident(n) => n.clone(),
+            _ => "".into(),
+        }
+    }
+
     fn block_body(&mut self) -> PResult<Vec<Stmt>> {
         self.expect("{")?;
         let mut out = Vec::new();
@@ -304,24 +477,11 @@ impl Parser {
                 // declare function/class: parse and treat as a declaration with no body.
                 self.statement_kind()
             }
-            "export" => {
+            "export" if !self.is_at(1, "=") => {
                 self.bump();
-                if self.eat_kw("default") {
-                    if self.is_kw("function") || self.is_kw("class") || self.is_kw("abstract") {
-                        return self.statement_kind();
-                    }
-                    let e = self.expr()?;
-                    self.semi()?;
-                    return Ok(StmtKind::Expr(e));
-                }
-                if self.is("{") || self.is("*") {
-                    return self.err("export lists are not supported (modules are not implemented yet)");
-                }
-                self.statement_kind()
+                self.export_decl()
             }
-            "import" if !self.is_at(1, "(") && !self.is_at(1, ".") => {
-                self.err("import is not supported yet (modules are not implemented)")
-            }
+            "import" if !self.is_at(1, "(") && !self.is_at(1, ".") => self.import_decl(),
             "if" => {
                 self.bump();
                 self.expect("(")?;
@@ -503,9 +663,7 @@ impl Parser {
 
     fn for_stmt(&mut self) -> PResult<StmtKind> {
         self.bump();
-        if self.is_kw("await") {
-            return self.err("for await is not supported yet");
-        }
+        let is_await = self.eat_kw("await");
         self.expect("(")?;
         let mut init = None;
         if !self.is(";") {
@@ -526,6 +684,7 @@ impl Parser {
                         pat,
                         iter,
                         body: Box::new(body),
+                        is_await,
                     });
                 }
                 if self.eat_kw("in") {
@@ -890,10 +1049,11 @@ impl Parser {
             self.bump();
         }
         let is_generator = self.eat("*");
-        if self.is("[") {
-            return self.err("computed class member names are not supported");
-        }
-        let name = self.prop_name()?;
+        let name = match self.well_known_symbol_key() {
+            Some(k) => k,
+            None if self.is("[") => return self.err("computed class member names are not supported (except well-known symbols)"),
+            None => self.prop_name()?,
+        };
         if &*name == "constructor" && self.is("(") {
             let f = self.function_rest(Some(name), start, false, false)?;
             return Ok(ClassMember::Constructor(Rc::new(f)));
@@ -1154,6 +1314,26 @@ impl Parser {
                 out.push(TypeMember::Index { key, value });
                 continue;
             }
+            if let Some(name) = self.well_known_symbol_key() {
+                let optional = self.eat("?");
+                if self.is("(") || self.is("<") {
+                    let tparams = self.type_params()?;
+                    let params = self.params()?;
+                    self.expect(":")?;
+                    let ret = self.return_type()?;
+                    out.push(TypeMember::Prop {
+                        name,
+                        optional,
+                        readonly,
+                        ty: TypeExpr::Func { tparams, params, ret: Box::new(ret) },
+                    });
+                } else {
+                    self.expect(":")?;
+                    let ty = self.type_expr()?;
+                    out.push(TypeMember::Prop { name, optional, readonly, ty });
+                }
+                continue;
+            }
             if self.is("[") {
                 return self.err("mapped and computed-key types are not supported");
             }
@@ -1337,7 +1517,14 @@ impl Parser {
             return Ok(arrow);
         }
         if self.is_kw("yield") {
-            return self.err("generators are not supported yet");
+            let start = self.span();
+            self.bump();
+            let delegate = !self.nl_before() && self.eat("*");
+            let ends = self.nl_before() && !delegate
+                || matches!(self.tok(), Tok::P(")" | "]" | "}" | "," | ";" | ":") | Tok::Eof);
+            let arg = if ends { None } else { Some(Box::new(self.assign_expr()?)) };
+            let span = start.to(self.prev_span());
+            return Ok(Self::mk(ExprKind::Yield { arg, delegate }, span));
         }
         let start = self.span();
         let lhs = self.cond_expr()?;
@@ -1506,8 +1693,11 @@ impl Parser {
                 span,
             ));
         }
-        if self.is_kw("await") && !matches!(self.tok_at(1), Tok::P(")") | Tok::P(";") | Tok::P(",")) {
-            return self.err("await is not supported yet");
+        if self.is_kw("await") && !matches!(self.tok_at(1), Tok::P(")") | Tok::P(";") | Tok::P(",") | Tok::P("=") | Tok::P(".")) {
+            self.bump();
+            let e = self.unary_expr()?;
+            let span = start.to(e.span);
+            return Ok(Self::mk(ExprKind::Await(Box::new(e)), span));
         }
         if self.is("<") {
             return self.err("angle-bracket type assertions are not supported; use 'as'");
@@ -1849,7 +2039,9 @@ impl Parser {
                 }
                 let is_generator = self.eat("*");
                 let ksp = self.span();
-                let key = if self.eat("[") {
+                let key = if let Some(k) = self.well_known_symbol_key() {
+                    PropKey::Name(k)
+                } else if self.eat("[") {
                     let e = self.assign_expr()?;
                     self.expect("]")?;
                     PropKey::Computed(e)

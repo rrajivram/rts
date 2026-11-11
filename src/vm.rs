@@ -12,6 +12,12 @@ use crate::runtime::natives::{self, as_index, call_native, get_dyn, js_mod, js_p
 use crate::runtime::*;
 use crate::types::Kind;
 
+#[path = "vm_task.rs"]
+mod task;
+pub use task::{call_task_native, is_callable, iter_result};
+
+use crate::runtime::task::{CoKind, CoStatus, Coroutine, Resume};
+
 const MAX_DEPTH: usize = 10_000;
 
 /// Where a returning function's result goes.
@@ -52,6 +58,9 @@ struct Frame {
     /// The closure being run, whose captured cells `ReadCapture` reads.
     closure: Option<Rc<Closure>>,
     ret: Ret,
+    /// Set for generators and async functions: where the frame's state goes
+    /// when it suspends, and (async) the promise it settles.
+    co: Option<Rc<Coroutine>>,
 }
 
 pub struct Vm {
@@ -70,6 +79,8 @@ pub struct Vm {
     out: std::io::BufWriter<std::io::Stdout>,
     pub start: Instant,
     native_ret: Value,
+    /// Microtasks and timers.
+    lp: task::EventLoop,
 }
 
 /// A number slot's contents as an f64, and an f64 as number slot contents.
@@ -222,6 +233,7 @@ impl Vm {
             out: std::io::BufWriter::with_capacity(1 << 16, std::io::stdout()),
             start: Instant::now(),
             native_ret: Value::Undef,
+            lp: task::EventLoop::default(),
             prog,
         }
     }
@@ -284,18 +296,24 @@ impl Vm {
             value_base: 0,
             closure: None,
             ret: Ret::Discard,
+            co: None,
         });
-        let r = self.run(0);
+        let r = self.run(0).and_then(|()| self.run_event_loop());
         self.flush();
         r
     }
 
     /// Call any callable value from native code.
     pub fn call(&mut self, callee: &Value, this: Value, args: Vec<Value>) -> Result<Value, Value> {
-        if let Value::Native(n) = callee {
-            return call_native(self, *n, this, args);
+        match callee {
+            Value::Native(n) => call_native(self, *n, this, args),
+            Value::Bound(b) => {
+                let mut all = b.args.clone();
+                all.extend(args);
+                self.call(&b.target.clone(), b.this.clone(), all)
+            }
+            _ => self.call_slice(callee, this, &args),
         }
-        self.call_slice(callee, this, &args)
     }
 
     /// Call from native code with arguments borrowed from the caller (no allocation
@@ -304,6 +322,7 @@ impl Vm {
         let (func, closure) = match callee {
             Value::Func(c) => (self.prog.funcs[c.func as usize].clone(), Some(c.clone())),
             Value::Native(n) => return call_native(self, *n, this, args.to_vec()),
+            Value::Bound(_) => return self.call(callee, this, args.to_vec()),
             v => return Err(self.type_error(format!("{} is not a function", describe(v)))),
         };
         if self.frames.len() >= MAX_DEPTH {
@@ -328,6 +347,7 @@ impl Vm {
             value_base: vb,
             closure,
             ret: Ret::Native,
+            co: None,
         });
         self.run(depth)?;
         Ok(std::mem::take(&mut self.native_ret))
@@ -432,6 +452,17 @@ impl Vm {
                     let n = *n;
                     return self.call_native_ci(n, ci, this.unwrap_or(Value::Undef), sb, vb);
                 }
+                Value::Bound(b) => {
+                    let b = b.clone();
+                    let args = self.collect_args(ci, sb, vb)?;
+                    let mut all = b.args.clone();
+                    all.extend(args);
+                    let r = self.call(&b.target, b.this.clone(), all)?;
+                    if let Some((k, d)) = ci.output {
+                        self.store(k, d, sb, vb, r)?;
+                    }
+                    return Ok(false);
+                }
                 Value::Class(c) => {
                     return Err(self.type_error(format!("Class constructor {} cannot be invoked without 'new'", c.name)));
                 }
@@ -488,6 +519,14 @@ impl Vm {
                 match self.lookup_method(&recv, &site.name)? {
                     Value::Func(c) => (self.prog.funcs[c.func as usize].clone(), Some(c)),
                     Value::Native(n) => return self.call_native_ci(n, ci, recv, sb, vb),
+                    f @ Value::Bound(_) => {
+                        let args = self.collect_args(ci, sb, vb)?;
+                        let r = self.call(&f, recv, args)?;
+                        if let Some((k, d)) = ci.output {
+                            self.store(k, d, sb, vb, r)?;
+                        }
+                        return Ok(false);
+                    }
                     v => {
                         let d = describe(&v);
                         return Err(self.type_error(format!("{}.{} is not a function (it is {d})", recv.type_of(), site.name)));
@@ -554,6 +593,7 @@ impl Vm {
                 Some((k, r)) => Ret::ToSlot(k, r),
                 None => Ret::Discard,
             },
+            co: None,
         });
         Ok(true)
     }
@@ -704,15 +744,11 @@ impl Vm {
         for x in &mut self.values[fr.value_base..fr.value_base + fr.func.get().value_slots] {
             x.release();
         }
-        match fr.ret {
-            Ret::ToSlot(k, d) => {
-                let top = self.frames.last().unwrap();
-                let (sb, vb) = (top.scalar_base, top.value_base);
-                self.store(k, d, sb, vb, val)?;
-            }
-            Ret::Discard => {}
-            Ret::Native => self.native_ret = val,
-        }
+        let val = match &fr.co {
+            Some(co) => self.complete_coroutine(co, Ok(val)),
+            None => val,
+        };
+        self.deliver(fr.ret, val)?;
         Ok(self.frames.len() <= stop)
     }
 
@@ -722,6 +758,7 @@ impl Vm {
         if let Some(fr) = self.frames.last()
             && let Ret::ToSlot(rk, d) = fr.ret
             && rk == k
+            && fr.co.is_none()
         {
             let fr = self.frames.pop().unwrap();
             for x in &mut self.values[fr.value_base..fr.value_base + fr.func.get().value_slots] {
@@ -743,6 +780,7 @@ impl Vm {
     fn do_return_big(&mut self, n: i128, stop: usize) -> Result<bool, Value> {
         if let Some(fr) = self.frames.last()
             && let Ret::ToSlot(Kind::Big, d) = fr.ret
+            && fr.co.is_none()
         {
             let fr = self.frames.pop().unwrap();
             for x in &mut self.values[fr.value_base..fr.value_base + fr.func.get().value_slots] {
@@ -755,7 +793,10 @@ impl Vm {
         self.do_return(Value::bigint(n), stop)
     }
 
-    fn unwind(&mut self, err: Value, stop: usize) -> Result<(), Value> {
+    /// Find the handler for `err`. Ok(false): continue in the top frame;
+    /// Ok(true): the run loop with base `stop` is finished (an async function
+    /// turned the exception into a rejected promise).
+    fn unwind(&mut self, err: Value, stop: usize) -> Result<bool, Value> {
         loop {
             let top = self.frames.len() - 1;
             if let Some(&(fidx, catch, exc)) = self.handlers.last()
@@ -766,11 +807,18 @@ impl Vm {
                 fr.pc = catch as usize;
                 let vb = fr.value_base;
                 self.values[vb + exc.index()] = err;
-                return Ok(());
+                return Ok(false);
             }
             let fr = self.frames.pop().unwrap();
             for x in &mut self.values[fr.value_base..fr.value_base + fr.func.get().value_slots] {
                 x.release();
+            }
+            if let Some(co) = &fr.co
+                && co.kind != CoKind::Generator
+            {
+                let out = self.complete_coroutine(co, Err(err));
+                self.deliver(fr.ret, out)?;
+                return Ok(self.frames.len() <= stop);
             }
             if self.frames.len() <= stop {
                 return Err(err);
@@ -1553,13 +1601,134 @@ impl Vm {
                     Instruction::TryEnd => {
                         self.handlers.pop();
                     }
+
+                    Instruction::GetIterator { value, output } => {
+                        let v = value!(value).clone();
+                        let it = tri!(self.get_iterator(&v));
+                        value!(output) = it
+                    }
+                    Instruction::GetAsyncIterator { value, output, is_sync } => {
+                        let v = value!(value).clone();
+                        let (it, sync) = tri!(self.get_async_iterator(&v));
+                        refresh!();
+                        value!(output) = it;
+                        scalar!(is_sync) = sync as u64
+                    }
+                    Instruction::IteratorStep { iterator, output, to } => {
+                        let it = value!(iterator).clone();
+                        self.frames[fi].pc = pc;
+                        let r = self.iterator_step(&it);
+                        refresh!();
+                        match tri!(r) {
+                            Some(x) => value!(output) = x,
+                            None => pc = to as usize,
+                        }
+                    }
+                    Instruction::IteratorNextResult { iterator, output } => {
+                        let it = value!(iterator).clone();
+                        self.frames[fi].pc = pc;
+                        let r = self.iterator_next_result(&it);
+                        refresh!();
+                        value!(output) = tri!(r)
+                    }
+                    Instruction::UnpackIteratorResult { result, output, to } => {
+                        let r = value!(result).clone();
+                        let x = self.unpack_result(&r);
+                        refresh!();
+                        match tri!(x) {
+                            Some(x) => value!(output) = x,
+                            None => pc = to as usize,
+                        }
+                    }
+                    Instruction::IteratorClose { iterator } => {
+                        let it = value!(iterator).clone();
+                        self.frames[fi].pc = pc;
+                        let r = self.iterator_close(&it);
+                        refresh!();
+                        tri!(r)
+                    }
+                    Instruction::IteratorResume { iterator, mode, value, output, done } => {
+                        let it = value!(iterator).clone();
+                        let m = match number!(mode) as u8 {
+                            0 => Resume::Next,
+                            1 => Resume::Throw,
+                            _ => Resume::Return,
+                        };
+                        let v = value!(value).clone();
+                        self.frames[fi].pc = pc;
+                        let r = self.iterator_resume(&it, m, v);
+                        refresh!();
+                        let (x, d) = tri!(r);
+                        value!(output) = x;
+                        scalar!(done) = d as u64
+                    }
+                    Instruction::CreateGenerator => {
+                        let kind = if func.is_async { CoKind::AsyncGenerator } else { CoKind::Generator };
+                        let co = Coroutine::new(kind, func.id, self.frames[fi].closure.clone());
+                        self.frames[fi].co = Some(co.clone());
+                        let fr = self.suspend_top(pc);
+                        co.st.borrow_mut().status = CoStatus::Start;
+                        tri!(self.deliver(fr.ret, Value::Gen(co)));
+                        if self.frames.len() <= stop {
+                            return Ok(());
+                        }
+                        continue 'outer;
+                    }
+                    Instruction::StartAsync => {
+                        let co = Coroutine::new(CoKind::Async, func.id, self.frames[fi].closure.clone());
+                        {
+                            let mut st = co.st.borrow_mut();
+                            st.status = CoStatus::Running;
+                            st.promise = Some(crate::runtime::task::Promise::new());
+                        }
+                        self.frames[fi].co = Some(co);
+                    }
+                    Instruction::Yield { value, .. } => {
+                        let x = value!(value).clone();
+                        let co = self.frames[fi].co.clone().expect("yield outside a generator");
+                        let fr = self.suspend_top(pc);
+                        let out = if co.kind == CoKind::AsyncGenerator {
+                            let req = co.st.borrow_mut().queue.pop_front();
+                            if let Some((_, _, p)) = req {
+                                self.resolve_promise(&p, iter_result(x, false));
+                            }
+                            Value::Undef
+                        } else {
+                            x
+                        };
+                        tri!(self.deliver(fr.ret, out));
+                        if self.frames.len() <= stop {
+                            return Ok(());
+                        }
+                        continue 'outer;
+                    }
+                    Instruction::Await { value, .. } => {
+                        let x = value!(value).clone();
+                        let co = self.frames[fi].co.clone().expect("await outside an async function");
+                        let p = self.promise_of(x);
+                        let fr = self.suspend_top(pc);
+                        co.st.borrow_mut().awaiting = true;
+                        self.promise_react(&p, crate::runtime::task::Reaction::Resume(co.clone()));
+                        // The first `await` of an async call returns its promise to the caller.
+                        let out = match &co.st.borrow().promise {
+                            Some(p) => Value::Promise(p.clone()),
+                            None => Value::Undef,
+                        };
+                        tri!(self.deliver(fr.ret, out));
+                        if self.frames.len() <= stop {
+                            return Ok(());
+                        }
+                        continue 'outer;
+                    }
                 }
             };
             // An exception was raised in this frame (or, if it already returned, in its caller).
             if fi < self.frames.len() {
                 self.frames[fi].pc = pc;
             }
-            self.unwind(err, stop)?;
+            if self.unwind(err, stop)? {
+                return Ok(());
+            }
         }
     }
 }

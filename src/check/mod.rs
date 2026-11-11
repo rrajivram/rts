@@ -6,6 +6,7 @@
 
 mod builtins;
 mod expr;
+mod modules;
 mod stmt;
 
 use std::cell::RefCell;
@@ -34,6 +35,8 @@ pub enum VB {
     Builtin(BuiltinNs),
     /// A global built-in function (`parseInt`, `String`, …).
     NativeFn(crate::runtime::Native),
+    /// `import * as ns`: the namespace of module `.0`.
+    Namespace(u32),
 }
 
 #[derive(Debug, Clone)]
@@ -191,6 +194,15 @@ pub struct FnCtx {
     pub class: Option<ClassId>,
     /// Inside a constructor before/after super() — field inits to splice in.
     pub ctor_inits: Option<Vec<HStmt>>,
+    /// `async` function (or the top level, once it uses `await`).
+    pub is_async: bool,
+    pub is_generator: bool,
+    /// Generators: the declared type of yielded values, if annotated.
+    pub yield_ty: Option<Type>,
+    /// Generators: types of the values yielded (to infer the yield type).
+    pub yields: Vec<Type>,
+    /// Generators: the type `yield` evaluates to (what `next(v)` passes).
+    pub next_ty: Type,
 }
 
 pub struct Checker {
@@ -224,6 +236,10 @@ pub struct Checker {
     /// Experiment switch (`--no-types`): every variable, parameter, return value
     /// and field is treated as `any`, so the program runs on dynamic paths only.
     pub erase: bool,
+    /// The scope of each module (see `modules.rs`).
+    pub module_scopes: Vec<Rc<Scope>>,
+    /// Each module's exports as namespace members, sorted by name.
+    pub namespaces: Vec<Vec<(Name, VB)>>,
 }
 
 impl TypeNames for Checker {
@@ -246,7 +262,7 @@ pub fn err<T>(msg: impl Into<String>, span: Span) -> CResult<T> {
 }
 
 /// Check a whole program (prelude statements first).
-pub fn check_program(prelude: &[ast::Stmt], program: &[ast::Stmt], erase: bool) -> CResult<HProgram> {
+pub fn check_program(prelude: &[ast::Stmt], program: &crate::module::ModuleGraph, erase: bool) -> CResult<HProgram> {
     let module = Scope::new(None, None);
     let mut c = Checker {
         vars: Vec::new(),
@@ -271,6 +287,8 @@ pub fn check_program(prelude: &[ast::Stmt], program: &[ast::Stmt], erase: bool) 
         static_inits: Vec::new(),
         pending_narrow: None,
         erase,
+        module_scopes: Vec::new(),
+        namespaces: Vec::new(),
     };
     c.tp_u = c.new_tparam("U", None);
     c.tp_t = c.new_tparam("T", None);
@@ -308,22 +326,32 @@ pub fn check_program(prelude: &[ast::Stmt], program: &[ast::Stmt], erase: bool) 
         kind: FnKind::Normal,
         class: None,
         ctor_inits: None,
+        is_async: false,
+        is_generator: false,
+        yield_ty: None,
+        yields: vec![],
+        next_ty: Type::Any,
     });
-    let all: Vec<ast::Stmt> = prelude.iter().chain(program.iter()).cloned().collect();
-    let body = c.check_block_in(&all, module.clone())?;
-    c.stack.pop();
+    let mut body = c.check_block_in(prelude, module.clone())?;
+    body.extend(c.check_modules(program)?);
+    let main_ctx = c.stack.pop().unwrap();
     // Module variables only used by top-level code live in main's slots.
     let mut demoted = Vec::new();
-    for v in module.decls.borrow().iter() {
-        let i = *v as usize;
-        if c.vars[i].owner.is_none() && !c.var_outside_main[i] {
-            c.vars[i].owner = Some(MAIN);
-            demoted.push(*v);
+    let scopes: Vec<Rc<Scope>> = std::iter::once(module.clone()).chain(c.module_scopes.iter().cloned()).collect();
+    for scope in scopes {
+        for v in scope.decls.borrow().iter() {
+            let i = *v as usize;
+            if c.vars[i].owner.is_none() && !c.var_outside_main[i] {
+                c.vars[i].owner = Some(MAIN);
+                demoted.push(*v);
+            }
         }
     }
     c.funcs[MAIN as usize].hir = Some(HFunc {
         name: "<main>".into(),
         body: vec![HStmt::Block(body, demoted)],
+        // Top-level await makes the top level an async function.
+        is_async: main_ctx.is_async,
         ..Default::default()
     });
     c.funcs[MAIN as usize].state = State::Done;
@@ -673,9 +701,17 @@ impl Checker {
                 Type::Func(f) => f.ret.clone(),
                 _ => Type::Any,
             },
-            "Promise" | "PromiseLike" => return err("Promise types are not supported yet (no async)", span),
-            "symbol" | "Symbol" => return err(format!("'{name}' is not supported"), span),
-            "Iterable" | "IterableIterator" | "Iterator" | "ArrayLike" => Type::array(arg(0)),
+            "Promise" | "PromiseLike" => Type::promise(arg(0)),
+            "Awaited" => arg(0).awaited(),
+            "symbol" | "Symbol" => Type::Symbol,
+            "Generator" | "AsyncGenerator" => Type::iter(IterKind::Generator, name.starts_with("Async"), arg(0), arg(1), arg(2)),
+            "Iterator" | "AsyncIterator" => Type::iter(IterKind::Iterator, name.starts_with("Async"), arg(0), arg(1), arg(2)),
+            "IterableIterator" | "AsyncIterableIterator" | "IteratorObject" | "ArrayIterator" | "MapIterator" | "SetIterator" => {
+                Type::iter(IterKind::IterableIterator, name.starts_with("Async"), arg(0), arg(1), arg(2))
+            }
+            "Iterable" | "AsyncIterable" => Type::iter(IterKind::Iterable, name.starts_with("Async"), arg(0), arg(1), arg(2)),
+            "IteratorResult" => iter_result_type(arg(0), arg(1)),
+            "ArrayLike" => Type::array(arg(0)),
             _ => return err(format!("cannot find type '{name}'"), span),
         })
     }
@@ -870,6 +906,14 @@ impl Checker {
             Type::Iface(c, args) => Type::Iface(*c, args.iter().map(|x| self.subst(x, map)).collect()),
             Type::Map(k, v) => Type::Map(Rc::new(self.subst(k, map)), Rc::new(self.subst(v, map))),
             Type::Set(k) => Type::Set(Rc::new(self.subst(k, map))),
+            Type::Promise(t) => Type::promise(self.subst(t, map)),
+            Type::Iter(it) => Type::iter(
+                it.kind,
+                it.is_async,
+                self.subst(&it.yield_ty, map),
+                self.subst(&it.return_ty, map),
+                self.subst(&it.next_ty, map),
+            ),
             t => t.clone(),
         }
     }
@@ -941,6 +985,29 @@ impl Checker {
                 return self.assignable(&k1.clone(), &k2.clone()) && self.assignable(&v1.clone(), &v2.clone());
             }
             (Type::Set(a), Type::Set(b)) => return self.assignable(&a.clone(), &b.clone()),
+            (Type::Promise(a), Type::Promise(b)) => return self.assignable(&a.clone(), &b.clone()),
+            (Type::Iter(a), Type::Iter(b)) => {
+                let (a, b) = (a.clone(), b.clone());
+                let kind_ok = match b.kind {
+                    IterKind::Iterable => true,
+                    IterKind::IterableIterator | IterKind::Iterator => a.kind != IterKind::Iterable,
+                    IterKind::Generator => a.kind == IterKind::Generator,
+                };
+                return kind_ok && a.is_async == b.is_async && self.assignable(&a.yield_ty, &b.yield_ty);
+            }
+            (_, Type::Iter(b)) if b.kind == IterKind::Iterable || b.kind == IterKind::IterableIterator => {
+                // Arrays, strings, maps, sets and objects with a [Symbol.iterator] method.
+                let b = b.clone();
+                if b.kind == IterKind::Iterable && !b.is_async && let Some(e) = self.iter_elem(src) {
+                    return self.assignable(&e, &b.yield_ty);
+                }
+                return self.obj_view(src).is_some_and(|o| {
+                    o.prop(if b.is_async { "\u{2}Symbol.asyncIterator" } else { "\u{2}Symbol.iterator" }).is_some()
+                });
+            }
+            (_, Type::Iter(b)) if b.kind == IterKind::Iterator => {
+                return self.obj_view(src).is_some_and(|o| o.prop("next").is_some());
+            }
             (Type::Func(f), Type::Func(g)) => return self.fn_assignable(&f.clone(), &g.clone()),
             (Type::ClassCtor(a), Type::ClassCtor(b)) => return a == b,
             (Type::Class(a, aa), Type::Class(b, ba)) => {
@@ -1255,14 +1322,20 @@ impl Checker {
             _ if kind == FnKind::Ctor => Some(Type::Void),
             _ => None,
         };
-        if let Some(a) = &ast {
-            if a.is_async {
-                return err("async functions are not supported yet", a.span);
-            }
-            if a.is_generator {
-                return err("generators are not supported yet", a.span);
-            }
-        }
+        let (is_async, is_generator) = ast.as_ref().map_or((false, false), |a| (a.is_async, a.is_generator));
+        // What `return` statements in the body must produce, and (generators)
+        // what `yield` takes and gives back.
+        let (body_ret, yield_ty, next_ty) = match (&declared_ret, is_async, is_generator) {
+            (Some(t), _, true) => match t {
+                Type::Iter(it) => (Some(it.return_ty.clone()), Some(it.yield_ty.clone()), it.next_ty.clone()),
+                _ => (Some(Type::Any), Some(Type::Any), Type::Any),
+            },
+            (Some(t), true, false) => (Some(match t {
+                Type::Promise(t) => (**t).clone(),
+                _ => Type::Any,
+            }), None, Type::Any),
+            (d, _, _) => (d.clone(), None, Type::Any),
+        };
         let fscope = Scope::new(Some(ts), Some(f));
         let this_var = match kind {
             FnKind::Arrow | FnKind::Normal => None,
@@ -1283,7 +1356,7 @@ impl Checker {
             func: f,
             scope: fscope.clone(),
             fn_scope: fscope.clone(),
-            ret: declared_ret.clone(),
+            ret: body_ret.clone(),
             returns: vec![],
             narrow: inherited,
             this_var,
@@ -1291,13 +1364,31 @@ impl Checker {
             kind,
             class,
             ctor_inits: None,
+            is_async,
+            is_generator,
+            yield_ty,
+            yields: vec![],
+            next_ty,
         });
         let r = self.check_func_inner(f, &params, &fscope, ast.as_deref());
         let ctx = self.stack.pop().unwrap();
         self.param_stmts = saved_param_stmts;
         let (hparams, body) = r?;
+        let was_declared = declared_ret.is_some();
         let ret = match declared_ret {
             Some(t) => t,
+            None if is_generator => {
+                let mut rs = ctx.returns.clone();
+                let ret = if rs.is_empty() {
+                    Type::Void
+                } else {
+                    rs.push(Type::Undefined);
+                    Type::union(rs.iter().map(|t| t.widen())).widen()
+                };
+                let y = Type::union(ctx.yields.iter().map(|t| t.widen()));
+                let y = if ctx.yields.is_empty() { Type::Never } else { y };
+                Type::iter(IterKind::Generator, is_async, y, ret, Type::Any)
+            }
             None => {
                 let falls_off = match ast.as_ref().and_then(|a| a.body.as_ref()) {
                     Some(ast::Body::Block(b)) => !stmt::block_terminates(b),
@@ -1314,7 +1405,10 @@ impl Checker {
                 }
             }
         };
+        // An async function returns a promise of what its body returns.
+        let ret = if is_async && !is_generator && !was_declared { Type::promise(ret) } else { ret };
         let ret_kind = match ret {
+            _ if is_async || is_generator => Some(Kind::Val),
             Type::Void | Type::Undefined | Type::Never => None,
             ref t => Some(t.kind()),
         };
@@ -1330,6 +1424,8 @@ impl Checker {
             parent: self.funcs[f as usize].parent,
             is_ctor: kind == FnKind::Ctor,
             class,
+            is_async,
+            is_generator,
         });
         Ok(())
     }
@@ -1660,6 +1756,11 @@ impl Checker {
                                             kind: FnKind::Normal,
                                             class: Some(cid),
                                             ctor_inits: None,
+                                            is_async: false,
+                                            is_generator: false,
+                                            yield_ty: None,
+                                            yields: vec![],
+                                            next_ty: Type::Any,
                                         });
                                         let r = self.check_expr(e, None);
                                         self.stack.pop();
@@ -1887,6 +1988,29 @@ impl Checker {
             range_error_class,
         })
     }
+}
+
+/// `IteratorResult<T, TReturn>`: `{ done: false, value: T } | { done: true, value: TReturn }`.
+pub fn iter_result_type(t: Type, r: Type) -> Type {
+    let res = |done: bool, value: Type| {
+        Type::Object(Rc::new(ObjType {
+            props: vec![
+                Prop {
+                    name: "value".into(),
+                    ty: value,
+                    optional: false,
+                },
+                Prop {
+                    name: "done".into(),
+                    ty: Type::BoolLit(done),
+                    optional: false,
+                },
+            ],
+            index: None,
+            call: None,
+        }))
+    };
+    Type::union([res(false, t), res(true, r)])
 }
 
 pub fn pat_name(p: &ast::Pattern) -> Name {

@@ -28,14 +28,10 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    let prog = match rts::compile_with(&src, erase) {
+    let prog = match rts::compile_file(std::path::Path::new(&path), src, erase) {
         Ok(p) => p,
-        Err((e, in_prelude)) => {
-            if in_prelude {
-                eprintln!("{}", e.render("<prelude>", rts::PRELUDE));
-            } else {
-                eprintln!("{}", e.render(&path, &src));
-            }
+        Err(e) => {
+            eprintln!("{e}");
             return ExitCode::from(1);
         }
     };
