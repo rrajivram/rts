@@ -251,6 +251,22 @@ impl<T: Trace + 'static> Gc<T> {
         g.header().rc.get()
     }
 
+    /// Give up the handle without releasing its reference (compiled code
+    /// holds it as a raw pointer; see `from_header_owned`).
+    pub fn into_header(g: Gc<T>) -> NonNull<Header> {
+        let p = g.header_ptr();
+        std::mem::forget(g);
+        p
+    }
+
+    /// Rebuild a `Gc` from a header pointer that already owns a reference.
+    ///
+    /// # Safety
+    /// `h` must point at a live `GcBox<T>` and carry a counted reference.
+    pub unsafe fn from_header_owned(h: NonNull<Header>) -> Gc<T> {
+        Gc { ptr: h.cast(), _own: PhantomData }
+    }
+
     /// Rebuild a `Gc` from a header pointer, taking a new reference.
     ///
     /// # Safety

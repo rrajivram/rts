@@ -552,39 +552,57 @@ impl Vm {
     }
 
     /// Call a function compiled to native code (`jit.rs`), if this call site
-    /// passes exactly its scalar parameters. None: use the interpreter.
+    /// passes exactly its parameters, as values compiled code can take.
+    /// None: use the interpreter.
     #[inline(never)]
-    fn call_native_code(&mut self, entry: crate::jit::Entry, rk: Kind, func: &FunctionCode, ci: &CallSite, sb: usize, vb: usize) -> Option<Result<bool, Value>> {
+    fn call_native_code(&mut self, jf: &crate::jit::JitFn, func: &FunctionCode, ci: &CallSite, this: Option<&Value>, sb: usize, vb: usize) -> Option<Result<bool, Value>> {
+        use crate::jit::{JitFn, JK};
         let n = func.params.len();
-        if ci.has_spread || ci.args.len() != n || n > 16 || ci.args.iter().zip(&func.params).any(|(a, p)| a.0 != *p) {
+        if ci.has_spread || ci.args.len() != n || n > 15 || ci.args.iter().zip(&func.params).any(|(a, p)| a.0 != *p) {
             return None;
         }
         if let Some((k, _)) = ci.output
-            && k != rk
+            && k != jf.ret.kind()
             && k != Kind::Val
         {
             return None;
         }
         let mut argv = [0u64; 16];
-        for (i, &(_, r)) in ci.args.iter().enumerate() {
-            argv[i] = self.scalars[sb + r as usize];
+        let mut i = 0;
+        if jf.this {
+            argv[0] = JitFn::arg_bits(JK::Ref, this.unwrap_or(&Value::Undef))?;
+            i = 1;
+        }
+        for (&(_, r), &k) in ci.args.iter().zip(&jf.params) {
+            argv[i] = match k {
+                JK::Ref => JitFn::arg_bits(k, &self.values[vb + r as usize])?,
+                _ => self.scalars[sb + r as usize],
+            };
+            i += 1;
         }
         let ctx = crate::jit::ctx();
         let r = unsafe {
             (*ctx).depth = self.frames.len() as u32;
-            entry(ctx, argv.as_ptr())
+            (jf.entry)(ctx, argv.as_ptr())
         };
-        if unsafe { (*ctx).overflow } != 0 {
-            unsafe { (*ctx).overflow = 0 };
-            return Some(Err(self.range_error("Maximum call stack size exceeded".into())));
+        let status = unsafe { (*ctx).status };
+        if status != 0 {
+            unsafe { (*ctx).status = 0 };
+            return Some(Err(if status == crate::jit::STATUS_OVERFLOW {
+                self.range_error("Maximum call stack size exceeded".into())
+            } else {
+                let m = crate::jit::take_error();
+                self.type_error(m)
+            }));
         }
         match ci.output {
-            Some((Kind::Val, d)) => {
-                self.values[vb + d as usize] = if rk == Kind::Num { Value::Num(f64::from_bits(r)) } else { Value::Bool(r != 0) };
-            }
+            Some((Kind::Val, d)) => self.values[vb + d as usize] = jf.ret_value(r),
             Some((_, d)) => self.scalars[sb + d as usize] = r,
-            None => {}
+            None => drop(jf.ret_value(r)),
         }
+        // Compiled code pushed no frames: take the safepoint here, with
+        // every value back in a slot.
+        self.safepoint();
         Some(Ok(false))
     }
 
@@ -924,8 +942,8 @@ impl Vm {
                 return self.call_native_ci(*n, ci, this_counted(&this), sb, vb);
             }
         };
-        if let Some((entry, rk)) = func.jit
-            && let Some(r) = self.call_native_code(entry, rk, func, ci, sb, vb)
+        if let Some(jf) = &func.jit
+            && let Some(r) = self.call_native_code(jf, func, ci, this.as_deref(), sb, vb)
         {
             return r;
         }

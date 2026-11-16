@@ -1637,13 +1637,14 @@ impl Checker {
             Type::Void | Type::Undefined | Type::Never => None,
             ref t => Some(t.kind()),
         };
-        self.funcs[f as usize].ret = Some(ret);
+        self.funcs[f as usize].ret = Some(ret.clone());
         let name = self.funcs[f as usize].name.clone();
         self.funcs[f as usize].hir = Some(HFunc {
             name,
             this_var,
             params: hparams,
             ret_kind,
+            ret_ty: Some(ret),
             body,
             free: vec![],
             parent: self.funcs[f as usize].parent,

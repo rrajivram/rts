@@ -45,6 +45,8 @@ pub struct HFunc {
     pub this_var: Option<VarId>,
     pub params: Vec<HParam>,
     pub ret_kind: Option<Kind>,
+    /// The return type (None for the top level).
+    pub ret_ty: Option<Type>,
     pub body: Vec<HStmt>,
     /// Variables owned by enclosing functions that this function (or a nested one) uses.
     pub free: Vec<VarId>,

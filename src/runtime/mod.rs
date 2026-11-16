@@ -615,8 +615,9 @@ const TAG_CLASS: u8 = 10;
 const TAG_NATIVE: u8 = 13;
 
 impl Value {
+    /// The variant's tag byte (compiled code reads and writes it directly).
     #[inline(always)]
-    fn tag(&self) -> u8 {
+    pub fn tag(&self) -> u8 {
         // SAFETY: `repr(C, u8)` puts the tag in the first byte.
         unsafe { *(self as *const Value as *const u8) }
     }

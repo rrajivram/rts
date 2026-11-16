@@ -129,12 +129,18 @@ impl Profile {
                 per(*rc as f64)
             );
         }
+        let rc_total: u64 = rows.iter().map(|r| r.4).sum();
+        let objects = STATS.allocated.get();
+        eprintln!(
+            "reference-count updates: {rc_total} ({:.2} per allocated box, {objects} boxes; compiled code's are counted under Call)",
+            rc_total as f64 / objects.max(1) as f64
+        );
         if let Some(path) = std::env::var_os("RTS_PROFILE_JSON") {
             let body: Vec<String> = rows
                 .iter()
                 .map(|(n, c, ns, a, rc)| format!("{{\"instruction\":\"{n}\",\"count\":{c},\"ns\":{ns},\"allocs\":{a},\"rc\":{rc}}}"))
                 .collect();
-            let _ = std::fs::write(path, format!("{{\"wall_ns\":{wall},\"rows\":[{}]}}\n", body.join(",")));
+            let _ = std::fs::write(path, format!("{{\"wall_ns\":{wall},\"rc_total\":{rc_total},\"boxes\":{objects},\"rows\":[{}]}}\n", body.join(",")));
         }
     }
 }
