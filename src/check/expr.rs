@@ -810,9 +810,15 @@ impl Checker {
                         let args = vec![HElem::Expr(ha), HElem::Expr(HExpr::str(n))];
                         Ok(self.native_call(Native::IsInstanceOfBuiltin, None, args, Type::Boolean))
                     }
-                    _ => err(format!("'instanceof {n}' is not supported"), b.span),
+                    _ => {
+                        let hb = self.check_expr(b, None)?;
+                        Ok(self.native_call(Native::InstanceOfDyn, None, vec![HElem::Expr(ha), HElem::Expr(hb)], Type::Boolean))
+                    }
                 },
-                _ => err("the right side of 'instanceof' must be a class name", b.span),
+                _ => {
+                    let hb = self.check_expr(b, None)?;
+                    Ok(self.native_call(Native::InstanceOfDyn, None, vec![HElem::Expr(ha), HElem::Expr(hb)], Type::Boolean))
+                }
             };
         }
         let ha = self.check_expr(a, None)?;
@@ -1363,6 +1369,10 @@ impl Checker {
                     let (hargs, _, _) = self.check_args(&global_fn_type(Native::ArrNew), args, &[], span)?;
                     return Ok(HExpr::new(HK::NewBuiltin(Native::ArrNew, hargs), Type::array(Type::Any)));
                 }
+                // `Error("…")` constructs, like `new Error("…")`.
+                Some(VB::Class(c)) if self.classes[c as usize].prelude_error => {
+                    return self.check_new(callee, targs, args, None, span);
+                }
                 Some(VB::Class(c)) => {
                     return err(
                         format!("class constructor '{}' cannot be invoked without 'new'", self.classes[c as usize].name),
@@ -1704,9 +1714,18 @@ impl Checker {
         }
         let rest_idx = ft.params.iter().position(|p| p.rest);
         let has_spread = args.iter().any(|a| matches!(a, ArrayElem::Spread(_)));
+        // Untyped JS: extra arguments without side effects are dropped, and
+        // missing ones arrive as `undefined` (padded below).
+        let args = if self.erase && rest_idx.is_none() && !has_spread && args.len() > ft.params.len()
+            && args[ft.params.len()..].iter().all(|a| matches!(a, ArrayElem::Expr(e) if is_pure_expr(e)))
+        {
+            &args[..ft.params.len()]
+        } else {
+            args
+        };
         // Arity.
         let min = ft.min_args();
-        if !has_spread && args.len() < min {
+        if !has_spread && args.len() < min && !self.erase {
             return err(format!("expected {} argument{}, but got {}", min, if min == 1 { "" } else { "s" }, args.len()), span);
         }
         if rest_idx.is_none() && !has_spread && args.len() > ft.params.len() {
@@ -1774,6 +1793,11 @@ impl Checker {
                 }
             }
             hargs.push(h);
+        }
+        if !has_spread {
+            while hargs.len() < min {
+                hargs.push(HElem::Expr(HExpr::undefined()));
+            }
         }
         let ret = erase_unbound(&self.subst(&ft.ret, &subst), &ft.tparams);
         Ok((hargs, ret, subst))
@@ -1895,6 +1919,9 @@ impl Checker {
             {
                 return err(format!("'{n}' is not a constructor (or is not supported yet)"), callee.span);
             }
+            if h.ty.is_dynamic() || matches!(h.ty, Type::Func(_)) {
+                return self.construct_dynamic(h, args);
+            }
             return err(format!("'new' needs a class; this expression has type '{}'", self.show(&h.ty)), callee.span);
         }
         let ExprKind::Ident(n) = &callee.kind else { unreachable!() };
@@ -1999,8 +2026,20 @@ impl Checker {
                 let hargs = self.untyped_args(args)?;
                 Ok(HExpr::new(HK::NewBuiltin(Native::ArrNew, hargs), Type::array(t.unwrap_or(Type::Any))))
             }
+            Some(VB::Func(..)) => {
+                // `function F() { this.x = … }` used as a constructor (ES5 style).
+                let h = self.check_expr(callee, None)?;
+                self.construct_dynamic(h, args)
+            }
             _ => err(format!("'{n}' is not a constructor (or is not supported yet)"), callee.span),
         }
+    }
+
+    /// `new f(…)` resolved at run time: prototype-based construction.
+    fn construct_dynamic(&mut self, callee: HExpr, args: &[ArrayElem]) -> CResult<HExpr> {
+        let mut hargs = vec![HElem::Expr(callee)];
+        hargs.extend(self.untyped_args(args)?);
+        Ok(self.native_call(Native::Construct, None, hargs, Type::Any))
     }
 
     // ───────────── narrowing helpers used by expressions ─────────────
@@ -2112,3 +2151,12 @@ pub fn falsy_part(t: &Type) -> Type {
 
 #[allow(dead_code)]
 fn _u(_: &Callee) {}
+
+/// An expression whose evaluation has no side effects (safe to drop).
+fn is_pure_expr(e: &Expr) -> bool {
+    match &e.kind {
+        ExprKind::Ident(_) | ExprKind::Num(_) | ExprKind::Str(_) | ExprKind::Bool(_) | ExprKind::Null | ExprKind::This => true,
+        ExprKind::Member { obj, .. } => is_pure_expr(obj),
+        _ => false,
+    }
+}

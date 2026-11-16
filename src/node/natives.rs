@@ -71,6 +71,18 @@ pub fn call(vm: &mut Vm, n: Native, _this: Value, args: Vec<Value>) -> Result<Va
             Value::Bool(true)
         }
         HrtimeBigint => Value::bigint(vm.start.elapsed().as_nanos() as i128 + 1_000_000_000),
+        Hrtime => {
+            // [seconds, nanoseconds], relative to `prev` when given.
+            let mut t = vm.start.elapsed().as_nanos() as i128 + 1_000_000_000;
+            if let Value::Arr(a) = arg(&args, 0) {
+                let get = |i| a.get(i).to_number();
+                t -= get(0) as i128 * 1_000_000_000 + get(1) as i128;
+            }
+            Value::Arr(crate::runtime::natives::make_array(vec![
+                Value::Num((t / 1_000_000_000) as f64),
+                Value::Num((t % 1_000_000_000) as f64),
+            ]))
+        }
         FsReadFile => match std::fs::read_to_string(path()) {
             Ok(t) => Value::str(t),
             Err(e) => return Err(sys_error(vm, e, "open", &path())),
@@ -618,20 +630,27 @@ pub fn call_console_object(vm: &mut Vm, n: Native, args: Vec<Value>) -> Result<V
         }
         ObjCreate => match arg(&args, 0) {
             Value::Null => Value::Obj(Object::new(Shape::new_null_proto(vec![]), vec![], None)),
-            Value::Obj(p) => {
-                // No prototype chains: copy the prototype's properties.
-                let keys = p.keys();
-                let vals = keys.iter().map(|k| p.get(k).unwrap_or(Value::Undef)).collect();
-                Value::Obj(Object::new(Shape::new(keys), vals, p.class.clone()))
-            }
+            Value::Obj(p) => Value::Obj(Object::new(Shape::with_proto(p), vec![], None)),
             _ => Value::Obj(Object::new(Shape::new(vec![]), vec![], None)),
         },
         ObjGetPrototypeOf => match arg(&args, 0) {
             Value::Obj(o) if o.inner.borrow().shape.null_proto => Value::Null,
+            Value::Obj(o) if o.proto().is_some() => Value::Obj(o.proto().unwrap()),
             Value::Obj(o) if o.class.is_some() => Value::Class(o.class.clone().unwrap()),
             _ => Value::Obj(Object::new(Shape::new(vec![]), vec![], None)),
         },
-        ObjSetPrototypeOf => arg(&args, 0),
+        ObjSetPrototypeOf => {
+            let o = arg(&args, 0);
+            if let Value::Obj(ob) = &o {
+                let mut inner = ob.inner.borrow_mut();
+                inner.shape = match arg(&args, 1) {
+                    Value::Obj(p) => inner.shape.reproto(Some(p), false),
+                    Value::Null => inner.shape.reproto(None, true),
+                    _ => inner.shape.reproto(None, false),
+                };
+            }
+            o
+        }
         ObjIsFrozen => Value::Bool(false),
         ObjHasOwn => {
             let k = arg(&args, 1).to_js_string();

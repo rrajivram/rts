@@ -1541,8 +1541,12 @@ impl Checker {
             (d, _, _) => (d.clone(), None, Type::Any),
         };
         let fscope = Scope::new(Some(ts), Some(f));
+        // A plain `function` gets `this` only if it reads it (an ES5
+        // constructor or a function installed as a method).
+        let normal_this = kind == FnKind::Normal && ast.as_ref().is_some_and(|a| uses_this(a));
         let this_var = match kind {
-            FnKind::Arrow | FnKind::Normal => None,
+            FnKind::Arrow => None,
+            FnKind::Normal if !normal_this => None,
             _ => {
                 let v = self.new_var("this".into(), this_ty.clone(), true, &fscope);
                 fscope.decls.borrow_mut().pop();
@@ -1915,6 +1919,7 @@ impl Checker {
             }
             let mut statics: FxHashMap<Name, VB> = FxHashMap::default();
             let mut static_inits: Vec<(VarId, ast::Expr)> = Vec::new();
+            let mut deferred_statics: Vec<(Name, ast::Expr)> = Vec::new();
             for m in &decl.members {
                 match m {
                     ast::ClassMember::Field {
@@ -1935,10 +1940,15 @@ impl Checker {
                         if *is_static {
                             let t = match (t, init) {
                                 (Some(t), _) => t,
-                                (None, Some(e)) => {
-                                    let he = self.check_expr(e, None)?;
-                                    he.ty.widen()
-                                }
+                                (None, Some(e)) => match self.literal_type(e) {
+                                    Some(t) => t.widen(),
+                                    None => {
+                                        // Inferred once the whole class is known: the
+                                        // initializer may call static methods declared later.
+                                        deferred_statics.push((name.clone(), e.clone()));
+                                        continue;
+                                    }
+                                },
                                 (None, None) => Type::Any,
                             };
                             let v = self.new_var(name.clone(), Some(t), false, &self.classes[cid as usize].scope.clone());
@@ -2141,6 +2151,13 @@ impl Checker {
             c.ctor = ctor;
             c.statics = statics;
             c.accessors = accessors;
+            for (name, e) in deferred_statics {
+                let he = self.check_expr(&e, None)?;
+                let t = if self.erase { Type::Any } else { he.ty.widen() };
+                let v = self.new_var(name.clone(), Some(t), false, &self.classes[cid as usize].scope.clone());
+                self.classes[cid as usize].statics.insert(name, VB::Var(v));
+                static_inits.push((v, e));
+            }
             // Static initializers run where the class is declared.
             self.static_inits.extend(static_inits.into_iter().map(|(v, e)| (cid, v, e)));
             Ok(())
@@ -2228,6 +2245,23 @@ fn collect_infers(t: &TypeExpr, f: &mut dyn FnMut(&str)) {
         }
         _ => {}
     }
+}
+
+/// Whether a function's own body reads `this` (not counting nested
+/// non-arrow functions and classes, which have their own).
+fn uses_this(f: &ast::Function) -> bool {
+    use ast::*;
+    let Some(Body::Block(b)) = &f.body else { return false };
+    let mut probe = b.clone();
+    probe.retain(|s| !matches!(s.kind, StmtKind::Func(_) | StmtKind::Class(_)));
+    let mut uses = false;
+    visit_exprs_mut(&mut probe, &mut |e| match &e.kind {
+        ExprKind::This => uses = true,
+        ExprKind::Func(g) if !g.is_arrow => e.kind = ExprKind::Null,
+        ExprKind::Class(_) => e.kind = ExprKind::Null,
+        _ => {}
+    });
+    uses
 }
 
 /// A non-arrow function that reads `arguments` gets a hidden rest parameter

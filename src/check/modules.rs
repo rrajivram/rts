@@ -155,6 +155,8 @@ fn prepare(g: &ModuleGraph, exports: &Exports, m: usize) -> CResult<Prepared> {
     let mut stmts = Vec::new();
     // (local name, alias of the CommonJS module's exports, property)
     let mut cjs_named: Vec<(Name, Name, Name)> = Vec::new();
+    // Locals bound to `require()` of a CommonJS module with static exports.
+    let mut cjs_ns: Vec<Name> = Vec::new();
     for s in &module.stmts {
         match &s.kind {
             StmtKind::Import(d) if g.modules[module.deps[&d.from]].is_cjs => {
@@ -238,8 +240,48 @@ fn prepare(g: &ModuleGraph, exports: &Exports, m: usize) -> CResult<Prepared> {
                 }
                 ExportDecl::Named { .. } | ExportDecl::All { .. } => {}
             },
+            // `const { A, B: C } = require("./cjs")` of statically known
+            // exports: bind the names directly, like an import.
+            StmtKind::Var { kind: VarKind::Const, decls, declare: false }
+                if decls.len() == 1
+                    && let Some(dep) = required_dep(module, decls[0].init.as_ref())
+                    && let Some(statics) = cjs_static_exports(&g.modules[dep]) =>
+            {
+                match &decls[0].pat {
+                    Pattern::Object { props, rest: None, .. }
+                        if props.iter().all(|(k, p, d)| d.is_none() && matches!(p, Pattern::Ident(..)) && statics.iter().any(|(e, _)| e == k)) =>
+                    {
+                        for (k, p, _) in props {
+                            let Pattern::Ident(local, _) = p else { unreachable!() };
+                            let (_, l) = statics.iter().find(|(e, _)| e == k).unwrap();
+                            bindings.push((local.clone(), ExportTarget::Local(dep, l.clone()), s.span, false));
+                        }
+                    }
+                    Pattern::Ident(local, _) => {
+                        // `const som = require("./som")`: `som.X` reads the binding.
+                        for (e, l) in &statics {
+                            bindings.push((format!("{local}.{e}").into(), ExportTarget::Local(dep, l.clone()), Span::default(), true));
+                        }
+                        cjs_ns.push(local.clone());
+                        stmts.push(s.clone());
+                    }
+                    _ => stmts.push(s.clone()),
+                }
+            }
             _ => stmts.push(s.clone()),
         }
+    }
+    if !cjs_ns.is_empty() {
+        let names = cjs_ns.clone();
+        visit_exprs_mut(&mut stmts, &mut |e| {
+            if let ExprKind::Member { obj, prop, optional: false } = &e.kind
+                && let ExprKind::Ident(n) = &obj.kind
+                && names.contains(n)
+                && bindings_has(&bindings, &format!("{n}.{prop}"))
+            {
+                e.kind = ExprKind::Ident(format!("{n}.{prop}").into());
+            }
+        });
     }
     if !namespaces.is_empty() {
         // `ns.x` → a hidden name bound to what `x` resolves to.
@@ -348,6 +390,71 @@ fn wrap_commonjs(body: Vec<Stmt>, file: &str) -> Vec<Stmt> {
     }
     out.extend(t);
     out
+}
+
+fn bindings_has(b: &[(Name, ExportTarget, Span, bool)], name: &str) -> bool {
+    b.iter().any(|(n, ..)| &**n == name)
+}
+
+/// The dependency a `require("x")` expression loads.
+fn required_dep(module: &crate::module::Module, init: Option<&Expr>) -> Option<usize> {
+    let Expr { kind: ExprKind::Call { callee, args, .. }, .. } = init? else { return None };
+    if !matches!(&callee.kind, ExprKind::Ident(n) if &**n == "require") {
+        return None;
+    }
+    let [ArrayElem::Expr(Expr { kind: ExprKind::Str(spec), .. })] = &args[..] else { return None };
+    module.deps.get(spec).copied()
+}
+
+/// A CommonJS module's exports when they can be read off its top level, as
+/// Node's cjs-module-lexer does: `exports.X = L`, `module.exports.X = L` and
+/// `module.exports = { X: L, … }`, where `L` is a top-level class, function or
+/// const. Returns (exported name, local name) pairs, or None when any write to
+/// the exports is not of that form.
+pub fn cjs_static_exports(m: &crate::module::Module) -> Option<Vec<(Name, Name)>> {
+    if !m.is_cjs {
+        return None;
+    }
+    let fixed = |n: &str| {
+        m.stmts.iter().any(|s| match &s.kind {
+            StmtKind::Class(c) => c.name.as_deref() == Some(n),
+            StmtKind::Func(f) => f.name.as_deref() == Some(n),
+            StmtKind::Var { kind: VarKind::Const, .. } => declares(s, n),
+            _ => false,
+        })
+    };
+    let is_exports = |e: &Expr| match &e.kind {
+        ExprKind::Ident(n) => &**n == "exports",
+        ExprKind::Member { obj, prop, .. } => &**prop == "exports" && matches!(&obj.kind, ExprKind::Ident(n) if &**n == "module"),
+        _ => false,
+    };
+    let mut out: Vec<(Name, Name)> = Vec::new();
+    for s in &m.stmts {
+        let StmtKind::Expr(e) = &s.kind else { continue };
+        let ExprKind::Assign(AssignOp::Assign, target, value) = &e.kind else { continue };
+        match &target.kind {
+            ExprKind::Member { obj, prop, .. } if is_exports(obj) => match &value.kind {
+                ExprKind::Ident(l) if fixed(l) => out.push((prop.clone(), l.clone())),
+                // `exports.f = () => …` and the like: a dynamic property.
+                _ => {}
+            },
+            _ if is_exports(target) => match &value.kind {
+                ExprKind::Object(props) => {
+                    for p in props {
+                        match p {
+                            ObjProp::Init { key: PropKey::Name(k), value: Expr { kind: ExprKind::Ident(l), .. } } if fixed(l) => {
+                                out.push((k.clone(), l.clone()))
+                            }
+                            _ => return None,
+                        }
+                    }
+                }
+                _ => return None,
+            },
+            _ => {}
+        }
+    }
+    Some(out)
 }
 
 fn declares(s: &Stmt, name: &str) -> bool {

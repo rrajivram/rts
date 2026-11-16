@@ -14,7 +14,7 @@ use crate::types::Kind;
 
 #[path = "vm_task.rs"]
 mod task;
-pub use task::{call_task_native, is_callable, iter_result};
+pub use task::{call_task_native, func_prototype, is_callable, iter_result, PROTOTYPE_KEY};
 use task::Flow;
 
 use crate::runtime::task::{CoKind, Coroutine};
@@ -318,7 +318,7 @@ impl Vm {
         let stderr = obj(&["write", "isTTY"], vec![Value::Native(Native::StderrWrite), Value::Bool(false)]);
         let env = call_native(self, Native::EnvObject, Value::Undef, vec![]).unwrap_or(Value::Undef);
         let versions = obj(&["node", "v8", "rts"], vec![Value::str("22.12.0"), Value::str("12.4.254.21-node.21"), Value::str(env!("CARGO_PKG_VERSION"))]);
-        let hrtime = obj(&["bigint"], vec![Value::Native(Native::HrtimeBigint)]);
+        let hrtime = Value::Native(Native::Hrtime);
         let p = obj(
             &[
                 "argv", "env", "platform", "arch", "pid", "version", "versions", "execPath", "exitCode", "cwd", "chdir", "exit",
@@ -734,7 +734,7 @@ impl Vm {
     fn lookup_method(&mut self, recv: &Value, name: &str) -> Result<Value, Value> {
         match recv {
             Value::Obj(o) => {
-                if let Some(v) = o.get(name) {
+                if let Some(v) = o.get_chain(name) {
                     return Ok(v);
                 }
                 if let Some(c) = &o.class {
@@ -750,7 +750,7 @@ impl Vm {
                         k = c.parent.clone();
                     }
                 }
-                Ok(Value::Undef)
+                Ok(method_by_name(recv, name).map_or(Value::Undef, Value::Native))
             }
             Value::Undef | Value::Null => Err(self.type_error(format!(
                 "Cannot read properties of {} (reading '{name}')",
@@ -785,6 +785,9 @@ impl Vm {
                 if let Some(x) = found {
                     return self.read_accessor(x, recv);
                 }
+                if let Some(x) = o.get_inherited(name) {
+                    return self.read_accessor(x, recv);
+                }
                 if name == "constructor" {
                     return Ok(match &o.class {
                         Some(c) => Value::Class(c.clone()),
@@ -803,11 +806,13 @@ impl Vm {
             ))),
             Value::Arr(a) if name == "length" => Ok(Value::Num(a.len() as f64)),
             Value::Class(c) if name == "name" => Ok(Value::Str(JsStr::new(&*c.name))),
+            Value::Func(f) if name == "prototype" => Ok(Value::Obj(crate::vm::func_prototype(f))),
             Value::Func(f) if (name == "name" || name == "length") && f.props.borrow().as_ref().is_none_or(|p| p.get(name).is_none()) => {
                 let fc = &self.prog.funcs[f.func as usize];
                 Ok(if name == "name" { Value::Str(JsStr::new(&*fc.name)) } else { Value::Num(fc.params.len() as f64) })
             }
             Value::Str(s) if name == "length" => Ok(Value::Num(s.len16() as f64)),
+            Value::Native(Native::Hrtime) if name == "bigint" => Ok(Value::Native(Native::HrtimeBigint)),
             v => {
                 let r = get_dyn(v, &site.key);
                 if matches!(r, Value::Undef) {
@@ -870,7 +875,7 @@ impl Vm {
     #[inline(never)]
     pub fn to_string_value(&mut self, v: &Value) -> Result<Rc<JsStr>, Value> {
         if let Value::Obj(o) = v {
-            let user = match o.get("toString") {
+            let user = match o.get_chain("toString") {
                 Some(f) => Some(f),
                 None => match &o.class {
                     Some(_) => self.lookup_method(v, "toString").ok().filter(|f| matches!(f, Value::Func(_))),
@@ -1317,7 +1322,7 @@ impl Vm {
                         let r = match &value!(o) {
                             Value::Obj(ob) => {
                                 let key = value!(k).to_js_string();
-                                ob.get(&key.s).is_some()
+                                ob.get_chain(&key.s).is_some()
                                     || ob.class.as_ref().is_some_and(|c| {
                                         let mut c = Some(c.clone());
                                         while let Some(k) = c {

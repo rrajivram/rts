@@ -69,14 +69,18 @@ natives! {
     SetTimeout = "setTimeout", SetInterval = "setInterval", SetImmediate = "setImmediate",
     ClearTimeout = "clearTimeout", QueueMicrotask = "queueMicrotask", NextTick = "nextTick",
     FunctionBind = "bind", FunctionCall = "call", FunctionApply = "apply",
-    SymbolWellKnown = "", IsInstanceOfBuiltin = "",
+    SymbolWellKnown = "", Construct = "", InstanceOfDyn = "", IsInstanceOfBuiltin = "",
     RegexNew = "RegExp", RegexTest = "test", RegexExec = "exec", StrMatch = "match", StrMatchAll = "matchAll",
     StrSearch = "search", ObjRest = "", ObjDefineAccessor = "", SymbolToString = "toString",
     TemplateObject = "", StructuredClone = "structuredClone", ArrToSorted = "toSorted",
     ArrToReversed = "toReversed", ArrWith = "with", GlobalThis = "",
+    // Object.prototype methods, available on every object.
+    ObjProtoHasOwn = "hasOwnProperty", ObjProtoIsPrototypeOf = "isPrototypeOf",
+    ObjProtoPropIsEnum = "propertyIsEnumerable", ObjProtoValueOf = "valueOf", ObjProtoToString = "toString",
+    ObjProtoToLocaleString = "toLocaleString",
     // Node (src/node/natives.rs)
     ProcessObject = "", ProcessExit = "exit", ProcessCwd = "cwd", ProcessChdir = "chdir", StdoutWrite = "write",
-    StderrWrite = "write", HrtimeBigint = "bigint", FsReadFile = "readFileSync", FsWriteFile = "writeFileSync",
+    StderrWrite = "write", HrtimeBigint = "bigint", Hrtime = "hrtime", FsReadFile = "readFileSync", FsWriteFile = "writeFileSync",
     FsAppendFile = "appendFileSync", FsExists = "existsSync", FsMkdir = "mkdirSync", FsReaddir = "readdirSync",
     FsStat = "statSync", FsUnlink = "unlinkSync", FsRm = "rmSync", FsRename = "renameSync", FsCopy = "copyFileSync",
     FsRealpath = "realpathSync", OsInfo = "", UtilFormat = "format", UtilInspect = "inspect", EnvObject = "",
@@ -848,6 +852,49 @@ pub fn call_native(vm: &mut Vm, n: Native, this: Value, args: Vec<Value>) -> NRe
     Ok(match n {
         n if n.is_task() => return crate::vm::call_task_native(vm, n, this, args),
         n if (n as u16) >= (ProcessObject as u16) => return crate::node::natives::call_more(vm, n, args),
+        ObjProtoHasOwn | ObjProtoPropIsEnum => {
+            let k = arg(&args, 0);
+            Value::Bool(match &this {
+                Value::Obj(o) => o.get(&k.to_js_string().s).is_some(),
+                Value::Arr(a) => as_index(&k).is_some_and(|i| i < a.len()) || (n == ObjProtoHasOwn && &*k.to_js_string().s == "length"),
+                Value::Str(s) => as_index(&k).is_some_and(|i| i < s.len16()),
+                Value::Func(f) => f.props.borrow().as_ref().is_some_and(|p| p.get(&k.to_js_string().s).is_some()),
+                _ => false,
+            })
+        }
+        ObjProtoIsPrototypeOf => Value::Bool(match (&this, arg(&args, 0)) {
+            (Value::Obj(p), Value::Obj(o)) => {
+                let mut q = o.proto();
+                let mut found = false;
+                while let Some(x) = q {
+                    if Rc::ptr_eq(&x, p) {
+                        found = true;
+                        break;
+                    }
+                    q = x.proto();
+                }
+                found
+            }
+            _ => false,
+        }),
+        ObjProtoValueOf => this,
+        ObjProtoToString => Value::str(match &this {
+            Value::Undef => "[object Undefined]",
+            Value::Null => "[object Null]",
+            Value::Arr(_) => "[object Array]",
+            Value::Func(_) | Value::Native(_) | Value::Bound(_) | Value::Class(_) => "[object Function]",
+            Value::Str(_) => "[object String]",
+            Value::Num(_) => "[object Number]",
+            Value::Bool(_) => "[object Boolean]",
+            Value::Regex(_) => "[object RegExp]",
+            Value::Map(_) => "[object Map]",
+            Value::Set(_) => "[object Set]",
+            Value::Promise(_) => "[object Promise]",
+            Value::Symbol(_) => "[object Symbol]",
+            Value::BigInt(_) => "[object BigInt]",
+            _ => "[object Object]",
+        }),
+        ObjProtoToLocaleString => Value::Str(vm.to_string_value(&this)?),
         ConsoleLog | ConsoleError | ConsoleWarn => {
             let line = crate::node::natives::format_args(vm, &args);
             if n == ConsoleLog {
@@ -1962,6 +2009,7 @@ pub fn get_dyn(o: &Value, k: &Value) -> Value {
             Some(d) => Value::Str(JsStr::new(&**d)),
             None => Value::Undef,
         },
+        Value::Func(f) if &*k.to_js_string().s == "prototype" => Value::Obj(crate::vm::func_prototype(f)),
         Value::Func(f) => match &*f.props.borrow() {
             Some(p) => p.get(&k.to_js_string().s).unwrap_or(Value::Undef),
             None => Value::Undef,
@@ -1989,7 +2037,7 @@ pub fn get_dyn(o: &Value, k: &Value) -> Value {
         }
         Value::Obj(ob) => {
             let key = k.to_js_string();
-            ob.get(&key.s).unwrap_or(Value::Undef)
+            ob.get_chain(&key.s).unwrap_or(Value::Undef)
         }
         Value::Map(m) => {
             if let Value::Str(n) = k
@@ -2016,6 +2064,7 @@ pub fn set_dyn(o: &Value, k: &Value, v: Value) -> bool {
     match o {
         Value::Func(f) => {
             let key: Rc<str> = (&*k.to_js_string().s).into();
+            let key: Rc<str> = if &*key == "prototype" { crate::vm::PROTOTYPE_KEY.into() } else { key };
             let mut props = f.props.borrow_mut();
             props.get_or_insert_with(|| Object::new(Shape::new(vec![]), vec![], None)).set(&key, v);
             true
@@ -2078,7 +2127,11 @@ pub fn method_by_name(recv: &Value, name: &str) -> Option<Native> {
         Value::Func(_) | Value::Native(_) | Value::Bound(_) => &[FunctionBind, FunctionCall, FunctionApply],
         _ => &[],
     };
-    all.iter().copied().find(|n| n.name() == name).or(match (recv, name) {
+    const OBJECT_PROTO: &[Native] = &[ObjProtoHasOwn, ObjProtoIsPrototypeOf, ObjProtoPropIsEnum, ObjProtoValueOf, ObjProtoToString, ObjProtoToLocaleString];
+    if matches!(recv, Value::Undef | Value::Null) {
+        return None;
+    }
+    all.iter().copied().chain(OBJECT_PROTO.iter().copied()).find(|n| n.name() == name).or(match (recv, name) {
         (Value::Set(_), "keys") => Some(SetValues),
         (Value::Bool(_), "toString") => Some(StrToString),
         _ => None,

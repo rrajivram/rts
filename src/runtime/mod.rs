@@ -163,26 +163,43 @@ pub struct Shape {
     /// Objects of this shape have no prototype (`Object.create(null)`,
     /// regex match `groups`); only printing cares.
     pub null_proto: bool,
+    /// The prototype of objects of this shape (`Object.create(p)`, `new F`).
+    /// Class instances use their class instead; plain objects have none.
+    pub proto: Option<Rc<Object>>,
+    /// For a function's `prototype` object: the function, which is its
+    /// (non-enumerable) `constructor` property.
+    pub ctor: Option<Value>,
 }
 
 impl Shape {
     pub fn new(keys: Vec<Rc<str>>) -> Rc<Shape> {
-        let map = keys.iter().enumerate().map(|(i, k)| (k.clone(), i as u32)).collect();
-        Rc::new(Shape {
-            keys,
-            map,
-            transitions: Default::default(),
-            null_proto: false,
-        })
+        Self::make(keys, false, None, None)
     }
     pub fn new_null_proto(keys: Vec<Rc<str>>) -> Rc<Shape> {
+        Self::make(keys, true, None, None)
+    }
+    /// An empty shape whose objects inherit from `proto`.
+    pub fn with_proto(proto: Rc<Object>) -> Rc<Shape> {
+        Self::make(vec![], false, Some(proto), None)
+    }
+    /// The shape of a function's fresh `prototype` object.
+    pub fn prototype_of(ctor: Value) -> Rc<Shape> {
+        Self::make(vec![], false, None, Some(ctor))
+    }
+    pub fn make(keys: Vec<Rc<str>>, null_proto: bool, proto: Option<Rc<Object>>, ctor: Option<Value>) -> Rc<Shape> {
         let map = keys.iter().enumerate().map(|(i, k)| (k.clone(), i as u32)).collect();
         Rc::new(Shape {
             keys,
             map,
             transitions: Default::default(),
-            null_proto: true,
+            null_proto,
+            proto,
+            ctor,
         })
+    }
+    /// The same keys with a different prototype (`Object.setPrototypeOf`).
+    pub fn reproto(&self, proto: Option<Rc<Object>>, null_proto: bool) -> Rc<Shape> {
+        Self::make(self.keys.clone(), null_proto, proto, self.ctor.clone())
     }
     pub fn lookup(&self, name: &str) -> Option<u32> {
         if self.keys.len() <= 8 {
@@ -198,7 +215,7 @@ impl Shape {
         }
         let mut keys = self.keys.clone();
         keys.push(name.clone());
-        let s = if self.null_proto { Shape::new_null_proto(keys) } else { Shape::new(keys) };
+        let s = Shape::make(keys, self.null_proto, self.proto.clone(), self.ctor.clone());
         // Big (dictionary-like) objects don't cache transitions.
         if self.keys.len() < 64 {
             self.transitions.borrow_mut().insert(name.clone(), s.clone());
@@ -208,7 +225,7 @@ impl Shape {
     pub fn without_key(&self, idx: usize) -> Rc<Shape> {
         let mut keys = self.keys.clone();
         keys.remove(idx);
-        Shape::new(keys)
+        Shape::make(keys, self.null_proto, self.proto.clone(), self.ctor.clone())
     }
 }
 
@@ -265,6 +282,31 @@ impl Object {
     }
     pub fn keys(&self) -> Vec<Rc<str>> {
         self.inner.borrow().shape.keys.clone()
+    }
+    /// The prototype object, if this object has one.
+    pub fn proto(&self) -> Option<Rc<Object>> {
+        self.inner.borrow().shape.proto.clone()
+    }
+    /// An inherited property: looked up along the prototype chain (own
+    /// properties excluded).
+    pub fn get_inherited(&self, name: &str) -> Option<Value> {
+        let mut p = self.proto();
+        while let Some(o) = p {
+            if let Some(v) = o.get(name) {
+                return Some(v);
+            }
+            if name == "constructor"
+                && let Some(c) = &o.inner.borrow().shape.ctor
+            {
+                return Some(c.clone());
+            }
+            p = o.proto();
+        }
+        None
+    }
+    /// Own or inherited property.
+    pub fn get_chain(&self, name: &str) -> Option<Value> {
+        self.get(name).or_else(|| self.get_inherited(name))
     }
 }
 
@@ -838,7 +880,11 @@ impl Insp<'_> {
                 let base = match &o.class {
                     Some(c) => c.name.to_string(),
                     None if o.inner.borrow().shape.null_proto => "[Object: null prototype]".to_string(),
-                    None => String::new(),
+                    None => match o.get_inherited("constructor") {
+                        Some(Value::Func(f)) => (self.funcs)(f.func).to_string(),
+                        Some(Value::Class(c)) => c.name.to_string(),
+                        _ => String::new(),
+                    },
                 };
                 (base, ("{", "}"), out, false, false)
             }

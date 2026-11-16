@@ -839,6 +839,10 @@ pub fn call_task_native(vm: &mut Vm, n: Native, this: Value, args: Vec<Value>) -
                 key: well_known(&name.s),
             }))
         }
+        // `new f(…)` where `f` is only known at run time.
+        Construct => vm.construct(&arg(0), args[1.min(args.len())..].to_vec())?,
+        // `x instanceof f` where `f` is only known at run time.
+        InstanceOfDyn => Value::Bool(vm.instance_of(&arg(0), &arg(1))?),
         IsInstanceOfBuiltin => {
             let v = arg(0);
             Value::Bool(match &*arg(1).to_js_string().s {
@@ -1090,5 +1094,81 @@ impl Vm {
             _ => unreachable!("not an extended instruction"),
         }
         Ok(Flow::Next)
+    }
+}
+
+/// The hidden key of a function's `prototype` (kept out of its printed properties).
+pub const PROTOTYPE_KEY: &str = "\u{1}prototype";
+
+/// A function's `prototype` object, created on first use with `constructor`
+/// pointing back at the function.
+pub fn func_prototype(f: &Rc<Closure>) -> Rc<Object> {
+    if let Some(p) = &*f.props.borrow()
+        && let Some(Value::Obj(o)) = p.get(PROTOTYPE_KEY)
+    {
+        return o;
+    }
+    let proto = Object::new(Shape::prototype_of(Value::Func(f.clone())), vec![], None);
+    let mut props = f.props.borrow_mut();
+    props.get_or_insert_with(|| Object::new(Shape::new(vec![]), vec![], None)).set(&Rc::from(PROTOTYPE_KEY), Value::Obj(proto.clone()));
+    proto
+}
+
+impl Vm {
+    /// `new f(...args)` for a run-time callee: a class, or a plain function
+    /// used as a constructor (ES5 style).
+    pub fn construct(&mut self, f: &Value, args: Vec<Value>) -> Result<Value, Value> {
+        match f {
+            Value::Class(c) => {
+                let o = Value::Obj(Object::blank(c.shape.clone(), Some(c.clone())));
+                let ctor = Value::Func(Rc::new(Closure { func: c.ctor, caps: Box::new([]), props: Default::default() }));
+                self.call(&ctor, o.clone(), args)?;
+                Ok(o)
+            }
+            Value::Func(cl) => {
+                let proto = func_prototype(cl);
+                let o = Value::Obj(Object::new(Shape::with_proto(proto), vec![], None));
+                let r = self.call(f, o.clone(), args)?;
+                Ok(match r {
+                    Value::Undef | Value::Null | Value::Bool(_) | Value::Num(_) | Value::Str(_) | Value::BigInt(_) | Value::Symbol(_) => o,
+                    r => r,
+                })
+            }
+            Value::Bound(b) => {
+                let mut all = b.args.to_vec();
+                all.extend(args);
+                let t = b.target.clone();
+                self.construct(&t, all)
+            }
+            _ => Err(self.type_error(format!("{} is not a constructor", describe_short(f)))),
+        }
+    }
+
+    /// `x instanceof f` for a run-time `f`.
+    pub fn instance_of(&mut self, x: &Value, f: &Value) -> Result<bool, Value> {
+        match f {
+            Value::Class(c) => Ok(match x {
+                Value::Obj(o) => o.class.as_ref().is_some_and(|k| k.is_subclass_of(c.id)),
+                _ => false,
+            }),
+            Value::Func(cl) => {
+                let Value::Obj(o) = x else { return Ok(false) };
+                let target = func_prototype(cl);
+                let mut p = o.proto();
+                while let Some(q) = p {
+                    if Rc::ptr_eq(&q, &target) {
+                        return Ok(true);
+                    }
+                    p = q.proto();
+                }
+                Ok(false)
+            }
+            Value::Bound(b) => {
+                let t = b.target.clone();
+                self.instance_of(x, &t)
+            }
+            Value::Native(_) => Ok(false),
+            _ => Err(self.type_error("Right-hand side of 'instanceof' is not callable".into())),
+        }
     }
 }
