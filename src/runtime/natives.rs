@@ -128,7 +128,7 @@ fn rel_index(n: f64, len: usize) -> usize {
     }
 }
 
-fn this_str(this: &Value) -> Rc<JsStr> {
+fn this_str(this: &Value) -> Gc<JsStr> {
     this.to_js_string()
 }
 
@@ -364,7 +364,7 @@ fn str_index_of(hay: &JsStr, needle: &str, from: usize) -> f64 {
         .map_or(-1.0, |i| i as f64)
 }
 
-fn arr_of(this: &Value) -> Result<Rc<Array>, String> {
+fn arr_of(this: &Value) -> Result<Gc<Array>, String> {
     match this {
         Value::Arr(a) => Ok(a.clone()),
         v => Err(format!("{} is not an array", v.type_of())),
@@ -411,7 +411,7 @@ fn merge_sort(v: &mut Vec<Value>, cmp: &mut dyn FnMut(&Value, &Value) -> Result<
 }
 
 /// Whether a callback wants the index/array args (avoid boxing them for 1-param callbacks).
-fn cb_args(x: Value, i: usize, arr: &Rc<Array>) -> [Value; 3] {
+fn cb_args(x: Value, i: usize, arr: &Gc<Array>) -> [Value; 3] {
     [x, Value::Num(i as f64), Value::Arr(arr.clone())]
 }
 
@@ -867,7 +867,7 @@ pub fn call_native(vm: &mut Vm, n: Native, this: Value, args: Vec<Value>) -> NRe
                 let mut q = o.proto();
                 let mut found = false;
                 while let Some(x) = q {
-                    if Rc::ptr_eq(&x, p) {
+                    if Gc::ptr_eq(&x, p) {
                         found = true;
                         break;
                     }
@@ -1659,7 +1659,7 @@ pub fn call_native(vm: &mut Vm, n: Native, this: Value, args: Vec<Value>) -> NRe
         // ───── Map / Set ─────
         MapNew => {
             let m: IndexMap<HKey, Value, FxBuildHasher> = IndexMap::default();
-            let m = Rc::new(RefCell::new(m));
+            let m = Gc::new(RefCell::new(m));
             if let Some(init) = args.first().filter(|v| !v.is_nullish()) {
                 for e in iterate(vm, init)? {
                     if let Value::Arr(p) = e {
@@ -1671,7 +1671,7 @@ pub fn call_native(vm: &mut Vm, n: Native, this: Value, args: Vec<Value>) -> NRe
         }
         SetNew => {
             let s: IndexSet<HKey, FxBuildHasher> = IndexSet::default();
-            let s = Rc::new(RefCell::new(s));
+            let s = Gc::new(RefCell::new(s));
             if let Some(init) = args.first().filter(|v| !v.is_nullish()) {
                 for e in iterate(vm, init)? {
                     s.borrow_mut().insert(HKey(e));
@@ -1757,7 +1757,7 @@ pub fn call_native(vm: &mut Vm, n: Native, this: Value, args: Vec<Value>) -> NRe
                 (s, f) => (s.to_js_string().s.to_string(), f.to_js_string().s.to_string()),
             };
             match regexp::RegExp::new(&src, &flags) {
-                Ok(r) => Value::Regex(Rc::new(r)),
+                Ok(r) => Value::Regex(Gc::new(r)),
                 Err(m) => return Err(vm.syntax_error(m)),
             }
         }
@@ -1777,7 +1777,7 @@ pub fn call_native(vm: &mut Vm, n: Native, this: Value, args: Vec<Value>) -> NRe
             let s = this_str(&this);
             let re = match arg(&args, 0) {
                 Value::Regex(r) => r,
-                v => Rc::new(regexp::RegExp::new(&v.to_js_string().s, "").map_err(|m| vm.syntax_error(m))?),
+                v => Gc::new(regexp::RegExp::new(&v.to_js_string().s, "").map_err(|m| vm.syntax_error(m))?),
             };
             if re.global {
                 let mut out = Vec::new();
@@ -1801,7 +1801,7 @@ pub fn call_native(vm: &mut Vm, n: Native, this: Value, args: Vec<Value>) -> NRe
             let re = match arg(&args, 0) {
                 Value::Regex(r) if !r.global => return te(vm, "String.prototype.matchAll called with a non-global RegExp argument".into()),
                 Value::Regex(r) => r,
-                v => Rc::new(regexp::RegExp::new(&v.to_js_string().s, "g").map_err(|m| vm.syntax_error(m))?),
+                v => Gc::new(regexp::RegExp::new(&v.to_js_string().s, "g").map_err(|m| vm.syntax_error(m))?),
             };
             let mut out = Vec::new();
             let mut at = 0;
@@ -1819,7 +1819,7 @@ pub fn call_native(vm: &mut Vm, n: Native, this: Value, args: Vec<Value>) -> NRe
             let s = this_str(&this);
             let re = match arg(&args, 0) {
                 Value::Regex(r) => r,
-                v => Rc::new(regexp::RegExp::new(&v.to_js_string().s, "").map_err(|m| vm.syntax_error(m))?),
+                v => Gc::new(regexp::RegExp::new(&v.to_js_string().s, "").map_err(|m| vm.syntax_error(m))?),
             };
             match re.match_at(&s.s, 0) {
                 Some(m) => Value::Num(regexp::utf16_of(&s.s, m.groups[0].unwrap().0) as f64),
@@ -1840,7 +1840,7 @@ pub fn call_native(vm: &mut Vm, n: Native, this: Value, args: Vec<Value>) -> NRe
         }
         ObjRest => {
             let src = arg(&args, 0);
-            let skip: Vec<Rc<JsStr>> = args[1..].iter().map(|k| k.to_js_string()).collect();
+            let skip: Vec<Gc<JsStr>> = args[1..].iter().map(|k| k.to_js_string()).collect();
             let mut keys = Vec::new();
             let mut vals = Vec::new();
             for k in keys_of(&src) {
@@ -1866,7 +1866,7 @@ pub fn call_native(vm: &mut Vm, n: Native, this: Value, args: Vec<Value>) -> NRe
                     set = a.set.clone();
                 }
             }
-            o.set(&name, Value::Accessor(Rc::new(task::Accessor { get, set })));
+            o.set(&name, Value::Accessor(Gc::new(task::Accessor { get, set })));
             Value::Undef
         }
         _ => unreachable!(),
@@ -1874,7 +1874,7 @@ pub fn call_native(vm: &mut Vm, n: Native, this: Value, args: Vec<Value>) -> NRe
 }
 
 /// Build an array, choosing numeric storage when every element is a number.
-fn regex_split(re: &regexp::RegExp, s: &Rc<JsStr>) -> Vec<Value> {
+fn regex_split(re: &regexp::RegExp, s: &Gc<JsStr>) -> Vec<Value> {
     let text = &s.s;
     if text.is_empty() {
         return if re.match_at(text, 0).is_some() { vec![] } else { vec![Value::Str(s.clone())] };
@@ -1904,7 +1904,7 @@ fn regex_split(re: &regexp::RegExp, s: &Rc<JsStr>) -> Vec<Value> {
     out
 }
 
-fn regex_replace(vm: &mut Vm, re: &Rc<regexp::RegExp>, s: &Rc<JsStr>, rep: &Value) -> NResult {
+fn regex_replace(vm: &mut Vm, re: &Gc<regexp::RegExp>, s: &Gc<JsStr>, rep: &Value) -> NResult {
     let text = &s.s;
     let mut out = String::new();
     let mut last = 0usize;
@@ -1948,17 +1948,17 @@ fn deep_clone(v: &Value) -> Value {
         }
         Value::Map(m) => {
             let copy: IndexMap<HKey, Value, rustc_hash::FxBuildHasher> = m.borrow().iter().map(|(k, x)| (HKey(deep_clone(&k.0)), deep_clone(x))).collect();
-            Value::Map(Rc::new(std::cell::RefCell::new(copy)))
+            Value::Map(Gc::new(std::cell::RefCell::new(copy)))
         }
         Value::Set(s) => {
             let copy: IndexSet<HKey, rustc_hash::FxBuildHasher> = s.borrow().iter().map(|k| HKey(deep_clone(&k.0))).collect();
-            Value::Set(Rc::new(std::cell::RefCell::new(copy)))
+            Value::Set(Gc::new(std::cell::RefCell::new(copy)))
         }
         v => v.clone(),
     }
 }
 
-pub fn make_array(vals: Vec<Value>) -> Rc<Array> {
+pub fn make_array(vals: Vec<Value>) -> Gc<Array> {
     if !vals.is_empty() && vals.iter().all(|v| matches!(v, Value::Num(_))) {
         Array::new_num(vals.iter().map(|v| v.to_number()).collect())
     } else {
@@ -2061,6 +2061,11 @@ pub fn get_dyn(o: &Value, k: &Value) -> Value {
 
 /// `obj[key] = v` for dynamic receivers. Returns false if not settable.
 pub fn set_dyn(o: &Value, k: &Value, v: Value) -> bool {
+    if let Value::Obj(ob) = o
+        && v.is_container()
+    {
+        ob.header().clear(crate::runtime::heap::flag::ACYCLIC);
+    }
     match o {
         Value::Func(f) => {
             let key: Rc<str> = (&*k.to_js_string().s).into();

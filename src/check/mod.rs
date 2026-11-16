@@ -2206,6 +2206,7 @@ impl Checker {
                 vtable: c.vtable.clone(),
                 ctor: c.ctor,
                 prelude: c.prelude_error,
+                acyclic: !c.erase && c.fields.iter().all(|f| f.ty.as_ref().is_some_and(is_leaf_type)),
             });
         }
         Ok(HProgram {
@@ -2244,6 +2245,17 @@ fn collect_infers(t: &TypeExpr, f: &mut dyn FnMut(&str)) {
             collect_infers(b, f);
         }
         _ => {}
+    }
+}
+
+/// A type whose values are never heap containers: primitives and strings
+/// (strings hold no pointers). Used to find classes that can't form cycles.
+fn is_leaf_type(t: &Type) -> bool {
+    match t {
+        Type::Number | Type::BigInt | Type::Boolean | Type::String | Type::Undefined | Type::Null | Type::Void => true,
+        Type::StrLit(_) | Type::BoolLit(_) | Type::NumLit(_) | Type::Enum(_) => true,
+        Type::Union(ts) => ts.iter().all(is_leaf_type),
+        _ => false,
     }
 }
 

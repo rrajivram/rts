@@ -203,7 +203,7 @@ pub fn utf16_of(s: &str, b: usize) -> usize {
 }
 
 /// `re.exec(s)`, honoring and updating `lastIndex` for `g`/`y`.
-pub fn exec(re: &RegExp, s: &Rc<JsStr>) -> Option<Match> {
+pub fn exec(re: &RegExp, s: &Gc<JsStr>) -> Option<Match> {
     let from = if re.global || re.sticky { byte_of(&s.s, re.last_index.get()) } else { 0 };
     if (re.global || re.sticky) && re.last_index.get() > s.len16() {
         re.last_index.set(0);
@@ -229,7 +229,7 @@ pub fn exec(re: &RegExp, s: &Rc<JsStr>) -> Option<Match> {
 
 /// The array `exec` and `match` return: the match and groups, with `index`,
 /// `input` and `groups` properties.
-pub fn match_array(re: &RegExp, s: &Rc<JsStr>, m: &Match) -> Value {
+pub fn match_array(re: &RegExp, s: &Gc<JsStr>, m: &Match) -> Value {
     let items: Vec<Value> = m.groups.iter().map(|g| g.map_or(Value::Undef, |(a, b)| Value::str(&s.s[a..b]))).collect();
     let arr = Array::new_val(items);
     let index = utf16_of(&s.s, m.groups[0].unwrap().0);

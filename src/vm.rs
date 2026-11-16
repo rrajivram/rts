@@ -2,6 +2,7 @@
 //! values). Calls into JS functions don't recurse in Rust; only natives that
 //! call back into JS (e.g. `arr.map(f)`) start a nested run loop.
 
+use crate::runtime::Gc;
 use std::io::Write;
 use std::rc::Rc;
 use std::time::Instant;
@@ -27,16 +28,49 @@ const MAX_DEPTH: usize = 10_000;
 const SCALAR_STACK: usize = 1 << 22;
 const VALUE_STACK: usize = 1 << 21;
 
-/// `n` value slots, all `undefined` (an all-zero `Value`).
-fn zeroed_values(n: usize) -> Vec<Value> {
-    assert!(matches!(unsafe { std::mem::zeroed::<Value>() }, Value::Undef));
-    let layout = std::alloc::Layout::array::<Value>(n).unwrap();
-    unsafe {
-        let p = std::alloc::alloc_zeroed(layout) as *mut Value;
-        assert!(!p.is_null(), "out of memory");
-        Vec::from_raw_parts(p, n, n)
+/// A fixed-size slot stack of `n` zeroed slots, reserved straight from the
+/// system allocator: the OS commits pages lazily, so this is address space,
+/// not heap, and it stays out of the heap statistics.
+pub struct Stack<T> {
+    ptr: std::ptr::NonNull<T>,
+    len: usize,
+}
+
+impl<T> Stack<T> {
+    /// # Safety
+    /// An all-zero `T` must be a valid value.
+    unsafe fn zeroed(n: usize) -> Stack<T> {
+        use std::alloc::GlobalAlloc;
+        let layout = std::alloc::Layout::array::<T>(n).unwrap();
+        let p = unsafe { std::alloc::System.alloc_zeroed(layout) } as *mut T;
+        Stack { ptr: std::ptr::NonNull::new(p).expect("out of memory"), len: n }
     }
 }
+
+impl<T> std::ops::Deref for Stack<T> {
+    type Target = [T];
+    fn deref(&self) -> &[T] {
+        unsafe { std::slice::from_raw_parts(self.ptr.as_ptr(), self.len) }
+    }
+}
+
+impl<T> std::ops::DerefMut for Stack<T> {
+    fn deref_mut(&mut self) -> &mut [T] {
+        unsafe { std::slice::from_raw_parts_mut(self.ptr.as_ptr(), self.len) }
+    }
+}
+
+impl<T> Drop for Stack<T> {
+    fn drop(&mut self) {
+        use std::alloc::GlobalAlloc;
+        unsafe {
+            std::ptr::drop_in_place(&mut **self as *mut [T]);
+            System.dealloc(self.ptr.as_ptr() as *mut u8, std::alloc::Layout::array::<T>(self.len).unwrap());
+        }
+    }
+}
+
+use std::alloc::System;
 
 /// Where a returning function's result goes.
 #[derive(Debug, Clone, Copy)]
@@ -74,7 +108,7 @@ struct Frame {
     scalar_base: usize,
     value_base: usize,
     /// The closure being run, whose captured cells `ReadCapture` reads.
-    closure: Option<Rc<Closure>>,
+    closure: Option<Gc<Closure>>,
     ret: Ret,
 }
 
@@ -82,9 +116,9 @@ pub struct Vm {
     pub prog: Rc<Program>,
     /// The number/boolean slots of every frame, one after another (each frame
     /// uses `scalar_slots` of them from its `scalar_base`).
-    scalars: Vec<u64>,
+    scalars: Stack<u64>,
     /// The value slots of every frame, likewise.
-    values: Vec<Value>,
+    values: Stack<Value>,
     /// Global variables: numbers/booleans and values.
     global_scalars: Vec<u64>,
     global_values: Vec<Value>,
@@ -103,11 +137,16 @@ pub struct Vm {
     /// Frames running a generator or async function (frame index and its
     /// coroutine), innermost last. Kept apart from `Frame` so ordinary calls
     /// don't pay for it.
-    co_frames: Vec<(usize, Rc<Coroutine>)>,
+    co_frames: Vec<(usize, Gc<Coroutine>)>,
     /// `console.group` indentation, `console.count` and `console.time` state.
     pub console_indent: usize,
     pub console_counts: rustc_hash::FxHashMap<String, u32>,
     pub console_timers: rustc_hash::FxHashMap<String, f64>,
+    /// Native calls into the VM in progress: the tracing GC waits for them.
+    gc_block: u32,
+    /// Boxes rooted by hosts that run VM code while holding values
+    /// (the event loop). Only the tracing GC reads these.
+    host_roots: Vec<std::ptr::NonNull<crate::runtime::heap::Header>>,
 }
 
 /// A number slot's contents as an f64, and an f64 as number slot contents.
@@ -251,8 +290,9 @@ impl Vm {
     pub fn new(prog: Program) -> Vm {
         let prog = Rc::new(prog);
         Vm {
-            scalars: vec![0; SCALAR_STACK],
-            values: zeroed_values(VALUE_STACK),
+            // SAFETY: zero is 0 for u64 and `undefined` for Value.
+            scalars: unsafe { Stack::zeroed(SCALAR_STACK) },
+            values: unsafe { Stack::zeroed(VALUE_STACK) },
             global_scalars: vec![0; prog.global_scalars],
             global_values: vec![Value::Undef; prog.global_values],
             frames: Vec::new(),
@@ -264,6 +304,8 @@ impl Vm {
             args: Vec::new(),
             process: None,
             co_frames: Vec::new(),
+            gc_block: 0,
+            host_roots: Vec::new(),
             console_indent: 0,
             console_counts: Default::default(),
             console_timers: Default::default(),
@@ -394,6 +436,7 @@ impl Vm {
 
     /// Run the program's main function. Returns the uncaught exception, if any.
     pub fn run_main(&mut self) -> Result<(), Value> {
+        crate::runtime::heap::start_run();
         let main = self.prog.funcs[self.prog.main as usize].clone();
         self.ensure(0, 0, &main)?;
         self.frames.push(Frame {
@@ -409,8 +452,16 @@ impl Vm {
         r
     }
 
-    /// Call any callable value from native code.
+    /// Call any callable value from native code. Native code may hold
+    /// values in Rust locals, so the tracing GC waits until the call returns.
     pub fn call(&mut self, callee: &Value, this: Value, args: Vec<Value>) -> Result<Value, Value> {
+        self.gc_block += 1;
+        let r = self.call_unblocked(callee, this, args);
+        self.gc_block -= 1;
+        r
+    }
+
+    fn call_unblocked(&mut self, callee: &Value, this: Value, args: Vec<Value>) -> Result<Value, Value> {
         match callee {
             Value::Native(n) => call_native(self, *n, this, args),
             Value::Bound(b) => {
@@ -418,13 +469,20 @@ impl Vm {
                 all.extend(args);
                 self.call(&b.target.clone(), b.this.clone(), all)
             }
-            _ => self.call_slice(callee, this, &args),
+            _ => self.call_slice_unblocked(callee, this, &args),
         }
     }
 
     /// Call from native code with arguments borrowed from the caller (no allocation
     /// for the argument list — used by callbacks such as `map`'s).
     pub fn call_slice(&mut self, callee: &Value, this: Value, args: &[Value]) -> Result<Value, Value> {
+        self.gc_block += 1;
+        let r = self.call_slice_unblocked(callee, this, args);
+        self.gc_block -= 1;
+        r
+    }
+
+    fn call_slice_unblocked(&mut self, callee: &Value, this: Value, args: &[Value]) -> Result<Value, Value> {
         let (func, closure) = match callee {
             Value::Func(c) => (self.prog.funcs[c.func as usize].clone(), Some(c.clone())),
             Value::Native(n) => return call_native(self, *n, this, args.to_vec()),
@@ -454,6 +512,7 @@ impl Vm {
             closure,
             ret: Ret::Native,
         });
+        self.safepoint();
         self.run(depth)?;
         Ok(std::mem::take(&mut self.native_ret))
     }
@@ -464,6 +523,104 @@ impl Vm {
             return Err(self.range_error("Maximum call stack size exceeded".into()));
         }
         Ok(())
+    }
+
+    /// A safepoint, right after a frame was pushed: every live value is now
+    /// in a VM slot or structure (the callee's `this`, arguments and closure
+    /// included), and the interpreter holds no heap value borrowed.
+    #[inline(always)]
+    pub(crate) fn safepoint(&mut self) {
+        #[cfg(not(feature = "gc"))]
+        if crate::runtime::cycles::wanted() {
+            Self::collect_cycles();
+        }
+        #[cfg(feature = "gc")]
+        if crate::runtime::gc::wanted() && self.gc_block == 0 {
+            self.collect_garbage();
+        }
+    }
+
+    #[cfg(not(feature = "gc"))]
+    #[cold]
+    #[inline(never)]
+    fn collect_cycles() {
+        crate::runtime::cycles::collect();
+    }
+
+    /// Mark from every root and sweep (tracing-GC build).
+    #[cfg(feature = "gc")]
+    #[cold]
+    #[inline(never)]
+    pub fn collect_garbage(&mut self) {
+        use crate::runtime::heap::{Trace, Tracer};
+        let extent = self.frames.last().map_or(0, |f| f.value_base + f.func.get().value_slots);
+        let this = &*self;
+        crate::runtime::gc::collect(&mut |t: &mut Tracer| {
+            for v in &this.values[..extent] {
+                v.trace(t);
+            }
+            for v in &this.global_values {
+                v.trace(t);
+            }
+            this.native_ret.trace(t);
+            for f in &this.frames {
+                if let Some(c) = &f.closure {
+                    t.edge(c);
+                }
+            }
+            for (_, c) in &this.co_frames {
+                t.edge(c);
+            }
+            this.lp.trace(t);
+            if let Some(p) = &this.process {
+                p.trace(t);
+            }
+            for &h in &this.host_roots {
+                (t.visit)(h);
+            }
+            for f in &this.prog.funcs {
+                for v in &f.constants {
+                    v.trace(t);
+                }
+                for s in &f.property_sites {
+                    s.key.trace(t);
+                }
+            }
+            for c in &this.prog.classes {
+                Value::Class(c.clone()).trace(t);
+            }
+            for sh in &this.prog.shapes {
+                crate::runtime::trace_shape(sh, t);
+            }
+        });
+    }
+
+    /// Call from the event loop or another host that has rooted what it
+    /// holds (`host_roots`): collection stays allowed inside the call.
+    pub(crate) fn call_hosted(&mut self, callee: &Value, this: Value, args: Vec<Value>) -> Result<Value, Value> {
+        let mark = self.root(callee);
+        self.root(&this);
+        for a in &args {
+            self.root(a);
+        }
+        let r = self.call_unblocked(callee, this, args);
+        self.host_roots.truncate(mark);
+        r
+    }
+
+    /// Root a value for the tracing GC (until `host_roots` is truncated).
+    /// Returns the previous length, to truncate back to.
+    pub(crate) fn root(&mut self, v: &Value) -> usize {
+        let mark = self.host_roots.len();
+        #[cfg(feature = "gc")]
+        {
+            use crate::runtime::heap::{Trace, Tracer};
+            let roots = &mut self.host_roots;
+            v.trace(&mut Tracer { visit: &mut |h| roots.push(h), shared: true });
+        }
+        #[cfg(not(feature = "gc"))]
+        let _ = v;
+        mark
     }
 
     /// Bind boxed argument values to a callee's parameter slots.
@@ -696,6 +853,7 @@ impl Vm {
                 None => Ret::Discard,
             },
         });
+        self.safepoint();
         Ok(true)
     }
 
@@ -741,7 +899,7 @@ impl Vm {
                     let mut k = Some(c.clone());
                     while let Some(c) = k {
                         if let Some(fi) = c.methods.get(name) {
-                            return Ok(Value::Func(Rc::new(Closure {
+                            return Ok(Value::Func(Gc::new(Closure {
                                 func: *fi,
                                 caps: Box::new([]),
                                 props: Default::default(),
@@ -795,7 +953,7 @@ impl Vm {
                     });
                 }
                 if let Some(g) = Self::accessor(o, "get", name) {
-                    let f = Value::Func(Rc::new(Closure { func: g, caps: Box::new([]), props: Default::default() }));
+                    let f = Value::Func(Gc::new(Closure { func: g, caps: Box::new([]), props: Default::default() }));
                     return self.call(&f, recv.clone(), vec![]);
                 }
                 self.lookup_method(recv, name)
@@ -828,7 +986,7 @@ impl Vm {
         match recv {
             Value::Obj(o) if o.inner.borrow().shape.lookup(&site.name).is_none() && Self::accessor(o, "set", &site.name).is_some() => {
                 let s = Self::accessor(o, "set", &site.name).unwrap();
-                let f = Value::Func(Rc::new(Closure { func: s, caps: Box::new([]), props: Default::default() }));
+                let f = Value::Func(Gc::new(Closure { func: s, caps: Box::new([]), props: Default::default() }));
                 self.call(&f, recv.clone(), vec![val])?;
                 Ok(())
             }
@@ -841,6 +999,9 @@ impl Vm {
                 Ok(())
             }
             Value::Obj(o) => {
+                if val.is_container() {
+                    o.header().clear(crate::runtime::heap::flag::ACYCLIC);
+                }
                 let mut inner = o.inner.borrow_mut();
                 if let Some((sh, slot)) = &*site.cache.entry.borrow()
                     && Rc::ptr_eq(sh, &inner.shape)
@@ -873,7 +1034,7 @@ impl Vm {
 
     /// ToString, calling a user-defined `toString()` on objects.
     #[inline(never)]
-    pub fn to_string_value(&mut self, v: &Value) -> Result<Rc<JsStr>, Value> {
+    pub fn to_string_value(&mut self, v: &Value) -> Result<Gc<JsStr>, Value> {
         if let Value::Obj(o) = v {
             let user = match o.get_chain("toString") {
                 Some(f) => Some(f),
@@ -966,12 +1127,12 @@ impl Vm {
 
     /// The coroutine of frame `fi` (just popped), if it had one.
     #[inline(always)]
-    fn pop_co(&mut self, fi: usize) -> Option<Rc<Coroutine>> {
+    fn pop_co(&mut self, fi: usize) -> Option<Gc<Coroutine>> {
         if self.is_co(fi) { self.co_frames.pop().map(|(_, c)| c) } else { None }
     }
 
     /// The coroutine running in frame `fi`.
-    fn frame_co(&self, fi: usize) -> Option<Rc<Coroutine>> {
+    fn frame_co(&self, fi: usize) -> Option<Gc<Coroutine>> {
         self.co_frames.last().filter(|(i, _)| *i == fi).map(|(_, c)| c.clone())
     }
 
@@ -1347,7 +1508,7 @@ impl Vm {
                             as u64
                     }
 
-                    Instruction::NewCell { output } => value!(output) = Value::Cell(Rc::new(std::cell::RefCell::new(Value::Undef))),
+                    Instruction::NewCell { output } => value!(output) = Value::Cell(Gc::new(std::cell::RefCell::new(Value::Undef))),
                     Instruction::ReadCell { output: d, cell: c } => {
                         let x = match &value!(c) {
                             Value::Cell(cell) => cell.borrow().clone(),
@@ -1389,7 +1550,7 @@ impl Vm {
                                 CaptureFrom::Capture(i) => self.frames[fi].closure.as_ref().unwrap().caps[*i as usize].clone(),
                             });
                         }
-                        value!(output) = Value::Func(Rc::new(Closure {
+                        value!(output) = Value::Func(Gc::new(Closure {
                             func: function,
                             caps: cells.into_boxed_slice(),
                             props: Default::default(),

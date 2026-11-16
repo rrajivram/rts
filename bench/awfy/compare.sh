@@ -2,7 +2,7 @@
 # Run the Are-We-Fast-Yet benchmarks under rts and node and compare output
 # (timings stripped). usage: [SIZE=full] bench/awfy/compare.sh [rts flags...]
 cd "$(dirname "$0")/js"
-RTS="$(cd ../../.. && pwd)/target/release/rts"
+RTS="${RTS:-$(cd ../../.. && pwd)/target/release/rts}"
 full() { case $1 in DeltaBlue) echo 12000;; Richards|Json) echo 100;; CD) echo 250;; Havlak|Bounce|List) echo 1500;; Mandelbrot) echo 500;; NBody) echo 250000;; Permute|Queens|Storage) echo 1000;; Sieve) echo 3000;; Towers) echo 600;; esac; }
 test_size() { case $1 in CD) echo 10;; *) echo 1;; esac; }
 pass=0; fail=0

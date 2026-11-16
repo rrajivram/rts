@@ -69,6 +69,9 @@ pub struct HClass {
     pub ctor: FuncId,
     /// Defined by the built-in prelude (`Error` and friends), not the program.
     pub prelude: bool,
+    /// Every field has a primitive type, so instances never hold a heap
+    /// pointer (strings aside) and can't be part of a reference cycle.
+    pub acyclic: bool,
 }
 
 #[derive(Debug, Clone)]

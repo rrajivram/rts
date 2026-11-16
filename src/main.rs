@@ -4,11 +4,16 @@
 use std::process::ExitCode;
 
 use rts::runtime::Value;
+
+/// Counts live and peak heap bytes (reported by `--mem-stats`).
+#[global_allocator]
+static ALLOC: rts::runtime::heap::CountingAlloc = rts::runtime::heap::CountingAlloc;
 use rts::vm::Vm;
 
 fn main() -> ExitCode {
     let mut dump = false;
     let mut erase = false;
+    let mut mem_stats = false;
     let mut path = None;
     let mut script_args = Vec::new();
     for a in std::env::args().skip(1) {
@@ -20,11 +25,20 @@ fn main() -> ExitCode {
         match a.as_str() {
             "--dump" => dump = true,
             "--no-types" => erase = true,
+            "--no-cycles" => rts::runtime::cycles::disable(),
+            "--mem-stats" => mem_stats = true,
             _ => path = Some(a),
         }
     }
+    if let Some(n) = std::env::var("RTS_CC_THRESHOLD").ok().and_then(|v| v.parse().ok()) {
+        rts::runtime::cycles::set_threshold(n);
+    }
+    #[cfg(feature = "gc")]
+    if let Some(n) = std::env::var("RTS_GC_MIN_HEAP").ok().and_then(|v| v.parse().ok()) {
+        rts::runtime::gc::set_min_heap(n);
+    }
     let Some(path) = path else {
-        eprintln!("usage: rts [--dump] [--no-types] <file.ts>");
+        eprintln!("usage: rts [--dump] [--no-types] [--no-cycles] [--mem-stats] <file.ts>");
         return ExitCode::from(2);
     };
     let src = match std::fs::read_to_string(&path) {
@@ -59,6 +73,9 @@ fn main() -> ExitCode {
             ExitCode::from(1)
         }
     };
+    if mem_stats {
+        rts::runtime::heap::print_stats();
+    }
     // The process is exiting: skip tearing down the VM's (large) slot stacks.
     std::mem::forget(vm);
     code

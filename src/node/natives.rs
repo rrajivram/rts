@@ -2,6 +2,7 @@
 //! `node:os`, `util.format`). The modules themselves are TypeScript
 //! (`src/node/*.ts`) calling these through `__rts_*` functions.
 
+use crate::runtime::Gc;
 use std::rc::Rc;
 
 use crate::runtime::natives::{make_array, Native};
@@ -443,7 +444,7 @@ pub fn deep_equal(a: &Value, b: &Value) -> bool {
             x.len() == y.len() && x.iter().zip(&y).all(|(p, q)| deep_equal(p, q))
         }
         (Value::Obj(x), Value::Obj(y)) => {
-            if Rc::ptr_eq(x, y) {
+            if Gc::ptr_eq(x, y) {
                 return true;
             }
             let same_class = match (&x.class, &y.class) {
@@ -621,7 +622,7 @@ pub fn call_console_object(vm: &mut Vm, n: Native, args: Vec<Value>) -> Result<V
             let get = vm.get_property(&d, "get")?;
             let set = vm.get_property(&d, "set")?;
             if !matches!(get, Value::Undef) || !matches!(set, Value::Undef) {
-                target.set(&key, Value::Accessor(Rc::new(crate::runtime::task::Accessor { get, set })));
+                target.set(&key, Value::Accessor(Gc::new(crate::runtime::task::Accessor { get, set })));
             } else {
                 let v = vm.get_property(&d, "value")?;
                 target.set(&key, v);

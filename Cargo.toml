@@ -14,3 +14,7 @@ debug = true
 panic = "abort"
 codegen-units = 1
 lto = "thin"
+
+[features]
+# Tracing garbage collection instead of reference counting (for comparison).
+gc = []

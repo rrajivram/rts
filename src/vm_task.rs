@@ -37,7 +37,7 @@ pub(super) struct EventLoop {
     pub seq: u64,
     pub next_id: u32,
     /// Rejected promises that had no handler when they were rejected.
-    pub rejected: Vec<Rc<Promise>>,
+    pub rejected: Vec<Gc<Promise>>,
 }
 
 thread_local! {
@@ -98,7 +98,7 @@ impl Vm {
 
     /// Run a suspended coroutine until it suspends again or finishes. Returns
     /// what it yielded or returned (check the status to tell which).
-    pub fn resume(&mut self, co: &Rc<Coroutine>, mode: Resume, val: Value) -> Result<Value, Value> {
+    pub fn resume(&mut self, co: &Gc<Coroutine>, mode: Resume, val: Value) -> Result<Value, Value> {
         let (fid, closure, pc, scalars, values, handlers, was) = {
             let mut st = co.st.borrow_mut();
             let was = st.status;
@@ -153,6 +153,7 @@ impl Vm {
             ret: Ret::Native,
         });
         self.co_frames.push((fi, co.clone()));
+        self.safepoint();
         let r = self.run(fi);
         let mut st = co.st.borrow_mut();
         match r {
@@ -171,7 +172,7 @@ impl Vm {
 
     /// A coroutine's body returned (`Ok`) or threw (`Err`, async kinds only).
     /// Settles its promise; returns what the frame's caller receives.
-    pub(super) fn complete_coroutine(&mut self, co: &Rc<Coroutine>, outcome: Result<Value, Value>) -> Value {
+    pub(super) fn complete_coroutine(&mut self, co: &Gc<Coroutine>, outcome: Result<Value, Value>) -> Value {
         let promise = {
             let mut st = co.st.borrow_mut();
             st.status = CoStatus::Done;
@@ -203,7 +204,7 @@ impl Vm {
     // ───────────── generators ─────────────
 
     /// `gen.next(v)` / `gen.throw(v)` / `gen.return(v)`: (value, done).
-    pub fn generator_step(&mut self, co: &Rc<Coroutine>, mode: Resume, val: Value) -> Result<(Value, bool), Value> {
+    pub fn generator_step(&mut self, co: &Gc<Coroutine>, mode: Resume, val: Value) -> Result<(Value, bool), Value> {
         let status = co.st.borrow().status;
         let finished = |vm: &mut Vm, val: Value| match mode {
             Resume::Next => Ok((Value::Undef, true)),
@@ -232,7 +233,7 @@ impl Vm {
 
     /// `next`/`throw`/`return` on an async generator: queue the request and
     /// return its promise.
-    pub fn async_generator_request(&mut self, co: &Rc<Coroutine>, mode: Resume, val: Value) -> Value {
+    pub fn async_generator_request(&mut self, co: &Gc<Coroutine>, mode: Resume, val: Value) -> Value {
         let p = Promise::new();
         co.st.borrow_mut().queue.push_back((mode, val, p.clone()));
         self.async_generator_drive(co);
@@ -240,7 +241,7 @@ impl Vm {
     }
 
     /// Serve queued requests while the generator is idle.
-    pub(super) fn async_generator_drive(&mut self, co: &Rc<Coroutine>) {
+    pub(super) fn async_generator_drive(&mut self, co: &Gc<Coroutine>) {
         loop {
             let (status, awaiting, front) = {
                 let st = co.st.borrow();
@@ -426,7 +427,7 @@ impl Vm {
 
     // ───────────── promises ─────────────
 
-    pub fn fulfill_promise(&mut self, p: &Rc<Promise>, v: Value) {
+    pub fn fulfill_promise(&mut self, p: &Gc<Promise>, v: Value) {
         let old = std::mem::replace(&mut *p.state.borrow_mut(), PromiseState::Fulfilled(v.clone()));
         if let PromiseState::Pending(reactions) = old {
             for r in reactions {
@@ -435,7 +436,7 @@ impl Vm {
         }
     }
 
-    pub fn reject_promise(&mut self, p: &Rc<Promise>, e: Value) {
+    pub fn reject_promise(&mut self, p: &Gc<Promise>, e: Value) {
         if !p.is_pending() {
             return;
         }
@@ -451,12 +452,12 @@ impl Vm {
     }
 
     /// Resolve `p` with `v`: adopt `v`'s state if it is a promise or thenable.
-    pub fn resolve_promise(&mut self, p: &Rc<Promise>, v: Value) {
+    pub fn resolve_promise(&mut self, p: &Gc<Promise>, v: Value) {
         if !p.is_pending() {
             return;
         }
         match &v {
-            Value::Promise(q) if Rc::ptr_eq(p, q) => {
+            Value::Promise(q) if Gc::ptr_eq(p, q) => {
                 let e = self.type_error("Chaining cycle detected for promise #<Promise>".into());
                 self.reject_promise(p, e);
             }
@@ -479,7 +480,7 @@ impl Vm {
     }
 
     /// PerformPromiseThen.
-    pub fn promise_react(&mut self, p: &Rc<Promise>, reaction: Reaction) {
+    pub fn promise_react(&mut self, p: &Gc<Promise>, reaction: Reaction) {
         p.handled.set(true);
         let mut st = p.state.borrow_mut();
         match &mut *st {
@@ -498,7 +499,7 @@ impl Vm {
     }
 
     /// PromiseResolve(%Promise%, v): `v` itself if it is a promise.
-    pub fn promise_of(&mut self, v: Value) -> Rc<Promise> {
+    pub fn promise_of(&mut self, v: Value) -> Gc<Promise> {
         if let Value::Promise(p) = v {
             return p;
         }
@@ -508,10 +509,10 @@ impl Vm {
     }
 
     /// The resolve and reject functions handed to an executor or a thenable.
-    pub fn resolving_functions(&mut self, p: &Rc<Promise>) -> (Value, Value) {
-        let flag = Value::Cell(Rc::new(std::cell::RefCell::new(Value::Bool(false))));
+    pub fn resolving_functions(&mut self, p: &Gc<Promise>) -> (Value, Value) {
+        let flag = Value::Cell(Gc::new(std::cell::RefCell::new(Value::Bool(false))));
         let mk = |n: Native| {
-            Value::Bound(Rc::new(Bound {
+            Value::Bound(Gc::new(Bound {
                 target: Value::Native(n),
                 this: Value::Promise(p.clone()),
                 args: vec![flag.clone()],
@@ -520,10 +521,32 @@ impl Vm {
         (mk(Native::PromiseResolveFunction), mk(Native::PromiseRejectFunction))
     }
 
+    /// Run one microtask. Everything the job holds is rooted first, so the
+    /// tracing GC may run inside the callbacks it calls.
     fn run_job(&mut self, job: Job) -> Result<(), Value> {
+        let mark = self.root_job(&job);
+        let r = self.run_job_rooted(job);
+        self.host_roots.truncate(mark);
+        r
+    }
+
+    fn root_job(&mut self, job: &Job) -> usize {
+        let mark = self.host_roots.len();
+        #[cfg(feature = "gc")]
+        {
+            use crate::runtime::heap::{Trace, Tracer};
+            let roots = &mut self.host_roots;
+            job.trace(&mut Tracer { visit: &mut |h| roots.push(h), shared: true });
+        }
+        #[cfg(not(feature = "gc"))]
+        let _ = job;
+        mark
+    }
+
+    fn run_job_rooted(&mut self, job: Job) -> Result<(), Value> {
         match job {
             Job::Call { f, args } => {
-                self.call(&f, Value::Undef, args)?;
+                self.call_hosted(&f, Value::Undef, args)?;
             }
             Job::ResolveThenable { promise, thenable, then } => {
                 let (res, rej) = self.resolving_functions(&promise);
@@ -536,15 +559,15 @@ impl Vm {
                             result: None,
                         },
                     );
-                } else if let Err(e) = self.call(&then, thenable, vec![res, rej.clone()]) {
-                    self.call(&rej, Value::Undef, vec![e])?;
+                } else if let Err(e) = self.call_hosted(&then, thenable, vec![res, rej.clone()]) {
+                    self.call_hosted(&rej, Value::Undef, vec![e])?;
                 }
             }
             Job::React { reaction, value, rejected } => match reaction {
                 Reaction::Then { on_fulfilled, on_rejected, result } => {
                     let handler = if rejected { on_rejected } else { on_fulfilled };
                     let outcome = if is_callable(&handler) {
-                        self.call(&handler, Value::Undef, vec![value])
+                        self.call_hosted(&handler, Value::Undef, vec![value])
                     } else if rejected {
                         Err(value)
                     } else {
@@ -568,11 +591,11 @@ impl Vm {
                     r?;
                 }
                 Reaction::Combine { agg, index } => self.combine(&agg, index, value, rejected),
-                Reaction::Finally { f, result } => match self.call(&f, Value::Undef, vec![]) {
+                Reaction::Finally { f, result } => match self.call_hosted(&f, Value::Undef, vec![]) {
                     Err(e) => self.reject_promise(&result, e),
                     Ok(r) => {
                         let pr = self.promise_of(r);
-                        let thunk = Value::Bound(Rc::new(Bound {
+                        let thunk = Value::Bound(Gc::new(Bound {
                             target: Value::Native(Native::PromiseThunk),
                             this: value,
                             args: vec![Value::Bool(rejected)],
@@ -776,7 +799,7 @@ impl Vm {
                     immediate: false,
                 });
             }
-            self.call(&t.f, Value::Undef, t.args)?;
+            self.call_hosted(&t.f, Value::Undef, t.args)?;
             self.run_microtasks()?;
         }
         let _ = Instant::now();
@@ -830,11 +853,11 @@ pub fn call_task_native(vm: &mut Vm, n: Native, this: Value, args: Vec<Value>) -
             };
             vm.lp.seq += 1;
             let key = format!("{SYMBOL_PREFIX}{}:{}", vm.lp.seq, desc.as_deref().unwrap_or(""));
-            Value::Symbol(Rc::new(Symbol { description: desc, key: key.into() }))
+            Value::Symbol(Gc::new(Symbol { description: desc, key: key.into() }))
         }
         SymbolWellKnown => {
             let name = arg(0).to_js_string();
-            Value::Symbol(Rc::new(Symbol {
+            Value::Symbol(Gc::new(Symbol {
                 description: Some(format!("Symbol.{}", name.s).into()),
                 key: well_known(&name.s),
             }))
@@ -857,7 +880,7 @@ pub fn call_task_native(vm: &mut Vm, n: Native, this: Value, args: Vec<Value>) -
         }
         SymbolFor => {
             let k = arg(0).to_js_string();
-            Value::Symbol(Rc::new(Symbol {
+            Value::Symbol(Gc::new(Symbol {
                 description: Some((&*k.s).into()),
                 key: format!("{SYMBOL_PREFIX}for:{}", k.s).into(),
             }))
@@ -965,7 +988,7 @@ pub fn call_task_native(vm: &mut Vm, n: Native, this: Value, args: Vec<Value>) -
             vm.next_tick(arg(0), args.get(1..).map(|r| r.to_vec()).unwrap_or_default());
             Value::Undef
         }
-        FunctionBind => Value::Bound(Rc::new(Bound {
+        FunctionBind => Value::Bound(Gc::new(Bound {
             target: this,
             this: arg(0),
             args: args.get(1..).map(|r| r.to_vec()).unwrap_or_default(),
@@ -1102,7 +1125,7 @@ pub const PROTOTYPE_KEY: &str = "\u{1}prototype";
 
 /// A function's `prototype` object, created on first use with `constructor`
 /// pointing back at the function.
-pub fn func_prototype(f: &Rc<Closure>) -> Rc<Object> {
+pub fn func_prototype(f: &Gc<Closure>) -> Gc<Object> {
     if let Some(p) = &*f.props.borrow()
         && let Some(Value::Obj(o)) = p.get(PROTOTYPE_KEY)
     {
@@ -1121,7 +1144,7 @@ impl Vm {
         match f {
             Value::Class(c) => {
                 let o = Value::Obj(Object::blank(c.shape.clone(), Some(c.clone())));
-                let ctor = Value::Func(Rc::new(Closure { func: c.ctor, caps: Box::new([]), props: Default::default() }));
+                let ctor = Value::Func(Gc::new(Closure { func: c.ctor, caps: Box::new([]), props: Default::default() }));
                 self.call(&ctor, o.clone(), args)?;
                 Ok(o)
             }
@@ -1156,7 +1179,7 @@ impl Vm {
                 let target = func_prototype(cl);
                 let mut p = o.proto();
                 while let Some(q) = p {
-                    if Rc::ptr_eq(&q, &target) {
+                    if Gc::ptr_eq(&q, &target) {
                         return Ok(true);
                     }
                     p = q.proto();
@@ -1169,6 +1192,23 @@ impl Vm {
             }
             Value::Native(_) => Ok(false),
             _ => Err(self.type_error("Right-hand side of 'instanceof' is not callable".into())),
+        }
+    }
+}
+
+impl crate::runtime::heap::Trace for EventLoop {
+    fn trace(&self, t: &mut crate::runtime::heap::Tracer) {
+        for j in self.microtasks.iter().chain(self.ticks.iter()) {
+            j.trace(t);
+        }
+        for tm in &self.timers {
+            tm.f.trace(t);
+            for a in &tm.args {
+                a.trace(t);
+            }
+        }
+        for p in &self.rejected {
+            t.edge(p);
         }
     }
 }

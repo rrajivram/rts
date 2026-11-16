@@ -1,11 +1,19 @@
-//! Run-time values. All heap values are reference counted (`Rc`); there is no
-//! tracing garbage collector. Numbers, booleans and BigInts in typed code never
-//! reach this module — they live unboxed in the VM's number and boolean slots.
+//! Run-time values. Heap values are `Gc<T>` (see `heap.rs` for the memory
+//! modes). Numbers, booleans and BigInts in typed code never reach this
+//! module — they live unboxed in the VM's number and boolean slots.
 
 pub mod bigint;
+pub mod cycles;
+#[cfg(feature = "gc")]
+pub mod gc;
+pub mod heap;
 pub mod natives;
 pub mod regexp;
 pub mod task;
+mod trace;
+pub use trace::trace_shape;
+
+pub use heap::Gc;
 
 use std::cell::RefCell;
 use std::fmt::Write as _;
@@ -26,10 +34,10 @@ pub struct JsStr {
 }
 
 impl JsStr {
-    pub fn new(s: impl Into<Box<str>>) -> Rc<JsStr> {
+    pub fn new(s: impl Into<Box<str>>) -> Gc<JsStr> {
         let s = s.into();
         let ascii = s.is_ascii();
-        Rc::new(JsStr { s, ascii })
+        Gc::new(JsStr { s, ascii })
     }
     pub fn len16(&self) -> usize {
         if self.ascii {
@@ -73,18 +81,18 @@ pub enum ArrStore {
 pub struct Array {
     pub store: RefCell<ArrStore>,
     /// Named properties of the array (regex match results' `index`, `input`).
-    pub props: RefCell<Option<Rc<Object>>>,
+    pub props: RefCell<Option<Gc<Object>>>,
 }
 
 impl Array {
-    pub fn new_num(v: Vec<f64>) -> Rc<Array> {
-        Rc::new(Array {
+    pub fn new_num(v: Vec<f64>) -> Gc<Array> {
+        Gc::new(Array {
             store: RefCell::new(ArrStore::Num(v)),
             props: RefCell::new(None),
         })
     }
-    pub fn new_val(v: Vec<Value>) -> Rc<Array> {
-        Rc::new(Array {
+    pub fn new_val(v: Vec<Value>) -> Gc<Array> {
+        Gc::new(Array {
             store: RefCell::new(ArrStore::Val(v)),
             props: RefCell::new(None),
         })
@@ -165,7 +173,7 @@ pub struct Shape {
     pub null_proto: bool,
     /// The prototype of objects of this shape (`Object.create(p)`, `new F`).
     /// Class instances use their class instead; plain objects have none.
-    pub proto: Option<Rc<Object>>,
+    pub proto: Option<Gc<Object>>,
     /// For a function's `prototype` object: the function, which is its
     /// (non-enumerable) `constructor` property.
     pub ctor: Option<Value>,
@@ -179,14 +187,14 @@ impl Shape {
         Self::make(keys, true, None, None)
     }
     /// An empty shape whose objects inherit from `proto`.
-    pub fn with_proto(proto: Rc<Object>) -> Rc<Shape> {
+    pub fn with_proto(proto: Gc<Object>) -> Rc<Shape> {
         Self::make(vec![], false, Some(proto), None)
     }
     /// The shape of a function's fresh `prototype` object.
     pub fn prototype_of(ctor: Value) -> Rc<Shape> {
         Self::make(vec![], false, None, Some(ctor))
     }
-    pub fn make(keys: Vec<Rc<str>>, null_proto: bool, proto: Option<Rc<Object>>, ctor: Option<Value>) -> Rc<Shape> {
+    pub fn make(keys: Vec<Rc<str>>, null_proto: bool, proto: Option<Gc<Object>>, ctor: Option<Value>) -> Rc<Shape> {
         let map = keys.iter().enumerate().map(|(i, k)| (k.clone(), i as u32)).collect();
         Rc::new(Shape {
             keys,
@@ -198,7 +206,7 @@ impl Shape {
         })
     }
     /// The same keys with a different prototype (`Object.setPrototypeOf`).
-    pub fn reproto(&self, proto: Option<Rc<Object>>, null_proto: bool) -> Rc<Shape> {
+    pub fn reproto(&self, proto: Option<Gc<Object>>, null_proto: bool) -> Rc<Shape> {
         Self::make(self.keys.clone(), null_proto, proto, self.ctor.clone())
     }
     pub fn lookup(&self, name: &str) -> Option<u32> {
@@ -245,16 +253,21 @@ pub struct Object {
 }
 
 impl Object {
-    pub fn new(shape: Rc<Shape>, vals: Vec<Value>, class: Option<Rc<ClassRt>>) -> Rc<Object> {
+    pub fn new(shape: Rc<Shape>, vals: Vec<Value>, class: Option<Rc<ClassRt>>) -> Gc<Object> {
         Self::with_fields(shape, Fields::from_vec(vals), class)
     }
     /// An object with `n` undefined fields.
-    pub fn blank(shape: Rc<Shape>, class: Option<Rc<ClassRt>>) -> Rc<Object> {
+    pub fn blank(shape: Rc<Shape>, class: Option<Rc<ClassRt>>) -> Gc<Object> {
         let n = shape.keys.len();
-        Self::with_fields(shape, Fields::from_elem(Value::Undef, n), class)
+        let acyclic = class.as_ref().is_some_and(|c| c.acyclic);
+        let obj = Object {
+            inner: RefCell::new(ObjInner { shape, vals: Fields::from_elem(Value::Undef, n) }),
+            class,
+        };
+        if acyclic { Gc::new_acyclic(obj) } else { Gc::new(obj) }
     }
-    pub fn with_fields(shape: Rc<Shape>, vals: Fields, class: Option<Rc<ClassRt>>) -> Rc<Object> {
-        Rc::new(Object {
+    pub fn with_fields(shape: Rc<Shape>, vals: Fields, class: Option<Rc<ClassRt>>) -> Gc<Object> {
+        Gc::new(Object {
             inner: RefCell::new(ObjInner { shape, vals }),
             class,
         })
@@ -284,7 +297,7 @@ impl Object {
         self.inner.borrow().shape.keys.clone()
     }
     /// The prototype object, if this object has one.
-    pub fn proto(&self) -> Option<Rc<Object>> {
+    pub fn proto(&self) -> Option<Gc<Object>> {
         self.inner.borrow().shape.proto.clone()
     }
     /// An inherited property: looked up along the prototype chain (own
@@ -320,6 +333,8 @@ pub struct ClassRt {
     pub vtable: Vec<u32>,
     pub methods: FxHashMap<Rc<str>, u32>,
     pub ctor: u32,
+    /// Instances can't be part of a cycle (see `HClass::acyclic`).
+    pub acyclic: bool,
 }
 
 impl ClassRt {
@@ -338,9 +353,9 @@ impl ClassRt {
 #[derive(Debug)]
 pub struct Closure {
     pub func: u32,
-    pub caps: Box<[Rc<RefCell<Value>>]>,
+    pub caps: Box<[Gc<RefCell<Value>>]>,
     /// Properties assigned to the function (`assert.ok = ok`).
-    pub props: RefCell<Option<Rc<Object>>>,
+    pub props: RefCell<Option<Gc<Object>>>,
 }
 
 /// Hash key with SameValueZero semantics (for Map and Set).
@@ -392,34 +407,42 @@ pub enum Value {
     Bool(bool),
     Num(f64),
     /// Boxed so the rare BigInt doesn't make every value 16-byte aligned.
-    BigInt(Rc<i128>),
-    Str(Rc<JsStr>),
-    Arr(Rc<Array>),
-    Obj(Rc<Object>),
-    Func(Rc<Closure>),
+    BigInt(Gc<i128>),
+    Str(Gc<JsStr>),
+    Arr(Gc<Array>),
+    Obj(Gc<Object>),
+    Func(Gc<Closure>),
     /// A captured variable's box (internal; never visible to programs).
-    Cell(Rc<RefCell<Value>>),
+    Cell(Gc<RefCell<Value>>),
     Class(Rc<ClassRt>),
-    Map(Rc<MapObj>),
-    Set(Rc<SetObj>),
+    Map(Gc<MapObj>),
+    Set(Gc<SetObj>),
     /// A built-in function used as a value.
     Native(Native),
     /// A bound function (`f.bind(…)`, a promise's resolve/reject functions).
-    Bound(Rc<task::Bound>),
-    Symbol(Rc<task::Symbol>),
+    Bound(Gc<task::Bound>),
+    Symbol(Gc<task::Symbol>),
     /// A generator object (also the state of an async function, internally).
-    Gen(Rc<task::Coroutine>),
-    Promise(Rc<task::Promise>),
+    Gen(Gc<task::Coroutine>),
+    Promise(Gc<task::Promise>),
     /// A built-in iterator (`arr.values()`, `map.entries()`, …).
-    Iter(Rc<task::NativeIter>),
-    Regex(Rc<regexp::RegExp>),
+    Iter(Gc<task::NativeIter>),
+    Regex(Gc<regexp::RegExp>),
     /// The slot of an accessor property (never a variable's value).
-    Accessor(Rc<task::Accessor>),
+    Accessor(Gc<task::Accessor>),
 }
 
 const _: () = assert!(std::mem::size_of::<Value>() == 16);
 
 impl Value {
+    /// Whether this value can point back into the heap (anything but
+    /// primitives and strings): storing it into an acyclic object makes the
+    /// object cycle-capable.
+    #[inline]
+    pub fn is_container(&self) -> bool {
+        !matches!(self, Value::Undef | Value::Null | Value::Bool(_) | Value::Num(_) | Value::Native(_) | Value::Str(_) | Value::BigInt(_) | Value::Symbol(_) | Value::Regex(_))
+    }
+
     /// Drop a slot's heap reference, if it holds one. Slots holding
     /// primitives keep their stale contents: nothing to free, nothing to do.
     #[inline(always)]
@@ -436,27 +459,27 @@ impl Value {
     }
 
     pub fn bigint(n: i128) -> Value {
-        Value::BigInt(Rc::new(n))
+        Value::BigInt(Gc::new(n))
     }
 
     pub fn ptr_id(&self) -> usize {
         match self {
-            Value::Str(s) => Rc::as_ptr(s) as *const () as usize,
-            Value::Arr(a) => Rc::as_ptr(a) as *const () as usize,
-            Value::Obj(o) => Rc::as_ptr(o) as *const () as usize,
-            Value::Func(f) => Rc::as_ptr(f) as *const () as usize,
-            Value::Cell(c) => Rc::as_ptr(c) as *const () as usize,
+            Value::Str(s) => Gc::as_ptr(s) as *const () as usize,
+            Value::Arr(a) => Gc::as_ptr(a) as *const () as usize,
+            Value::Obj(o) => Gc::as_ptr(o) as *const () as usize,
+            Value::Func(f) => Gc::as_ptr(f) as *const () as usize,
+            Value::Cell(c) => Gc::as_ptr(c) as *const () as usize,
             Value::Class(c) => Rc::as_ptr(c) as *const () as usize,
-            Value::Map(m) => Rc::as_ptr(m) as *const () as usize,
-            Value::Set(s) => Rc::as_ptr(s) as *const () as usize,
+            Value::Map(m) => Gc::as_ptr(m) as *const () as usize,
+            Value::Set(s) => Gc::as_ptr(s) as *const () as usize,
             Value::Native(n) => *n as usize,
-            Value::Bound(b) => Rc::as_ptr(b) as *const () as usize,
-            Value::Symbol(x) => Rc::as_ptr(x) as *const () as usize,
-            Value::Gen(g) => Rc::as_ptr(g) as *const () as usize,
-            Value::Promise(p) => Rc::as_ptr(p) as *const () as usize,
-            Value::Iter(i) => Rc::as_ptr(i) as *const () as usize,
-            Value::Regex(r) => Rc::as_ptr(r) as *const () as usize,
-            Value::Accessor(a) => Rc::as_ptr(a) as *const () as usize,
+            Value::Bound(b) => Gc::as_ptr(b) as *const () as usize,
+            Value::Symbol(x) => Gc::as_ptr(x) as *const () as usize,
+            Value::Gen(g) => Gc::as_ptr(g) as *const () as usize,
+            Value::Promise(p) => Gc::as_ptr(p) as *const () as usize,
+            Value::Iter(i) => Gc::as_ptr(i) as *const () as usize,
+            Value::Regex(r) => Gc::as_ptr(r) as *const () as usize,
+            Value::Accessor(a) => Gc::as_ptr(a) as *const () as usize,
             _ => 0,
         }
     }
@@ -482,7 +505,7 @@ impl Value {
             (Value::Bool(a), Value::Bool(b)) => a == b,
             (Value::Num(a), Value::Num(b)) => a == b,
             (Value::BigInt(a), Value::BigInt(b)) => a == b,
-            (Value::Str(a), Value::Str(b)) => Rc::ptr_eq(a, b) || a.s == b.s,
+            (Value::Str(a), Value::Str(b)) => Gc::ptr_eq(a, b) || a.s == b.s,
             (Value::Native(a), Value::Native(b)) => a == b,
             (a, b) => {
                 std::mem::discriminant(a) == std::mem::discriminant(b) && a.ptr_id() == b.ptr_id() && a.ptr_id() != 0
@@ -548,7 +571,7 @@ impl Value {
     }
 
     /// ToString, as used by `String(x)`, `+` and template literals.
-    pub fn to_js_string(&self) -> Rc<JsStr> {
+    pub fn to_js_string(&self) -> Gc<JsStr> {
         match self {
             Value::Str(s) => s.clone(),
             // As a property key: the symbol's hidden key string.

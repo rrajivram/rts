@@ -108,6 +108,7 @@ pub fn compile(hir: &HProgram) -> Program {
             vtable: hc.vtable.iter().map(|(_, f)| *f).collect(),
             methods,
             ctor: hc.ctor,
+            acyclic: hc.acyclic,
         });
         out[i] = Some(c.clone());
         c

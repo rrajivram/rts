@@ -5,6 +5,7 @@
 //! stacks into its `Coroutine`, and moved back when it resumes. Nothing else
 //! changes: the instructions are the same, and typed slots stay unboxed.
 
+use crate::runtime::Gc;
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 use std::rc::Rc;
@@ -46,7 +47,7 @@ pub struct Coroutine {
 pub struct CoState {
     pub status: CoStatus,
     pub func: u32,
-    pub closure: Option<Rc<Closure>>,
+    pub closure: Option<Gc<Closure>>,
     /// Where to continue.
     pub pc: usize,
     /// The frame's slots while suspended.
@@ -55,16 +56,16 @@ pub struct CoState {
     /// Active `try` handlers of the frame: (catch pc, exception slot).
     pub handlers: Vec<(u32, u16)>,
     /// Async functions: the promise the call returned.
-    pub promise: Option<Rc<Promise>>,
+    pub promise: Option<Gc<Promise>>,
     /// Async generators: pending `next`/`throw`/`return` calls, oldest first.
-    pub queue: VecDeque<(Resume, Value, Rc<Promise>)>,
+    pub queue: VecDeque<(Resume, Value, Gc<Promise>)>,
     /// Async generators: the current suspension is an `await`, not a `yield`.
     pub awaiting: bool,
 }
 
 impl Coroutine {
-    pub fn new(kind: CoKind, func: u32, closure: Option<Rc<Closure>>) -> Rc<Coroutine> {
-        Rc::new(Coroutine {
+    pub fn new(kind: CoKind, func: u32, closure: Option<Gc<Closure>>) -> Gc<Coroutine> {
+        Gc::new(Coroutine {
             kind,
             st: RefCell::new(CoState {
                 status: CoStatus::Start,
@@ -97,8 +98,8 @@ pub struct Promise {
 }
 
 impl Promise {
-    pub fn new() -> Rc<Promise> {
-        Rc::new(Promise {
+    pub fn new() -> Gc<Promise> {
+        Gc::new(Promise {
             state: RefCell::new(PromiseState::Pending(Vec::new())),
             handled: Cell::new(false),
         })
@@ -115,14 +116,14 @@ pub enum Reaction {
     Then {
         on_fulfilled: Value,
         on_rejected: Value,
-        result: Option<Rc<Promise>>,
+        result: Option<Gc<Promise>>,
     },
     /// `await`: resume the suspended function.
-    Resume(Rc<Coroutine>),
+    Resume(Gc<Coroutine>),
     /// One input of `Promise.all` / `allSettled` / `any`.
     Combine { agg: Rc<Combinator>, index: usize },
     /// `finally(f)`: call `f`, then pass the original outcome on.
-    Finally { f: Value, result: Rc<Promise> },
+    Finally { f: Value, result: Gc<Promise> },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -138,7 +139,7 @@ pub struct Combinator {
     pub kind: CombineKind,
     pub values: RefCell<Vec<Value>>,
     pub remaining: Cell<usize>,
-    pub result: Rc<Promise>,
+    pub result: Gc<Promise>,
 }
 
 /// A microtask.
@@ -147,7 +148,7 @@ pub enum Job {
     /// Run a reaction with a settled promise's outcome.
     React { reaction: Reaction, value: Value, rejected: bool },
     /// Resolve `promise` with a thenable: call `then` on it.
-    ResolveThenable { promise: Rc<Promise>, thenable: Value, then: Value },
+    ResolveThenable { promise: Gc<Promise>, thenable: Value, then: Value },
     /// `queueMicrotask(f)` / `process.nextTick(f, ...args)`.
     Call { f: Value, args: Vec<Value> },
 }
@@ -191,8 +192,8 @@ pub struct NativeIter {
 }
 
 impl NativeIter {
-    pub fn new(kind: &'static str, items: Vec<Value>) -> Rc<NativeIter> {
-        Rc::new(NativeIter { kind, items, pos: Cell::new(0) })
+    pub fn new(kind: &'static str, items: Vec<Value>) -> Gc<NativeIter> {
+        Gc::new(NativeIter { kind, items, pos: Cell::new(0) })
     }
     pub fn next(&self) -> Option<Value> {
         let i = self.pos.get();
