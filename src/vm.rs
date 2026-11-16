@@ -144,6 +144,13 @@ pub struct Vm {
     pub console_timers: rustc_hash::FxHashMap<String, f64>,
     /// Native calls into the VM in progress: the tracing GC waits for them.
     gc_block: u32,
+    /// Active scope regions, innermost last (see `escape.rs`).
+    pub(crate) regions: Vec<task::RegionRec>,
+    /// Arenas of exited regions, for reuse.
+    pub(crate) arena_pool: Vec<crate::runtime::arena::Arena>,
+    /// Allocate scope-bound objects in arenas (off: `--no-arena`, and in the
+    /// tracing-GC build).
+    pub arenas: bool,
     /// Boxes rooted by hosts that run VM code while holding values
     /// (the event loop). Only the tracing GC reads these.
     host_roots: Vec<std::ptr::NonNull<crate::runtime::heap::Header>>,
@@ -306,6 +313,9 @@ impl Vm {
             co_frames: Vec::new(),
             gc_block: 0,
             host_roots: Vec::new(),
+            regions: Vec::new(),
+            arena_pool: Vec::new(),
+            arenas: !cfg!(feature = "gc"),
             console_indent: 0,
             console_counts: Default::default(),
             console_timers: Default::default(),
@@ -1070,6 +1080,7 @@ impl Vm {
         for x in &mut self.values[fr.value_base..fr.value_base + fr.func.get().value_slots] {
             x.release();
         }
+        self.pop_regions(self.frames.len());
         let val = match self.pop_co(self.frames.len()) {
             Some(co) => self.complete_coroutine(&co, Ok(val)),
             None => val,
@@ -1090,6 +1101,7 @@ impl Vm {
             for x in &mut self.values[fr.value_base..fr.value_base + fr.func.get().value_slots] {
                 x.release();
             }
+            self.pop_regions(self.frames.len());
             let top = self.frames.last().unwrap();
             self.scalars[top.scalar_base + d as usize] = bits;
             return Ok(self.frames.len() <= stop);
@@ -1112,6 +1124,7 @@ impl Vm {
             for x in &mut self.values[fr.value_base..fr.value_base + fr.func.get().value_slots] {
                 x.release();
             }
+            self.pop_regions(self.frames.len());
             let top = self.frames.last().unwrap();
             write_big(&mut self.scalars, top.scalar_base + d as usize, n);
             return Ok(self.frames.len() <= stop);
@@ -1156,6 +1169,7 @@ impl Vm {
             for x in &mut self.values[fr.value_base..fr.value_base + fr.func.get().value_slots] {
                 x.release();
             }
+            self.pop_regions(self.frames.len());
             let co = self.pop_co(self.frames.len());
             if let Some(co) = &co
                 && co.kind != CoKind::Generator
@@ -1982,7 +1996,13 @@ impl Vm {
                     | Instruction::CreateGenerator
                     | Instruction::StartAsync
                     | Instruction::Yield { .. }
-                    | Instruction::Await { .. } => {
+                    | Instruction::Await { .. }
+                    | Instruction::EnterRegion { .. }
+                    | Instruction::ExitRegion
+                    | Instruction::ExitRegionsTo { .. }
+                    | Instruction::NewInstanceIn { .. }
+                    | Instruction::NewObjectIn { .. }
+                    | Instruction::NewArrayIn { .. } => {
                         self.frames[fi].pc = pc;
                         let r = self.exec_extended(fi, pc, sb, vb, stop);
                                                 match tri!(r) {

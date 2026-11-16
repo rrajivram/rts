@@ -57,6 +57,8 @@ struct LoopCtx {
     breaks: Vec<usize>,
     continues: Vec<usize>,
     try_depth: usize,
+    /// Regions active when the loop started (left by `break`/`continue`).
+    region_depth: usize,
 }
 
 struct TryCtx {
@@ -70,6 +72,7 @@ struct TryCtx {
 pub fn compile(hir: &HProgram) -> Program {
     let mut cg = Codegen {
         hir,
+        escape: crate::escape::analyze(hir),
         shapes: Vec::new(),
         shape_ids: HashMap::new(),
         globals: HashMap::new(),
@@ -136,6 +139,8 @@ pub fn compile(hir: &HProgram) -> Program {
 
 struct Codegen<'a> {
     hir: &'a HProgram,
+    /// Which allocations are scope-bound, and which blocks hold regions.
+    escape: crate::escape::EscapeInfo,
     shapes: Vec<Rc<Shape>>,
     shape_ids: HashMap<Vec<Rc<str>>, u32>,
     globals: HashMap<VarId, Home>,
@@ -191,6 +196,8 @@ impl<'a> Codegen<'a> {
             inline: Vec::new(),
             slot_names: vec![SlotName { kind: Kind::Val, index: 0, name: Some("this".into()), from: 0 }],
             field_names: Vec::new(),
+            regions: Vec::new(),
+            peak_v: 0,
         };
         // Arrival slots: value slot 0 = this, then each parameter in a slot of its type.
         let mut arrivals = Vec::new();
@@ -309,6 +316,10 @@ struct FnGen<'c, 'a> {
     slot_names: Vec<SlotName>,
     /// Field names of field instructions, by instruction index (for `--dump`).
     field_names: Vec<(u32, Rc<str>)>,
+    /// Blocks with an active region, innermost last (keys as in `EscapeInfo`).
+    regions: Vec<usize>,
+    /// Highest value slot in use since the innermost region started.
+    peak_v: u16,
 }
 
 struct InlineCtx {
@@ -317,6 +328,7 @@ struct InlineCtx {
     exits: Vec<usize>,
     try_depth: usize,
     loop_depth: usize,
+    region_depth: usize,
 }
 
 impl FnGen<'_, '_> {
@@ -333,6 +345,7 @@ impl FnGen<'_, '_> {
         let r = self.v_top;
         self.v_top += 1;
         self.max_v = self.max_v.max(self.v_top);
+        self.peak_v = self.peak_v.max(self.v_top);
         self.note_slot(Kind::Val, r, None);
         r
     }
@@ -579,6 +592,17 @@ impl FnGen<'_, '_> {
     /// up front, so closures created anywhere in the block see the same cells.
     fn block_vars(&mut self, ss: &[HStmt], vars: &[VarId]) {
         let m = self.mark();
+        // A block with scope-bound allocations gets a region: entered here,
+        // left (its slots cleared, its arena freed) when the block ends.
+        let region = !ss.is_empty() && self.cg.escape.regions.contains(&(ss.as_ptr() as usize));
+        let saved_peak = self.peak_v;
+        let enter = if region {
+            self.regions.push(ss.as_ptr() as usize);
+            self.peak_v = self.v_top;
+            Some(self.emit(Instruction::EnterRegion { first: ValSlot(m.1), count: 0 }))
+        } else {
+            None
+        };
         for v in vars {
             if self.cg.globals.contains_key(v) {
                 continue;
@@ -589,10 +613,31 @@ impl FnGen<'_, '_> {
             }
         }
         self.stmts(ss);
-        if self.v_top > m.1 {
+        if let Some(at) = enter {
+            let count = self.peak_v.max(self.v_top) - m.1;
+            self.code[at] = Instruction::EnterRegion { first: ValSlot(m.1), count };
+            self.emit(Instruction::ExitRegion);
+            self.regions.pop();
+            self.peak_v = saved_peak.max(self.peak_v);
+        } else if self.v_top > m.1 {
             self.emit(Instruction::Release { first: ValSlot(m.1), count: self.v_top - m.1 });
         }
         self.reset(m);
+    }
+
+    /// Leave regions entered since depth `depth` (before jumping out of them).
+    fn exit_regions_to(&mut self, depth: usize) {
+        if self.regions.len() > depth {
+            self.emit(Instruction::ExitRegionsTo { depth: depth as u16 });
+        }
+    }
+
+    /// The region (as `up` levels out from the innermost) an allocation goes
+    /// in, if the escape analysis bound it to a scope.
+    fn region_of(&self, e: &HExpr) -> Option<u16> {
+        let blk = self.cg.escape.sites.get(&(e as *const HExpr as usize))?;
+        let pos = self.regions.iter().rposition(|k| k == blk)?;
+        Some((self.regions.len() - 1 - pos) as u16)
     }
 
     /// Default value for an uninitialized declaration (`let x: number;`).
@@ -734,6 +779,7 @@ impl FnGen<'_, '_> {
                     breaks: vec![],
                     continues: vec![],
                     try_depth: self.tries.len(),
+                    region_depth: self.regions.len(),
                 });
                 // Rotated loop: test at the bottom, one branch per iteration.
                 let to_test = if *test_after || test.is_none() { None } else { Some(self.jump_placeholder()) };
@@ -807,6 +853,7 @@ impl FnGen<'_, '_> {
                     breaks: vec![],
                     continues: vec![],
                     try_depth: self.tries.len(),
+                    region_depth: self.regions.len(),
                 });
                 let top = self.here();
                 self.emit(Instruction::ArrayLength { output: NumSlot(len), array: ValSlot(arr) });
@@ -849,6 +896,8 @@ impl FnGen<'_, '_> {
                     .expect("break target");
                 let depth = self.loops[i].try_depth;
                 self.exit_tries(depth);
+                let rd = self.loops[i].region_depth;
+                self.exit_regions_to(rd);
                 let j = self.jump_placeholder();
                 self.loops[i].breaks.push(j);
             }
@@ -866,6 +915,8 @@ impl FnGen<'_, '_> {
                     .expect("continue target");
                 let depth = self.loops[i].try_depth;
                 self.exit_tries(depth);
+                let rd = self.loops[i].region_depth;
+                self.exit_regions_to(rd);
                 let j = self.jump_placeholder();
                 self.loops[i].continues.push(j);
             }
@@ -881,6 +932,8 @@ impl FnGen<'_, '_> {
                 }
                 let depth = self.inline.last().unwrap().try_depth;
                 self.exit_tries(depth);
+                let rd = self.inline.last().unwrap().region_depth;
+                self.exit_regions_to(rd);
                 let j = self.jump_placeholder();
                 self.inline.last_mut().unwrap().exits.push(j);
                 self.reset(m);
@@ -932,6 +985,7 @@ impl FnGen<'_, '_> {
                     breaks: vec![],
                     continues: vec![],
                     try_depth: self.tries.len(),
+                    region_depth: self.regions.len(),
                 });
                 self.stmt(body);
                 let ctx = self.loops.pop().unwrap();
@@ -1055,6 +1109,7 @@ impl FnGen<'_, '_> {
             breaks: vec![],
             continues: vec![],
             try_depth: self.tries.len(),
+                    region_depth: self.regions.len(),
         });
         let el = self.alloc_v();
         let top = self.here();
@@ -1100,6 +1155,7 @@ impl FnGen<'_, '_> {
             breaks: vec![],
             continues: vec![],
             try_depth: self.tries.len(),
+                    region_depth: self.regions.len(),
         });
         let res = self.alloc_v();
         let el = self.alloc_v();
@@ -1152,6 +1208,7 @@ impl FnGen<'_, '_> {
     }
 
     fn try_stmt(&mut self, block: &[HStmt], catch_var: Option<VarId>, handler: &[HStmt], finalizer: Option<&Vec<HStmt>>) {
+        let rd = self.regions.len();
         let exc = self.alloc_v();
         let begin = self.emit(Instruction::TryBegin { catch: 0, exception: ValSlot(exc) });
         self.tries.push(TryCtx {
@@ -1167,6 +1224,8 @@ impl FnGen<'_, '_> {
         }
         let end = self.jump_placeholder();
         self.patch_here(begin);
+        // An exception may have left regions of the try block active.
+        self.emit(Instruction::ExitRegionsTo { depth: rd as u16 });
         let has_handler = catch_var.is_some() || !handler.is_empty() || finalizer.is_none();
         let mut end2 = None;
         if has_handler {
@@ -1196,6 +1255,7 @@ impl FnGen<'_, '_> {
                 self.block(finalizer.unwrap());
                 end2 = Some(self.jump_placeholder());
                 self.patch_here(b2);
+                self.emit(Instruction::ExitRegionsTo { depth: rd as u16 });
                 self.block(finalizer.unwrap());
                 self.emit(Instruction::Throw { value: ValSlot(exc2) });
             }
@@ -1242,6 +1302,7 @@ impl FnGen<'_, '_> {
             breaks: vec![],
             continues: vec![],
             try_depth: self.tries.len(),
+                    region_depth: self.regions.len(),
         });
         let mut has_default = false;
         // All case bodies share one scope (as in JS).
@@ -1617,7 +1678,10 @@ impl FnGen<'_, '_> {
                     _ => false,
                 };
                 let d = self.alloc_v();
-                self.emit(Instruction::NewArray { output: ValSlot(d), numbers: num });
+                match self.region_of(e) {
+                    Some(up) => self.emit(Instruction::NewArrayIn { output: ValSlot(d), numbers: num, up }),
+                    None => self.emit(Instruction::NewArray { output: ValSlot(d), numbers: num }),
+                };
                 for el in elems {
                     let m = self.mark();
                     match el {
@@ -1658,7 +1722,10 @@ impl FnGen<'_, '_> {
                         }
                     }
                     let shape = self.cg.shape(keys.clone());
-                    self.emit(Instruction::NewObject { output: ValSlot(d), shape });
+                    match self.region_of(e) {
+                        Some(up) => self.emit(Instruction::NewObjectIn { output: ValSlot(d), shape, up }),
+                        None => self.emit(Instruction::NewObject { output: ValSlot(d), shape }),
+                    };
                     for p in props {
                         let HProp::Init(n, x) = p else { unreachable!() };
                         let slot = keys.iter().position(|k| k == n).unwrap() as u16;
@@ -1675,7 +1742,10 @@ impl FnGen<'_, '_> {
                     }
                 } else {
                     let shape = self.cg.shape(vec![]);
-                    self.emit(Instruction::NewObject { output: ValSlot(d), shape });
+                    match self.region_of(e) {
+                        Some(up) => self.emit(Instruction::NewObjectIn { output: ValSlot(d), shape, up }),
+                        None => self.emit(Instruction::NewObject { output: ValSlot(d), shape }),
+                    };
                     for p in props {
                         let m = self.mark();
                         match p {
@@ -1880,7 +1950,10 @@ impl FnGen<'_, '_> {
             }
             HK::New { class, args } => {
                 let d = self.alloc_v();
-                self.emit(Instruction::NewInstance { output: ValSlot(d), class: *class });
+                match self.region_of(e) {
+                    Some(up) => self.emit(Instruction::NewInstanceIn { output: ValSlot(d), class: *class, up }),
+                    None => self.emit(Instruction::NewInstance { output: ValSlot(d), class: *class }),
+                };
                 let ctor = self.cg.hir.classes[*class as usize].ctor;
                 let call = HCall {
                     callee: Callee::Direct { func: ctor, closure: None },
@@ -3007,6 +3080,7 @@ impl FnGen<'_, '_> {
             exits: vec![],
             try_depth: self.tries.len(),
             loop_depth: self.loops.len(),
+            region_depth: self.regions.len(),
         });
         let body = hf.body.clone();
         self.stmts(&body);

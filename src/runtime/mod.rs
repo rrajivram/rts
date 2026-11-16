@@ -2,6 +2,7 @@
 //! modes). Numbers, booleans and BigInts in typed code never reach this
 //! module — they live unboxed in the VM's number and boolean slots.
 
+pub mod arena;
 pub mod bigint;
 pub mod cycles;
 #[cfg(feature = "gc")]
@@ -85,6 +86,16 @@ pub struct Array {
 }
 
 impl Array {
+    /// An empty array allocated in a scope arena.
+    pub fn new_in(numbers: bool, arena: &arena::Arena) -> Gc<Array> {
+        let a = Array {
+            store: RefCell::new(if numbers { ArrStore::Num(Vec::new()) } else { ArrStore::Val(Vec::new()) }),
+            props: RefCell::new(None),
+        };
+        let g = Gc::new_in(a, arena, heap::flag::ARENA);
+        arena.track(g.header_ptr());
+        g
+    }
     pub fn new_num(v: Vec<f64>) -> Gc<Array> {
         Gc::new(Array {
             store: RefCell::new(ArrStore::Num(v)),
@@ -265,6 +276,21 @@ impl Object {
             class,
         };
         if acyclic { Gc::new_acyclic(obj) } else { Gc::new(obj) }
+    }
+    /// A blank object allocated in a scope arena.
+    pub fn blank_in(shape: Rc<Shape>, class: Option<Rc<ClassRt>>, arena: &arena::Arena) -> Gc<Object> {
+        let n = shape.keys.len();
+        let mut flags = heap::flag::ARENA;
+        if class.as_ref().is_some_and(|c| c.acyclic) {
+            flags |= heap::flag::ACYCLIC;
+        }
+        let obj = Object {
+            inner: RefCell::new(ObjInner { shape, vals: Fields::from_elem(Value::Undef, n) }),
+            class,
+        };
+        let g = Gc::new_in(obj, arena, flags);
+        arena.track(g.header_ptr());
+        g
     }
     pub fn with_fields(shape: Rc<Shape>, vals: Fields, class: Option<Rc<ClassRt>>) -> Gc<Object> {
         Gc::new(Object {

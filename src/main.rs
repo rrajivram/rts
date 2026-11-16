@@ -14,6 +14,7 @@ fn main() -> ExitCode {
     let mut dump = false;
     let mut erase = false;
     let mut mem_stats = false;
+    let mut no_arena = false;
     let mut path = None;
     let mut script_args = Vec::new();
     for a in std::env::args().skip(1) {
@@ -27,6 +28,7 @@ fn main() -> ExitCode {
             "--no-types" => erase = true,
             "--no-cycles" => rts::runtime::cycles::disable(),
             "--mem-stats" => mem_stats = true,
+            "--no-arena" => no_arena = true,
             _ => path = Some(a),
         }
     }
@@ -38,7 +40,7 @@ fn main() -> ExitCode {
         rts::runtime::gc::set_min_heap(n);
     }
     let Some(path) = path else {
-        eprintln!("usage: rts [--dump] [--no-types] [--no-cycles] [--mem-stats] <file.ts>");
+        eprintln!("usage: rts [--dump] [--no-types] [--no-cycles] [--no-arena] [--mem-stats] <file.ts>");
         return ExitCode::from(2);
     };
     let src = match std::fs::read_to_string(&path) {
@@ -60,6 +62,9 @@ fn main() -> ExitCode {
         return ExitCode::SUCCESS;
     }
     let mut vm = Vm::new(prog);
+    if no_arena {
+        vm.arenas = false;
+    }
     let abs = std::fs::canonicalize(&path).map(|p| p.to_string_lossy().into_owned()).unwrap_or(path.clone());
     vm.args = std::iter::once(abs).chain(script_args).collect();
     let code = match vm.run_main() {

@@ -17,6 +17,51 @@ use std::time::{Duration, Instant};
 use super::*;
 use crate::runtime::task::*;
 
+/// An active scope region: the frame it belongs to, the value slots to
+/// clear when it exits, and its arena.
+pub(crate) struct RegionRec {
+    pub frame: u32,
+    pub first: u16,
+    pub count: u16,
+    pub arena: crate::runtime::arena::Arena,
+}
+
+impl Vm {
+    /// Leave the innermost region of the current frame (value base `vb`):
+    /// clear its slots, then free its arena.
+    pub(super) fn exit_region(&mut self, vb: usize) {
+        let r = self.regions.pop().expect("region stack");
+        let first = vb + r.first as usize;
+        for x in &mut self.values[first..first + r.count as usize] {
+            x.release();
+        }
+        r.arena.reset();
+        self.arena_pool.push(r.arena);
+    }
+
+    /// Frame `fi` is gone (its slots already released): free its regions.
+    #[inline(always)]
+    pub(super) fn pop_regions(&mut self, fi: usize) {
+        if let Some(r) = self.regions.last()
+            && r.frame as usize >= fi
+        {
+            self.pop_regions_slow(fi);
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn pop_regions_slow(&mut self, fi: usize) {
+        while let Some(r) = self.regions.last()
+            && r.frame as usize >= fi
+        {
+            let r = self.regions.pop().unwrap();
+            r.arena.reset();
+            self.arena_pool.push(r.arena);
+        }
+    }
+}
+
 /// A pending `setTimeout` / `setInterval` / `setImmediate`.
 pub(super) struct Timer {
     pub id: u32,
@@ -1067,6 +1112,49 @@ impl Vm {
                 let (x, d) = self.iterator_resume(&val(self, iterator), m, val(self, value))?;
                 self.values[vb + output.index()] = x;
                 self.scalars[sb + done.index()] = d as u64;
+            }
+            Instruction::EnterRegion { first, count } => {
+                let arena = self.arena_pool.pop().unwrap_or_default();
+                self.regions.push(RegionRec { frame: fi as u32, first: first.0, count, arena });
+            }
+            Instruction::ExitRegion => self.exit_region(vb),
+            Instruction::ExitRegionsTo { depth } => {
+                let mine = self.regions.iter().rev().take_while(|r| r.frame as usize == fi).count();
+                for _ in depth as usize..mine {
+                    self.exit_region(vb);
+                }
+            }
+            Instruction::NewInstanceIn { class, output, up } => {
+                let c = self.prog.classes[class as usize].clone();
+                let o = if self.arenas {
+                    let r = &self.regions[self.regions.len() - 1 - up as usize];
+                    debug_assert_eq!(r.frame as usize, fi);
+                    Object::blank_in(c.shape.clone(), Some(c), &r.arena)
+                } else {
+                    Object::blank(c.shape.clone(), Some(c))
+                };
+                self.values[vb + output.index()] = Value::Obj(o);
+            }
+            Instruction::NewObjectIn { shape, output, up } => {
+                let sh = self.prog.shapes[shape as usize].clone();
+                let o = if self.arenas {
+                    let r = &self.regions[self.regions.len() - 1 - up as usize];
+                    Object::blank_in(sh, None, &r.arena)
+                } else {
+                    Object::blank(sh, None)
+                };
+                self.values[vb + output.index()] = Value::Obj(o);
+            }
+            Instruction::NewArrayIn { numbers, output, up } => {
+                let a = if self.arenas {
+                    let r = &self.regions[self.regions.len() - 1 - up as usize];
+                    Array::new_in(numbers, &r.arena)
+                } else if numbers {
+                    Array::new_num(Vec::new())
+                } else {
+                    Array::new_val(Vec::new())
+                };
+                self.values[vb + output.index()] = Value::Arr(a);
             }
             Instruction::CreateGenerator => {
                 let kind = if func.is_async { CoKind::AsyncGenerator } else { CoKind::Generator };

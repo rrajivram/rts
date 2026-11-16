@@ -9,6 +9,7 @@ pub mod check;
 pub mod codegen;
 pub mod disasm;
 pub mod error;
+pub mod escape;
 pub mod hir;
 pub mod lexer;
 pub mod module;

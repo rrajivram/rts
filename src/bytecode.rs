@@ -333,6 +333,22 @@ pub enum Instruction {
     /// `output = a new instance of classes[class]`, fields undefined (the
     /// constructor is a separate `Call`).
     NewInstance { class: u32, output: ValSlot },
+
+    // ── scope arenas (see escape.rs and runtime/arena.rs) ──
+    /// A block with scope-bound allocations starts: push a region. On exit
+    /// the region's `count` value slots from `first` are cleared.
+    EnterRegion { first: ValSlot, count: u16 },
+    /// The block ends: clear its slots, free everything in its arena.
+    ExitRegion,
+    /// Leave regions until this frame has `depth` of them (`break`,
+    /// `continue`, `catch`, and `return` from an inlined call).
+    ExitRegionsTo { depth: u16 },
+    /// `NewInstance` in the arena of the region `up` levels out from the innermost.
+    NewInstanceIn { class: u32, output: ValSlot, up: u16 },
+    /// `NewObject` in a region's arena.
+    NewObjectIn { shape: u32, output: ValSlot, up: u16 },
+    /// `NewArray` in a region's arena.
+    NewArrayIn { numbers: bool, output: ValSlot, up: u16 },
     /// `output = the class object classes[class]`
     LoadClass { class: u32, output: ValSlot },
 

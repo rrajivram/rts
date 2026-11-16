@@ -161,7 +161,8 @@ impl<T: Trace + 'static> Gc<T> {
             Ok(m) => m.cast::<GcBox<T>>(),
             Err(_) => std::alloc::handle_alloc_error(layout),
         };
-        let rc = if flags & flag::ARENA != 0 { ARENA_COUNT } else { 1 };
+        // One reference: the handle returned. Arena boxes count from ARENA_COUNT.
+        let rc = if flags & flag::ARENA != 0 { ARENA_COUNT + 1 } else { 1 };
         unsafe {
             mem.as_ptr().write(GcBox {
                 hdr: Header {
@@ -342,6 +343,8 @@ pub struct Stats {
     pub arena_boxes: Cell<u64>,
     pub arena_bytes: Cell<u64>,
     pub arena_resets: Cell<u64>,
+    /// Arena boxes still referenced when their scope ended (should be 0).
+    pub arena_escapes: Cell<u64>,
 }
 
 pub struct SyncStats(UnsafeCell<Stats>);
@@ -364,6 +367,7 @@ pub static STATS: SyncStats = SyncStats(UnsafeCell::new(Stats {
     arena_boxes: Cell::new(0),
     arena_bytes: Cell::new(0),
     arena_resets: Cell::new(0),
+    arena_escapes: Cell::new(0),
 }));
 
 impl Stats {
@@ -443,7 +447,7 @@ pub fn print_stats() {
     eprintln!("  allocations      {:>10}", TOTAL_ALLOCS.load(Relaxed));
     eprintln!("  allocated        {:>10.2} MB", mb(TOTAL_BYTES.load(Relaxed)));
     eprintln!("  live boxes       {:>10}", s.boxes.get());
-    eprintln!("  arena boxes      {:>10} ({:.2} MB, {} scope resets)", s.arena_boxes.get(), mb(s.arena_bytes.get()), s.arena_resets.get());
+    eprintln!("  arena boxes      {:>10} ({:.2} MB, {} scope resets, {} outlived their scope)", s.arena_boxes.get(), mb(s.arena_bytes.get()), s.arena_resets.get(), s.arena_escapes.get());
     eprintln!("  collected        {:>10} boxes", s.collected.get());
     eprintln!(
         "  pauses           {:>10} (total {:.3} ms, max {:.3} ms)",
