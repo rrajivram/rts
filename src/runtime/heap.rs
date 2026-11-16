@@ -34,6 +34,12 @@ pub trait Trace {
     /// so they can never be part of a cycle.
     const ACYCLIC: bool = false;
     fn trace(&self, t: &mut Tracer);
+    /// Bytes allocated after the value in the same box (an object's inline
+    /// fields; see `Gc::new_tail_in`).
+    #[inline]
+    fn tail_bytes(&self) -> usize {
+        0
+    }
 }
 
 /// Receives each child pointer of a traced value.
@@ -103,7 +109,8 @@ impl Header {
 /// Per-type operations on a type-erased box.
 pub struct VTable {
     pub name: fn() -> &'static str,
-    pub layout: Layout,
+    /// The box's layout (read before or after the value is dropped).
+    pub layout: unsafe fn(NonNull<Header>) -> Layout,
     pub trace: unsafe fn(NonNull<Header>, &mut Tracer),
     pub drop_value: unsafe fn(NonNull<Header>),
 }
@@ -119,10 +126,20 @@ struct Vt<T>(PhantomData<T>);
 impl<T: Trace + 'static> Vt<T> {
     const V: VTable = VTable {
         name: std::any::type_name::<T>,
-        layout: Layout::new::<GcBox<T>>(),
+        layout: layout_box::<T>,
         trace: trace_box::<T>,
         drop_value: drop_box::<T>,
     };
+}
+
+unsafe fn layout_box<T: Trace>(h: NonNull<Header>) -> Layout {
+    let tail = unsafe { (*h.cast::<GcBox<T>>().as_ptr()).val.tail_bytes() };
+    box_layout::<T>(tail)
+}
+
+fn box_layout<T>(tail: usize) -> Layout {
+    let l = Layout::new::<GcBox<T>>();
+    if tail == 0 { l } else { Layout::from_size_align(l.size() + tail, l.align()).unwrap() }
 }
 
 unsafe fn trace_box<T: Trace>(h: NonNull<Header>, t: &mut Tracer) {
@@ -156,7 +173,18 @@ impl<T: Trace + 'static> Gc<T> {
     /// Allocate with any allocator. Arena boxes pass `flag::ARENA`.
     #[inline]
     pub fn new_in<A: Allocator>(val: T, alloc: &A, flags: u32) -> Gc<T> {
-        let layout = Layout::new::<GcBox<T>>();
+        unsafe { Self::new_tail_in(val, 0, |_| {}, alloc, flags) }
+    }
+
+    /// Allocate `val` followed by `tail` bytes, which `init` initialises
+    /// (given their address) before the box is used.
+    ///
+    /// # Safety
+    /// `val.tail_bytes()` must equal `tail`, and `init` must leave the tail in
+    /// the state `T`'s `Drop` and `Trace` expect.
+    #[inline]
+    pub unsafe fn new_tail_in<A: Allocator>(val: T, tail: usize, init: impl FnOnce(*mut u8), alloc: &A, flags: u32) -> Gc<T> {
+        let layout = box_layout::<T>(tail);
         let mem = match alloc.allocate(layout) {
             Ok(m) => m.cast::<GcBox<T>>(),
             Err(_) => std::alloc::handle_alloc_error(layout),
@@ -174,6 +202,9 @@ impl<T: Trace + 'static> Gc<T> {
                 },
                 val,
             });
+            if tail != 0 {
+                init((mem.as_ptr() as *mut u8).add(size_of::<GcBox<T>>()));
+            }
         }
         let g = Gc { ptr: mem, _own: PhantomData };
         #[cfg(feature = "gc")]
@@ -186,6 +217,15 @@ impl<T: Trace + 'static> Gc<T> {
         STATS.allocated.set(STATS.allocated.get() + 1);
         g
     }
+
+    /// Address of the bytes after the value (see `new_tail_in`).
+    #[inline(always)]
+    pub fn tail_ptr(&self) -> *mut u8 {
+        unsafe { (self.ptr.as_ptr() as *mut u8).add(size_of::<GcBox<T>>()) }
+    }
+
+    /// Offset of the value from the start of the box.
+    pub const VALUE_OFFSET: usize = std::mem::offset_of!(GcBox<T>, val);
 
     #[inline]
     pub fn header(&self) -> &Header {
@@ -328,7 +368,7 @@ pub fn release(p: NonNull<Header>) {
 
 /// Return a box's memory (its value must already be dropped).
 pub fn free_box(p: NonNull<Header>) {
-    let layout = unsafe { p.as_ref() }.vt.layout;
+    let layout = unsafe { (p.as_ref().vt.layout)(p) };
     STATS.boxes.set(STATS.boxes.get() - 1);
     unsafe { Global.deallocate(p.cast(), layout) };
 }

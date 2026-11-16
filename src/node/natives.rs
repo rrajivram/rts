@@ -635,7 +635,7 @@ pub fn call_console_object(vm: &mut Vm, n: Native, args: Vec<Value>) -> Result<V
             _ => Value::Obj(Object::new(Shape::new(vec![]), vec![], None)),
         },
         ObjGetPrototypeOf => match arg(&args, 0) {
-            Value::Obj(ref o) if o.inner.borrow().shape.null_proto => Value::Null,
+            Value::Obj(ref o) if o.null_proto() => Value::Null,
             Value::Obj(ref o) if o.proto().is_some() => Value::Obj(o.proto().unwrap()),
             Value::Obj(ref o) if o.class.is_some() => Value::Class(o.class.clone().unwrap()),
             _ => Value::Obj(Object::new(Shape::new(vec![]), vec![], None)),
@@ -643,12 +643,12 @@ pub fn call_console_object(vm: &mut Vm, n: Native, args: Vec<Value>) -> Result<V
         ObjSetPrototypeOf => {
             let o = arg(&args, 0);
             if let Value::Obj(ob) = &o {
-                let mut inner = ob.inner.borrow_mut();
-                inner.shape = match arg(&args, 1) {
-                    Value::Obj(ref p) => inner.shape.reproto(Some(p.clone()), false),
-                    Value::Null => inner.shape.reproto(None, true),
-                    _ => inner.shape.reproto(None, false),
-                };
+                let sh = ob.shape();
+                ob.set_shape(match arg(&args, 1) {
+                    Value::Obj(ref p) => sh.reproto(Some(p.clone()), false),
+                    Value::Null => sh.reproto(None, true),
+                    _ => sh.reproto(None, false),
+                });
             }
             o
         }

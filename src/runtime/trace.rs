@@ -83,12 +83,13 @@ impl Trace for RefCell<Value> {
 }
 
 impl Trace for Object {
+    fn tail_bytes(&self) -> usize {
+        self.inline_slots().len() * size_of::<Value>()
+    }
     fn trace(&self, t: &mut Tracer) {
-        if let Ok(inner) = self.inner.try_borrow() {
-            trace_shape(&inner.shape, t);
-            for v in inner.vals.iter() {
-                v.trace(t);
-            }
+        trace_shape(&self.shape(), t);
+        for v in self.inline_slots().iter().chain(self.spilled()) {
+            v.trace(t);
         }
         if let Some(c) = &self.class {
             trace_class(c, t);

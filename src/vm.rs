@@ -301,7 +301,7 @@ fn str_cmp(op: CmpOp, a: &str, b: &str) -> bool {
     }
 }
 
-fn describe(v: &Value) -> String {
+pub(crate) fn describe(v: &Value) -> String {
     match v {
         Value::Undef => "undefined".into(),
         Value::Null => "null".into(),
@@ -877,12 +877,12 @@ impl Vm {
                     && let Some(cls) = &o.class
                 {
                     let hit = match &*site.cache.method.borrow() {
-                        Some((sh, c, fi)) if Rc::ptr_eq(c, cls) && Rc::ptr_eq(sh, &o.inner.borrow().shape) => Some(*fi),
+                        Some((sh, c, fi)) if Rc::ptr_eq(c, cls) && o.has_shape(sh) => Some(*fi),
                         _ => None,
                     };
                     let fi = match hit {
                         Some(fi) => Some(fi),
-                        None if o.inner.borrow().shape.lookup(&site.name).is_none() => {
+                        None if o.lookup(&site.name).is_none() => {
                             let mut k = Some(cls.clone());
                             let mut found = None;
                             while let Some(c) = k {
@@ -893,7 +893,7 @@ impl Vm {
                                 k = c.parent.clone();
                             }
                             if let Some(fi) = found {
-                                *site.cache.method.borrow_mut() = Some((o.inner.borrow().shape.clone(), cls.clone(), fi));
+                                *site.cache.method.borrow_mut() = Some((o.shape(), cls.clone(), fi));
                             }
                             found
                         }
@@ -1081,13 +1081,10 @@ impl Vm {
         let name = &*site.name;
         match recv {
             Value::Obj(o) => {
-                let found = {
-                    let inner = o.inner.borrow();
-                    inner.shape.lookup(name).map(|i| {
-                        *site.cache.entry.borrow_mut() = Some((inner.shape.clone(), i));
-                        inner.vals[i as usize].clone()
-                    })
-                };
+                let found = o.lookup(name).map(|i| {
+                    *site.cache.entry.borrow_mut() = Some((o.shape(), i));
+                    o.slot(i as usize)
+                });
                 if let Some(x) = found {
                     return self.read_accessor(x, recv);
                 }
@@ -1132,7 +1129,7 @@ impl Vm {
     #[inline(never)]
     fn set_prop(&mut self, recv: &Value, site: &PropertySite, val: Value) -> Result<(), Value> {
         match recv {
-            Value::Obj(o) if o.inner.borrow().shape.lookup(&site.name).is_none() && Self::accessor(o, "set", &site.name).is_some() => {
+            Value::Obj(o) if o.lookup(&site.name).is_none() && Self::accessor(o, "set", &site.name).is_some() => {
                 let s = Self::accessor(o, "set", &site.name).unwrap();
                 let f = Value::Func(Gc::new(Closure { func: s, caps: Box::new([]), props: Default::default() }));
                 self.call(&f, recv.clone(), vec![val])?;
@@ -1150,19 +1147,17 @@ impl Vm {
                 if val.is_container() {
                     o.header().clear(crate::runtime::heap::flag::ACYCLIC);
                 }
-                let mut inner = o.inner.borrow_mut();
-                if let Some((sh, slot)) = &*site.cache.entry.borrow()
-                    && Rc::ptr_eq(sh, &inner.shape)
-                {
-                    inner.vals[*slot as usize] = val;
+                let hit = matches!(&*site.cache.entry.borrow(), Some((sh, _)) if o.has_shape(sh));
+                if hit {
+                    let slot = site.cache.entry.borrow().as_ref().unwrap().1;
+                    o.set_slot(slot as usize, val);
                     return Ok(());
                 }
-                if let Some(i) = inner.shape.lookup(&site.name) {
-                    *site.cache.entry.borrow_mut() = Some((inner.shape.clone(), i));
-                    inner.vals[i as usize] = val;
+                if let Some(i) = o.lookup(&site.name) {
+                    *site.cache.entry.borrow_mut() = Some((o.shape(), i));
+                    o.set_slot(i as usize, val);
                 } else {
-                    inner.shape = inner.shape.with_key(&site.name);
-                    inner.vals.push(val);
+                    o.push(&site.name, val);
                 }
                 Ok(())
             }
@@ -2016,7 +2011,7 @@ impl Vm {
                     }
                     Instruction::ReadField { output, object, field } => {
                         let x = match &value!(object) {
-                            Value::Obj(ob) => ob.inner.borrow().vals[field as usize].clone(),
+                            Value::Obj(ob) => ob.slot(field as usize),
                             other => {
                                 let m = format!("Cannot read properties of {}", other.to_display());
                                 break self.type_error(m);
@@ -2027,7 +2022,7 @@ impl Vm {
                     Instruction::WriteField { object, field, value } => {
                         let x = value!(value).clone();
                         match &value!(object) {
-                            Value::Obj(ob) => ob.inner.borrow_mut().vals[field as usize] = x,
+                            Value::Obj(ob) => ob.set_slot(field as usize, x),
                             other => {
                                 let m = format!("Cannot set properties of {}", other.to_display());
                                 break self.type_error(m);
@@ -2036,10 +2031,7 @@ impl Vm {
                     }
                     Instruction::ReadFieldNumber { output: d, object: o, field: i } => {
                         let x = match &value!(o) {
-                            Value::Obj(ob) => match &ob.inner.borrow().vals[i as usize] {
-                                Value::Num(x) => Ok(*x),
-                                other => Err(format!("expected a number field, got {}", describe(other))),
-                            },
+                            Value::Obj(ob) => ob.slot_num(i as usize),
                             other => Err(format!("Cannot read properties of {}", other.to_display())),
                         };
                         match x {
@@ -2050,7 +2042,7 @@ impl Vm {
                     Instruction::WriteFieldNumber { object, field, value } => {
                         let x = number!(value);
                         match &value!(object) {
-                            Value::Obj(ob) => ob.inner.borrow_mut().vals[field as usize] = Value::Num(x),
+                            Value::Obj(ob) => ob.set_slot(field as usize, Value::Num(x)),
                             other => {
                                 let m = format!("Cannot set properties of {}", other.to_display());
                                 break self.type_error(m);
@@ -2061,9 +2053,8 @@ impl Vm {
                         let site = &func.property_sites[property as usize];
                         let fast = match &value!(object) {
                             Value::Obj(ob) => {
-                                let inner = ob.inner.borrow();
                                 match &*site.cache.entry.borrow() {
-                                    Some((sh, slot)) if Rc::ptr_eq(sh, &inner.shape) => Some(inner.vals[*slot as usize].clone()),
+                                    Some((sh, slot)) if ob.has_shape(sh) => Some(ob.slot(*slot as usize)),
                                     _ => None,
                                 }
                             }
@@ -2092,10 +2083,13 @@ impl Vm {
                         let x = value!(value).clone();
                         // Inline cache hit: the shape already has the slot.
                         let x = if let Value::Obj(ob) = &value!(object) {
-                            let mut inner = ob.inner.borrow_mut();
-                            match &*site.cache.entry.borrow() {
-                                Some((sh, slot)) if Rc::ptr_eq(sh, &inner.shape) && !matches!(inner.vals[*slot as usize], Value::Accessor(_)) => {
-                                    inner.vals[*slot as usize] = x;
+                            let hit = match &*site.cache.entry.borrow() {
+                                Some((sh, slot)) if ob.has_shape(sh) && !ob.slot_is_accessor(*slot as usize) => Some(*slot),
+                                _ => None,
+                            };
+                            match hit {
+                                Some(slot) => {
+                                    ob.set_slot(slot as usize, x);
                                     None
                                 }
                                 _ => Some(x),

@@ -16,7 +16,7 @@ pub use trace::trace_shape;
 
 pub use heap::Gc;
 
-use std::cell::RefCell;
+use std::cell::{RefCell, UnsafeCell};
 use std::fmt::Write as _;
 use std::hash::{Hash, Hasher};
 use std::rc::Rc;
@@ -248,83 +248,221 @@ impl Shape {
     }
 }
 
-/// Fields stored inline for small objects (one allocation per object).
-pub type Fields = smallvec::SmallVec<[Value; 4]>;
-
-#[derive(Debug)]
-pub struct ObjInner {
-    pub shape: Rc<Shape>,
-    pub vals: Fields,
-}
-
+/// A JavaScript object. Its first `cap` fields are stored inline, right after
+/// this struct in the same box, at fixed offsets (compiled code reads a class
+/// instance's fields with one load); any further fields go to `spill`.
+///
+/// No `RefCell`: every accessor clones a field out or swaps one in, and none
+/// holds a reference into the object across code that could change it.
 #[derive(Debug)]
 pub struct Object {
-    pub inner: RefCell<ObjInner>,
     pub class: Option<Rc<ClassRt>>,
+    shape: UnsafeCell<Rc<Shape>>,
+    /// Fields from index `cap` on.
+    spill: UnsafeCell<Vec<Value>>,
+    /// Inline slots; those past the shape's length hold `undefined`.
+    cap: u32,
 }
+
+/// Inline slots for objects whose fields aren't known in advance.
+const MIN_INLINE: usize = 4;
 
 impl Object {
     pub fn new(shape: Rc<Shape>, vals: Vec<Value>, class: Option<Rc<ClassRt>>) -> Gc<Object> {
-        Self::with_fields(shape, Fields::from_vec(vals), class)
+        let cap = vals.len().max(MIN_INLINE);
+        Self::alloc(shape, vals, cap, class, &std::alloc::Global, 0)
     }
-    /// An object with `n` undefined fields.
+    /// A class instance (or an object literal's shell) with every field undefined.
     pub fn blank(shape: Rc<Shape>, class: Option<Rc<ClassRt>>) -> Gc<Object> {
-        let n = shape.keys.len();
-        let acyclic = class.as_ref().is_some_and(|c| c.acyclic);
-        let obj = Object {
-            inner: RefCell::new(ObjInner { shape, vals: Fields::from_elem(Value::Undef, n) }),
-            class,
-        };
-        if acyclic { Gc::new_acyclic(obj) } else { Gc::new(obj) }
+        let flags = if class.as_ref().is_some_and(|c| c.acyclic) { heap::flag::ACYCLIC } else { 0 };
+        let cap = Self::blank_cap(&shape, &class);
+        Self::alloc(shape, Vec::new(), cap, class, &std::alloc::Global, flags)
     }
     /// A blank object allocated in a scope arena.
     pub fn blank_in(shape: Rc<Shape>, class: Option<Rc<ClassRt>>, arena: &arena::Arena) -> Gc<Object> {
-        let n = shape.keys.len();
         let mut flags = heap::flag::ARENA;
         if class.as_ref().is_some_and(|c| c.acyclic) {
             flags |= heap::flag::ACYCLIC;
         }
-        let obj = Object {
-            inner: RefCell::new(ObjInner { shape, vals: Fields::from_elem(Value::Undef, n) }),
-            class,
-        };
-        let g = Gc::new_in(obj, arena, flags);
+        let cap = Self::blank_cap(&shape, &class);
+        let g = Self::alloc(shape, Vec::new(), cap, class, arena, flags);
         arena.track(g.header_ptr());
         g
     }
-    pub fn with_fields(shape: Rc<Shape>, vals: Fields, class: Option<Rc<ClassRt>>) -> Gc<Object> {
-        Gc::new(Object {
-            inner: RefCell::new(ObjInner { shape, vals }),
-            class,
-        })
+    fn blank_cap(shape: &Shape, class: &Option<Rc<ClassRt>>) -> usize {
+        // Class instances get exactly their declared fields.
+        if class.is_some() { shape.keys.len() } else { shape.keys.len().max(MIN_INLINE) }
+    }
+    /// Allocate with `cap` inline slots: `vals` first, then `undefined` up to
+    /// the shape's length (and beyond, in unused slots).
+    fn alloc<A: std::alloc::Allocator>(shape: Rc<Shape>, vals: Vec<Value>, cap: usize, class: Option<Rc<ClassRt>>, alloc: &A, flags: u32) -> Gc<Object> {
+        let n = shape.keys.len();
+        debug_assert!(vals.is_empty() || vals.len() == n);
+        let mut it = vals.into_iter();
+        let inline: Vec<Value> = it.by_ref().take(cap).collect();
+        let spill: Vec<Value> = if n > cap { if it.len() > 0 { it.collect() } else { vec![Value::Undef; n - cap] } } else { Vec::new() };
+        let obj = Object { class, shape: UnsafeCell::new(shape), spill: UnsafeCell::new(spill), cap: cap as u32 };
+        unsafe {
+            Gc::new_tail_in(
+                obj,
+                cap * size_of::<Value>(),
+                |p| {
+                    let p = p as *mut Value;
+                    let k = inline.len();
+                    for (i, v) in inline.into_iter().enumerate() {
+                        p.add(i).write(v);
+                    }
+                    for i in k..cap {
+                        p.add(i).write(Value::Undef);
+                    }
+                },
+                alloc,
+                flags,
+            )
+        }
+    }
+    /// Byte offset of inline field `i` from the start of the object's box.
+    pub fn field_offset(i: usize) -> usize {
+        Gc::<Object>::VALUE_OFFSET + size_of::<Object>() + i * size_of::<Value>()
+    }
+    #[inline(always)]
+    fn inline_ptr(&self) -> *mut Value {
+        unsafe { (self as *const Object as *mut u8).add(size_of::<Object>()) as *mut Value }
+    }
+    #[inline(always)]
+    fn slot_ptr(&self, i: usize) -> *mut Value {
+        if i < self.cap as usize {
+            unsafe { self.inline_ptr().add(i) }
+        } else {
+            unsafe { (*self.spill.get()).as_mut_ptr().add(i - self.cap as usize) }
+        }
+    }
+    /// Number of fields.
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.shape_ref().keys.len()
+    }
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+    /// The shape. Valid until the object's keys or prototype change.
+    #[inline(always)]
+    fn shape_ref(&self) -> &Shape {
+        unsafe { &**self.shape.get() }
+    }
+    pub fn shape(&self) -> Rc<Shape> {
+        unsafe { (*self.shape.get()).clone() }
+    }
+    #[inline(always)]
+    pub fn has_shape(&self, s: &Rc<Shape>) -> bool {
+        unsafe { Rc::ptr_eq(&*self.shape.get(), s) }
+    }
+    /// Replace the shape with one that has the same keys (`setPrototypeOf`).
+    pub fn set_shape(&self, s: Rc<Shape>) {
+        debug_assert_eq!(s.keys.len(), self.len());
+        let old = unsafe { std::mem::replace(&mut *self.shape.get(), s) };
+        drop(old);
+    }
+    #[inline]
+    pub fn lookup(&self, name: &str) -> Option<u32> {
+        self.shape_ref().lookup(name)
+    }
+    pub fn null_proto(&self) -> bool {
+        self.shape_ref().null_proto
+    }
+    pub fn ctor(&self) -> Option<Value> {
+        self.shape_ref().ctor.clone()
+    }
+    /// Field `i` (which must exist).
+    #[inline(always)]
+    pub fn slot(&self, i: usize) -> Value {
+        debug_assert!(i < self.len());
+        unsafe { (*self.slot_ptr(i)).clone() }
+    }
+    /// Field `i` if it holds a number.
+    #[inline(always)]
+    pub fn slot_num(&self, i: usize) -> Result<f64, String> {
+        match unsafe { &*self.slot_ptr(i) } {
+            Value::Num(x) => Ok(*x),
+            other => Err(format!("expected a number field, got {}", crate::vm::describe(other))),
+        }
+    }
+    #[inline(always)]
+    pub fn slot_is_accessor(&self, i: usize) -> bool {
+        matches!(unsafe { &*self.slot_ptr(i) }, Value::Accessor(_))
+    }
+    /// Store into field `i` (which must exist). The old value is dropped
+    /// after the store.
+    #[inline(always)]
+    pub fn set_slot(&self, i: usize, v: Value) {
+        debug_assert!(i < self.len());
+        let old = unsafe { std::mem::replace(&mut *self.slot_ptr(i), v) };
+        drop(old);
+    }
+    /// Keys and values.
+    pub fn entries(&self) -> (Vec<Rc<str>>, Vec<Value>) {
+        let keys = self.keys();
+        let vals = (0..keys.len()).map(|i| self.slot(i)).collect();
+        (keys, vals)
+    }
+    /// Add a field (the key must be new).
+    pub fn push(&self, name: &Rc<str>, val: Value) {
+        let n = self.len();
+        let s = unsafe { &*self.shape.get() }.with_key(name);
+        self.set_shape_unchecked(s);
+        if n < self.cap as usize {
+            self.set_slot(n, val);
+        } else {
+            unsafe { (*self.spill.get()).push(val) };
+        }
+    }
+    fn set_shape_unchecked(&self, s: Rc<Shape>) {
+        let old = unsafe { std::mem::replace(&mut *self.shape.get(), s) };
+        drop(old);
     }
     pub fn get(&self, name: &str) -> Option<Value> {
-        let inner = self.inner.borrow();
-        inner.shape.lookup(name).map(|i| inner.vals[i as usize].clone())
+        self.lookup(name).map(|i| self.slot(i as usize))
     }
     pub fn set(&self, name: &Rc<str>, val: Value) {
-        let mut inner = self.inner.borrow_mut();
-        if let Some(i) = inner.shape.lookup(name) {
-            inner.vals[i as usize] = val;
-        } else {
-            inner.shape = inner.shape.with_key(name);
-            inner.vals.push(val);
+        match self.lookup(name) {
+            Some(i) => self.set_slot(i as usize, val),
+            None => self.push(name, val),
         }
     }
     pub fn delete(&self, name: &str) -> bool {
-        let mut inner = self.inner.borrow_mut();
-        if let Some(i) = inner.shape.lookup(name) {
-            inner.shape = inner.shape.without_key(i as usize);
-            inner.vals.remove(i as usize);
+        if let Some(i) = self.lookup(name) {
+            let i = i as usize;
+            let n = self.len();
+            let removed = self.slot(i);
+            for j in i..n - 1 {
+                self.set_slot(j, self.slot(j + 1));
+            }
+            if n - 1 >= self.cap as usize {
+                let last = unsafe { (*self.spill.get()).pop() };
+                drop(last);
+            } else {
+                self.set_slot(n - 1, Value::Undef);
+            }
+            let s = self.shape_ref().without_key(i);
+            self.set_shape_unchecked(s);
+            drop(removed);
         }
         true
     }
     pub fn keys(&self) -> Vec<Rc<str>> {
-        self.inner.borrow().shape.keys.clone()
+        self.shape_ref().keys.clone()
+    }
+    /// Inline slot count (for `Trace` and `Drop`).
+    pub(crate) fn inline_slots(&self) -> &[Value] {
+        unsafe { std::slice::from_raw_parts(self.inline_ptr(), self.cap as usize) }
+    }
+    pub(crate) fn spilled(&self) -> &[Value] {
+        unsafe { &*self.spill.get() }
     }
     /// The prototype object, if this object has one.
     pub fn proto(&self) -> Option<Gc<Object>> {
-        self.inner.borrow().shape.proto.clone()
+        self.shape_ref().proto.clone()
     }
     /// An inherited property: looked up along the prototype chain (own
     /// properties excluded).
@@ -335,9 +473,9 @@ impl Object {
                 return Some(v);
             }
             if name == "constructor"
-                && let Some(c) = &o.inner.borrow().shape.ctor
+                && let Some(c) = o.ctor()
             {
-                return Some(c.clone());
+                return Some(c);
             }
             p = o.proto();
         }
@@ -346,6 +484,12 @@ impl Object {
     /// Own or inherited property.
     pub fn get_chain(&self, name: &str) -> Option<Value> {
         self.get(name).or_else(|| self.get_inherited(name))
+    }
+}
+
+impl Drop for Object {
+    fn drop(&mut self) {
+        unsafe { std::ptr::drop_in_place(std::ptr::slice_from_raw_parts_mut(self.inline_ptr(), self.cap as usize)) }
     }
 }
 
@@ -984,10 +1128,7 @@ impl Insp<'_> {
                 (String::new(), ("[", "]"), out, true, numeric)
             }
             Value::Obj(o) => {
-                let (keys, vals) = {
-                    let inner = o.inner.borrow();
-                    (inner.shape.keys.clone(), inner.vals.clone())
-                };
+                let (keys, vals) = o.entries();
                 self.indent += 2;
                 // Symbol keys print after the others.
                 let mut pairs: Vec<(&Rc<str>, &Value)> = keys.iter().zip(vals.iter()).collect();
@@ -996,7 +1137,7 @@ impl Insp<'_> {
                 self.indent -= 2;
                 let base = match &o.class {
                     Some(c) => c.name.to_string(),
-                    None if o.inner.borrow().shape.null_proto => "[Object: null prototype]".to_string(),
+                    None if o.null_proto() => "[Object: null prototype]".to_string(),
                     None => match o.get_inherited("constructor") {
                         Some(Value::Func(ref f)) => (self.funcs)(f.func).to_string(),
                         Some(Value::Class(ref c)) => c.name.to_string(),

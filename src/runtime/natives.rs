@@ -476,10 +476,7 @@ pub fn json_stringify(v: &Value, indent: &str, cur: &str, out: &mut String) -> b
             _ => out.push_str("null"),
         },
         Value::Obj(o) => {
-            let (keys, vals) = {
-                let i = o.inner.borrow();
-                (i.shape.keys.clone(), i.vals.clone())
-            };
+            let (keys, vals) = o.entries();
             let inner = format!("{cur}{indent}");
             out.push('{');
             let mut first = true;
