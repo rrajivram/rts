@@ -198,6 +198,7 @@ impl<'a> Codegen<'a> {
             field_names: Vec::new(),
             regions: Vec::new(),
             peak_v: 0,
+            pending_regions: Vec::new(),
         };
         // Arrival slots: value slot 0 = this, then each parameter in a slot of its type.
         let mut arrivals = Vec::new();
@@ -320,6 +321,9 @@ struct FnGen<'c, 'a> {
     regions: Vec<usize>,
     /// Highest value slot in use since the innermost region started.
     peak_v: u16,
+    /// Result regions for calls being emitted, keyed by the `HCall` (see
+    /// `CallSite::region`); nested calls in arguments push their own.
+    pending_regions: Vec<(usize, Option<u16>)>,
 }
 
 struct InlineCtx {
@@ -635,7 +639,11 @@ impl FnGen<'_, '_> {
     /// The region (as `up` levels out from the innermost) an allocation goes
     /// in, if the escape analysis bound it to a scope.
     fn region_of(&self, e: &HExpr) -> Option<u16> {
-        let blk = self.cg.escape.sites.get(&(e as *const HExpr as usize))?;
+        let key = e as *const HExpr as usize;
+        if self.cg.escape.result.contains(&key) && !self.cg.hir.funcs[self.fid as usize].is_async {
+            return Some(crate::bytecode::RESULT_REGION);
+        }
+        let blk = self.cg.escape.sites.get(&key)?;
         let pos = self.regions.iter().rposition(|k| k == blk)?;
         Some((self.regions.len() - 1 - pos) as u16)
     }
@@ -1426,6 +1434,8 @@ impl FnGen<'_, '_> {
                 }
             }
             HK::Call(c) => {
+                let r = self.region_of(e);
+                self.call_region_for(c, r);
                 self.call(c, None);
             }
             HK::Assign(place, value) => {
@@ -1945,6 +1955,8 @@ impl FnGen<'_, '_> {
             HK::Update { place, inc, prefix } => self.update(place, *inc, *prefix, k == Kind::Big),
             HK::Call(c) => {
                 let d = self.alloc(k);
+                let r = self.region_of(e);
+                self.call_region_for(c, r);
                 self.call(c, Some(d));
                 d
             }
@@ -2601,6 +2613,7 @@ impl FnGen<'_, '_> {
             has_spread: false,
             output: dst.map(|d| (d.k, d.r)),
             packed_rest: false,
+            region: None,
         });
         let ci = self.calls.len() as u32 - 1;
         self.emit(Instruction::Call { site: ci });
@@ -2687,6 +2700,13 @@ impl FnGen<'_, '_> {
     }
 
     // ───────────── calls ─────────────
+
+    /// Note the result region for a call about to be emitted. It is taken
+    /// when the call's `CallSite` is built, after its arguments (which may
+    /// contain calls of their own) are emitted.
+    fn call_region_for(&mut self, c: &HCall, r: Option<u16>) {
+        self.pending_regions.push((c as *const HCall as usize, r));
+    }
 
     fn call(&mut self, c: &HCall, dst: Option<Op>) {
         let this = c.this.as_ref().map(|t| {
@@ -2904,6 +2924,7 @@ impl FnGen<'_, '_> {
                 has_spread: false,
                 output: out.map(|o| (o.k, o.r)),
                 packed_rest: false,
+                region: None,
             });
             let ci = self.calls.len() as u32 - 1;
             self.emit(Instruction::Call { site: ci });
@@ -3236,6 +3257,13 @@ impl FnGen<'_, '_> {
             spread,
             output: dst.map(|d| (d.k, d.r)),
             packed_rest: rest_at.is_some(),
+            region: {
+                let key = c as *const HCall as usize;
+                match self.pending_regions.iter().rposition(|(k, _)| *k == key) {
+                    Some(i) => self.pending_regions.remove(i).1,
+                    None => None,
+                }
+            },
         };
         self.calls.push(ci);
         let ci = self.calls.len() as u32 - 1;

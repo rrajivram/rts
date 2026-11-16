@@ -2054,6 +2054,8 @@ impl Checker {
             ExprKind::This => self.this_binding().map(|(v, _)| format!("{v}")),
             ExprKind::Member { obj, prop, optional: false } => self.narrow_key_member(obj, prop),
             ExprKind::Paren(x) | ExprKind::NonNull(x) => self.narrow_key(x),
+            // `(x = e)` evaluates to x's new value: `while ((x = next()) !== null)`.
+            ExprKind::Assign(AssignOp::Assign, target, _) => self.narrow_key(target),
             _ => None,
         }
     }

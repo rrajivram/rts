@@ -25,6 +25,7 @@ N = int(os.environ.get("RUNS", "5"))
 
 CONFIGS = {
     "rc": [RC, "--mem-stats"],
+    "rc-noarena-nocc": [RC, "--mem-stats", "--no-arena", "--no-cycles"],
     "rc-noarena": [RC, "--mem-stats", "--no-arena"],
     "rc-nocc": [RC, "--mem-stats", "--no-cycles"],
     "gc": [GC, "--mem-stats"],
@@ -34,7 +35,9 @@ CONFIGS = {
 if BASE:
     CONFIGS["base"] = [BASE]
 
-AWFY = os.path.join(ROOT, "bench/awfy/js")
+SUITE = os.environ.get("SUITE", "ts")  # ts: typed ports; js: upstream JavaScript
+AWFY = os.path.join(ROOT, "bench/awfy", SUITE)
+HARNESS = "harness.ts" if SUITE == "ts" else "harness.js"
 # AWFY at a fixed size that runs ~0.1-2 s in rts (inner iterations).
 SIZES = {"Bounce": 100, "CD": 100, "DeltaBlue": 2000, "Havlak": 1, "Json": 10, "List": 100,
          "Mandelbrot": 500, "NBody": 250000, "Permute": 100, "Queens": 100, "Richards": 5,
@@ -46,7 +49,7 @@ def programs():
     want = set(want.split(",")) if want else None
     for b, n in SIZES.items():
         if want is None or b in want:
-            yield b, ["harness.js", b, "1", str(n)], AWFY
+            yield b, [HARNESS, b, "1", str(n)], AWFY
 
 
 def run(cmd, cwd):
@@ -59,7 +62,8 @@ def run(cmd, cwd):
     stats = {}
     for key, pat in [("heap", r"peak heap\s+([\d.]+) MB"), ("pauses", r"pauses\s+(\d+)"),
                      ("pause_max", r"max ([\d.]+) ms\)"), ("pause_total", r"total ([\d.]+) ms"),
-                     ("arena", r"arena boxes\s+(\d+)"), ("collected", r"collected\s+(\d+)")]:
+                     ("arena", r"arena boxes\s+(\d+)"), ("collected", r"collected\s+(\d+)"),
+                     ("objects", r"objects\s+(\d+) allocated"), ("escaped", r"(\d+) outlived")]:
         m = re.search(pat, err)
         if m:
             stats[key] = float(m.group(1))
@@ -67,6 +71,7 @@ def run(cmd, cwd):
 
 
 def main():
+    import json
     configs = os.environ.get("CONFIGS", ",".join(CONFIGS)).split(",")
     rows = []
     for name, args, cwd in programs():
@@ -85,6 +90,10 @@ def main():
             rows.append(row)
             extra = " ".join(f"{k}={v:g}" for k, v in last.items())
             print(f"{name:12} {c:11} {row[2]:7.3f}s  rss {row[3]:7.1f} MB  {extra}", flush=True)
+    out = os.environ.get("OUT")
+    if out:
+        with open(out, "w") as f:
+            json.dump([{"bench": r[0], "config": r[1], "wall": r[2], "rss": r[3], **r[4]} for r in rows], f, indent=1)
     return rows
 
 

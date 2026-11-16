@@ -47,6 +47,47 @@ impl Vm {
         {
             self.pop_regions_slow(fi);
         }
+        if let Some(&(f, _)) = self.result_regions.last()
+            && f as usize >= fi
+        {
+            self.result_regions.pop();
+        }
+    }
+
+    /// The frame about to be pushed allocates its result in a region of the
+    /// caller (the top frame): `up` levels out, or the caller's own result region.
+    pub(super) fn give_result_region(&mut self, up: u16) {
+        let caller = self.frames.len() - 1;
+        let idx = if up == crate::bytecode::RESULT_REGION {
+            self.result_region(caller)
+        } else {
+            Some(self.regions.len() - 1 - up as usize)
+        };
+        if let Some(idx) = idx {
+            self.result_regions.push((self.frames.len() as u32, idx as u32));
+        }
+    }
+
+    /// The region frame `fi` was given for its result, if any.
+    #[inline]
+    pub(super) fn result_region(&self, fi: usize) -> Option<usize> {
+        match self.result_regions.last() {
+            Some(&(f, idx)) if f as usize == fi => Some(idx as usize),
+            _ => None,
+        }
+    }
+
+    /// The arena an `…In { up }` allocation in frame `fi` goes to (None: the heap).
+    #[inline]
+    fn alloc_region(&self, fi: usize, up: u16) -> Option<usize> {
+        if !self.arenas {
+            return None;
+        }
+        if up == crate::bytecode::RESULT_REGION {
+            self.result_region(fi)
+        } else {
+            Some(self.regions.len() - 1 - up as usize)
+        }
     }
 
     #[cold]
@@ -1126,29 +1167,23 @@ impl Vm {
             }
             Instruction::NewInstanceIn { class, output, up } => {
                 let c = self.prog.classes[class as usize].clone();
-                let o = if self.arenas {
-                    let r = &self.regions[self.regions.len() - 1 - up as usize];
-                    debug_assert_eq!(r.frame as usize, fi);
-                    Object::blank_in(c.shape.clone(), Some(c), &r.arena)
-                } else {
-                    Object::blank(c.shape.clone(), Some(c))
+                let o = match self.alloc_region(fi, up) {
+                    Some(i) => Object::blank_in(c.shape.clone(), Some(c), &self.regions[i].arena),
+                    None => Object::blank(c.shape.clone(), Some(c)),
                 };
                 self.values[vb + output.index()] = Value::Obj(o);
             }
             Instruction::NewObjectIn { shape, output, up } => {
                 let sh = self.prog.shapes[shape as usize].clone();
-                let o = if self.arenas {
-                    let r = &self.regions[self.regions.len() - 1 - up as usize];
-                    Object::blank_in(sh, None, &r.arena)
-                } else {
-                    Object::blank(sh, None)
+                let o = match self.alloc_region(fi, up) {
+                    Some(i) => Object::blank_in(sh, None, &self.regions[i].arena),
+                    None => Object::blank(sh, None),
                 };
                 self.values[vb + output.index()] = Value::Obj(o);
             }
             Instruction::NewArrayIn { numbers, output, up } => {
-                let a = if self.arenas {
-                    let r = &self.regions[self.regions.len() - 1 - up as usize];
-                    Array::new_in(numbers, &r.arena)
+                let a = if let Some(i) = self.alloc_region(fi, up) {
+                    Array::new_in(numbers, &self.regions[i].arena)
                 } else if numbers {
                     Array::new_num(Vec::new())
                 } else {

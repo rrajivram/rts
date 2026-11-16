@@ -442,7 +442,14 @@ pub struct CallSite {
     pub output: Option<(Kind, u16)>,
     /// The caller already packed the rest arguments into an array.
     pub packed_rest: bool,
+    /// The region the callee allocates its (fresh) result in, as `up` levels
+    /// out from the caller's innermost region; `RESULT_REGION` passes on the
+    /// caller's own result region. None: the heap.
+    pub region: Option<u16>,
 }
+
+/// `up` value meaning "the region the caller was given for its own result".
+pub const RESULT_REGION: u16 = u16::MAX;
 
 /// A property accessed by name, with its lookup cache.
 #[derive(Debug)]

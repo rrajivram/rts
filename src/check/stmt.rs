@@ -107,6 +107,17 @@ fn assigned_names(s: &Stmt, out: &mut FxHashSet<Name>) {
             _ => {}
         }
     }
+    /// The assigned path: `x`, or `x.a.b` for a property write (which leaves
+    /// narrowings of `x` itself alone).
+    fn path(e: &Expr) -> Option<String> {
+        match &e.kind {
+            ExprKind::Ident(n) => Some(n.to_string()),
+            ExprKind::This => Some("this".into()),
+            ExprKind::Member { obj, prop, .. } => path(obj).map(|p| format!("{p}.{prop}")),
+            ExprKind::Paren(x) | ExprKind::NonNull(x) => path(x),
+            _ => None,
+        }
+    }
     fn root(e: &Expr, out: &mut FxHashSet<Name>) {
         match &e.kind {
             ExprKind::Ident(n) => {
@@ -114,6 +125,9 @@ fn assigned_names(s: &Stmt, out: &mut FxHashSet<Name>) {
             }
             ExprKind::This => {
                 out.insert("this".into());
+            }
+            ExprKind::Member { .. } if path(e).is_some() => {
+                out.insert(path(e).unwrap().into());
             }
             ExprKind::Member { obj, .. } | ExprKind::Index { obj, .. } => root(obj, out),
             ExprKind::Paren(x) | ExprKind::NonNull(x) => root(x, out),
@@ -1029,12 +1043,19 @@ impl Checker {
         let vars = &self.vars;
         let this_v = self.stack.last().and_then(|c| c.this_var);
         self.stack.last_mut().unwrap().narrow.retain(|k, _| {
-            let root: usize = k.split('.').next().unwrap().parse().unwrap_or(usize::MAX);
+            let mut parts = k.splitn(2, '.');
+            let root: usize = parts.next().unwrap().parse().unwrap_or(usize::MAX);
             if root >= vars.len() {
                 return true;
             }
-            let n = if Some(root as u32) == this_v { "this".into() } else { vars[root].name.clone() };
-            !names.contains(&n)
+            let n: String = if Some(root as u32) == this_v { "this".into() } else { vars[root].name.to_string() };
+            // The narrowed path, by name: `x` or `x.a.b`.
+            let full = match parts.next() {
+                Some(rest) => format!("{n}.{rest}"),
+                None => n,
+            };
+            // Invalidated by an assignment to it or to a prefix of it.
+            !names.iter().any(|p| **p == *full || full.starts_with(&format!("{p}.")))
         });
     }
 

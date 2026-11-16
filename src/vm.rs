@@ -148,6 +148,9 @@ pub struct Vm {
     pub(crate) regions: Vec<task::RegionRec>,
     /// Arenas of exited regions, for reuse.
     pub(crate) arena_pool: Vec<crate::runtime::arena::Arena>,
+    /// Frames given a region for their result by their caller: (frame
+    /// index, index into `regions`), innermost last.
+    pub(crate) result_regions: Vec<(u32, u32)>,
     /// Allocate scope-bound objects in arenas (off: `--no-arena`, and in the
     /// tracing-GC build).
     pub arenas: bool,
@@ -315,6 +318,7 @@ impl Vm {
             host_roots: Vec::new(),
             regions: Vec::new(),
             arena_pool: Vec::new(),
+            result_regions: Vec::new(),
             arenas: !cfg!(feature = "gc"),
             console_indent: 0,
             console_counts: Default::default(),
@@ -851,6 +855,9 @@ impl Vm {
                     si += pk.width() as usize;
                 }
             }
+        }
+        if let Some(up) = ci.region {
+            self.give_result_region(up);
         }
         self.frames.push(Frame {
             func: FnRef::new(&func),

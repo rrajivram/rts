@@ -43,6 +43,9 @@ pub struct EscapeInfo {
     pub sites: FxHashMap<usize, usize>,
     /// Blocks (address of their first statement) that need a region.
     pub regions: FxHashSet<usize>,
+    /// Allocations and calls whose object is only ever returned: they go in
+    /// the region the caller passed for the result (or the heap, if none).
+    pub result: FxHashSet<usize>,
     /// Allocation sites seen, and how many are scope-bound (for `--dump`).
     pub total: usize,
 }
@@ -60,6 +63,9 @@ struct ParamSum {
 #[derive(Clone, Default, PartialEq, Debug)]
 struct Summary {
     p: Vec<ParamSum>,
+    /// Every value returned is an object allocated by this call (or a
+    /// primitive): the caller may choose the region it is allocated in.
+    fresh: bool,
 }
 
 impl Summary {
@@ -67,9 +73,10 @@ impl Summary {
         self.p.get(i).cloned().unwrap_or(ParamSum { esc: true, ret: true, into: vec![] })
     }
     fn all_escape(n: usize) -> Summary {
-        Summary { p: vec![ParamSum { esc: true, ret: true, into: vec![] }; n] }
+        Summary { p: vec![ParamSum { esc: true, ret: true, into: vec![] }; n], fresh: false }
     }
     fn join(&mut self, o: &Summary) {
+        self.fresh &= o.fresh;
         let n = self.p.len().max(o.p.len());
         self.p.resize(n, ParamSum::default());
         for (i, s) in self.p.iter_mut().enumerate() {
@@ -133,6 +140,10 @@ struct Fa<'a> {
     site_key: Vec<usize>,
     site_block: Vec<usize>,
     site_heap: Vec<bool>,
+    /// The node is a call whose result is fresh (not an allocation).
+    site_call: Vec<bool>,
+    /// Something returned may be a value the analysis doesn't track.
+    ret_unknown: bool,
     n_params: usize,
     pts: FxHashMap<VarId, Vec<Node>>,
     /// Variables that may hold values the analysis doesn't track.
@@ -163,6 +174,8 @@ impl<'a> Fa<'a> {
             site_key: vec![],
             site_block: vec![],
             site_heap: vec![],
+            site_call: vec![],
+            ret_unknown: false,
             n_params: hf.params.len() + 1,
             pts: FxHashMap::default(),
             var_unknown: FxHashSet::default(),
@@ -290,6 +303,7 @@ impl<'a> Fa<'a> {
         self.site_key.push(key);
         self.site_block.push(*self.cur.last().unwrap());
         self.site_heap.push(self.loop_header > 0);
+        self.site_call.push(false);
         n
     }
 
@@ -383,6 +397,10 @@ impl<'a> Fa<'a> {
             HStmt::Return(e) => {
                 if let Some(e) = e {
                     let av = self.expr(e);
+                    if av.unknown && !self.ret_unknown {
+                        self.ret_unknown = true;
+                        self.changed = true;
+                    }
                     for n in av.nodes {
                         if self.ret.insert(n) {
                             self.changed = true;
@@ -547,7 +565,7 @@ impl<'a> Fa<'a> {
                 self.write_place(place, &AV::none());
                 AV::none()
             }
-            HK::Call(c) => self.call(c),
+            HK::Call(c) => self.call(e, c),
             HK::InstanceOf(x, _) => {
                 self.expr(x);
                 AV::none()
@@ -639,14 +657,15 @@ impl<'a> Fa<'a> {
         }
     }
 
-    fn call(&mut self, c: &HCall) -> AV {
+    fn call(&mut self, e: &HExpr, c: &HCall) -> AV {
         let this = c.this.as_ref().map(|t| self.expr(t));
         let spread = c.args.iter().any(|a| matches!(a, HElem::Spread(_)));
         let args = self.elems(&c.args);
-        match &c.callee {
+        let result = match &c.callee {
             Callee::Direct { func, .. } if !spread => {
                 let sum = self.sums[*func as usize].clone();
-                self.apply(&sum, this, args, rest_at(&self.hir.funcs[*func as usize]))
+                let r = self.apply(&sum, this, args, rest_at(&self.hir.funcs[*func as usize]));
+                (r, sum.fresh)
             }
             Callee::Method { class, vslot } if !spread => {
                 let mut sum: Option<Summary> = None;
@@ -665,16 +684,32 @@ impl<'a> Fa<'a> {
                     }
                 }
                 match sum {
-                    Some(sum) => self.apply(&sum, this, args, rest),
-                    None => self.unknown_call(this, args),
+                    Some(sum) => {
+                        let r = self.apply(&sum, this, args, rest);
+                        (r, sum.fresh)
+                    }
+                    None => (self.unknown_call(this, args), false),
                 }
             }
-            Callee::Native(n) => self.native(*n, this, args),
+            Callee::Native(n) => (self.native(*n, this, args), false),
             Callee::Value(f) => {
                 self.expr(f);
-                self.unknown_call(this, args)
+                (self.unknown_call(this, args), false)
             }
-            _ => self.unknown_call(this, args),
+            _ => (self.unknown_call(this, args), false),
+        };
+        match result {
+            // A fresh result is a new object, like an allocation here.
+            (mut r, true) => {
+                let n = self.site(e);
+                self.site_call[n as usize] = true;
+                r.unknown = false;
+                if !r.nodes.contains(&n) {
+                    r.nodes.push(n);
+                }
+                r
+            }
+            (r, false) => r,
         }
     }
 
@@ -755,6 +790,9 @@ impl<'a> Fa<'a> {
             return Summary::all_escape(self.n_params);
         }
         let esc = self.escaped();
+        let other = self.escaped_other();
+        let fresh = !self.ret_unknown
+            && self.ret.iter().all(|&r| !Self::is_param(r) && !other.contains(&r));
         let mut p = vec![ParamSum::default(); self.n_params];
         for (j, ps) in p.iter_mut().enumerate() {
             let me = PARAM_BASE + j as Node;
@@ -773,7 +811,36 @@ impl<'a> Fa<'a> {
                 }
             }
         }
-        Summary { p }
+        Summary { p, fresh }
+    }
+
+    /// Nodes that escape other than by being returned (closed over contents).
+    fn escaped_other(&self) -> FxHashSet<Node> {
+        let mut esc = self.esc.clone();
+        for j in 0..self.n_params {
+            if let Some(c) = self.contents.get(&(PARAM_BASE + j as Node)) {
+                for &x in c {
+                    if !Self::is_param(x) {
+                        esc.insert(x);
+                    }
+                }
+            }
+        }
+        self.close(&mut esc);
+        esc
+    }
+
+    fn close(&self, esc: &mut FxHashSet<Node>) {
+        let mut work: Vec<Node> = esc.iter().copied().collect();
+        while let Some(n) = work.pop() {
+            if let Some(c) = self.contents.get(&n) {
+                for &x in c {
+                    if esc.insert(x) {
+                        work.push(x);
+                    }
+                }
+            }
+        }
     }
 
     /// Escaping nodes, closed over contents; returned sites and sites stored
@@ -868,6 +935,17 @@ impl<'a> Fa<'a> {
                 break;
             }
         }
+        // Only returned (and what is reachable from the returned objects):
+        // allocate in the caller's result region.
+        let other = self.escaped_other();
+        let mut returned: FxHashSet<Node> = self.ret.iter().copied().filter(|r| !Self::is_param(*r)).collect();
+        self.close(&mut returned);
+        for s in 0..n {
+            let sn = s as Node;
+            if returned.contains(&sn) && !other.contains(&sn) && !self.site_heap[s] && !self.gave_up {
+                out.result.insert(self.site_key[s]);
+            }
+        }
         for s in 0..n {
             if esc.contains(&(s as Node)) || self.site_heap[s] {
                 continue;
@@ -943,8 +1021,9 @@ pub fn analyze(hir: &HProgram) -> EscapeInfo {
     let mut sums: Vec<Summary> = hir
         .funcs
         .iter()
-        .map(|f| if f.is_async || f.is_generator { Summary::all_escape(f.params.len() + 1) } else { Summary { p: vec![ParamSum::default(); f.params.len() + 1] } })
+        .map(|f| if f.is_async || f.is_generator { Summary::all_escape(f.params.len() + 1) } else { Summary { p: vec![ParamSum::default(); f.params.len() + 1], fresh: true } })
         .collect();
+    let mut converged = false;
     for _round in 0..20 {
         let mut changed = false;
         for fid in 0..n {
@@ -957,7 +1036,14 @@ pub fn analyze(hir: &HProgram) -> EscapeInfo {
             }
         }
         if !changed {
+            converged = true;
             break;
+        }
+    }
+    if !converged {
+        // Optimistic summaries that never settled are not safe to use.
+        for (s, f) in sums.iter_mut().zip(&hir.funcs) {
+            *s = Summary::all_escape(f.params.len() + 1);
         }
     }
     let mut out = EscapeInfo::default();

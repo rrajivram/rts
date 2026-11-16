@@ -1042,13 +1042,30 @@ impl Checker {
         }
     }
 
+    /// Type arguments of a class instance, for its own type parameters and,
+    /// through each `extends Parent<…>`, its ancestors' (so inherited
+    /// members see the right types).
     pub fn class_subst(&self, cid: ClassId, args: &[Type]) -> FxHashMap<TParamId, Type> {
-        self.classes[cid as usize]
+        let mut map: FxHashMap<TParamId, Type> = self.classes[cid as usize]
             .tparams
             .iter()
             .cloned()
             .zip(args.iter().cloned().chain(std::iter::repeat(Type::Any)))
-            .collect()
+            .collect();
+        let mut cur = cid;
+        while let Some((pid, pargs)) = self.classes[cur as usize].parent.clone() {
+            let ptps = self.classes[pid as usize].tparams.clone();
+            if ptps.is_empty() {
+                cur = pid;
+                continue;
+            }
+            let mapped: Vec<Type> = pargs.iter().map(|t| self.subst(t, &map)).collect();
+            for (tp, t) in ptps.iter().zip(mapped.into_iter().chain(std::iter::repeat(Type::Any))) {
+                map.entry(*tp).or_insert(t);
+            }
+            cur = pid;
+        }
+        map
     }
 
     pub fn subst(&self, t: &Type, map: &FxHashMap<TParamId, Type>) -> Type {
@@ -1845,6 +1862,16 @@ impl Checker {
         let decl = self.classes[cid as usize].decl.clone();
         let cscope = self.classes[cid as usize].cscope.clone();
         let tparams = self.classes[cid as usize].tparams.clone();
+        // `class D<K extends H>`: constraints may name other declarations, so
+        // they are resolved here rather than when the class is declared.
+        for (tp, id) in decl.tparams.iter().zip(&tparams) {
+            if let Some(c) = &tp.constraint
+                && self.tparams[*id as usize].constraint.is_none()
+            {
+                let c = self.resolve_type_in(c, &cscope)?;
+                self.tparams[*id as usize].constraint = Some(c);
+            }
+        }
         let this_ty = Type::Class(cid, tparams.iter().map(|t| Type::Param(*t)).collect());
         let ctor_this = this_ty.clone();
         let saved_scope = self.ctx().scope.clone();

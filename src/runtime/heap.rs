@@ -180,7 +180,10 @@ impl<T: Trace + 'static> Gc<T> {
         if flags & flag::ARENA == 0 {
             crate::runtime::gc::register(g.header_ptr());
         }
-        STATS.boxes.set(STATS.boxes.get() + 1);
+        if flags & flag::ARENA == 0 {
+            STATS.boxes.set(STATS.boxes.get() + 1);
+        }
+        STATS.allocated.set(STATS.allocated.get() + 1);
         g
     }
 
@@ -333,6 +336,8 @@ pub unsafe fn drop_header_value(p: NonNull<Header>) {
 pub struct Stats {
     /// Live boxes.
     pub boxes: Cell<i64>,
+    /// Boxes allocated, in total (heap and arenas).
+    pub allocated: Cell<u64>,
     /// Collector pauses: count, total and longest, in nanoseconds.
     pub pauses: Cell<u64>,
     pub pause_total_ns: Cell<u64>,
@@ -360,6 +365,7 @@ impl Deref for SyncStats {
 
 pub static STATS: SyncStats = SyncStats(UnsafeCell::new(Stats {
     boxes: Cell::new(0),
+    allocated: Cell::new(0),
     pauses: Cell::new(0),
     pause_total_ns: Cell::new(0),
     pause_max_ns: Cell::new(0),
@@ -446,7 +452,7 @@ pub fn print_stats() {
     eprintln!("  live heap at end {:>10.2} MB", mb(LIVE_BYTES.load(Relaxed) as u64));
     eprintln!("  allocations      {:>10}", TOTAL_ALLOCS.load(Relaxed));
     eprintln!("  allocated        {:>10.2} MB", mb(TOTAL_BYTES.load(Relaxed)));
-    eprintln!("  live boxes       {:>10}", s.boxes.get());
+    eprintln!("  objects          {:>10} allocated, {} live at end", s.allocated.get(), s.boxes.get());
     eprintln!("  arena boxes      {:>10} ({:.2} MB, {} scope resets, {} outlived their scope)", s.arena_boxes.get(), mb(s.arena_bytes.get()), s.arena_resets.get(), s.arena_escapes.get());
     eprintln!("  collected        {:>10} boxes", s.collected.get());
     eprintln!(
