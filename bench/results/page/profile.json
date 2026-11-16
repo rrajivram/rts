@@ -1,106 +1,106 @@
 [
  {
   "instruction": "Call",
-  "time_share_pct": 20.27,
+  "time_share_pct": 27.92,
   "count": 167649682,
   "allocs": 9360165,
   "rc_ops_per_op": 0.261
  },
  {
-  "instruction": "Arithmetic",
-  "time_share_pct": 11.34,
-  "count": 341528009,
-  "allocs": 0,
-  "rc_ops_per_op": 0.0
- },
- {
   "instruction": "ReadField",
-  "time_share_pct": 11.09,
+  "time_share_pct": 11.02,
   "count": 258780212,
   "allocs": 0,
   "rc_ops_per_op": 1.47
  },
  {
   "instruction": "JumpIfCompare",
-  "time_share_pct": 10.27,
-  "count": 214230507,
+  "time_share_pct": 7.61,
+  "count": 184852670,
+  "allocs": 0,
+  "rc_ops_per_op": 0.0
+ },
+ {
+  "instruction": "Arithmetic",
+  "time_share_pct": 6.68,
+  "count": 266238586,
   "allocs": 0,
   "rc_ops_per_op": 0.0
  },
  {
   "instruction": "ReadFieldNumber",
-  "time_share_pct": 4.89,
+  "time_share_pct": 4.94,
   "count": 242524872,
   "allocs": 0,
   "rc_ops_per_op": 0.0
  },
  {
   "instruction": "JumpIf",
-  "time_share_pct": 4.21,
-  "count": 202879949,
+  "time_share_pct": 4.22,
+  "count": 194434902,
   "allocs": 0,
   "rc_ops_per_op": 0.0
  },
  {
   "instruction": "ReturnUndefined",
-  "time_share_pct": 4.09,
+  "time_share_pct": 4.05,
   "count": 63009813,
   "allocs": 0,
   "rc_ops_per_op": 1.176
  },
  {
   "instruction": "ReturnValue",
-  "time_share_pct": 3.75,
+  "time_share_pct": 3.81,
   "count": 33869926,
   "allocs": 0,
   "rc_ops_per_op": 2.336
  },
  {
   "instruction": "ReadElement",
-  "time_share_pct": 3.42,
+  "time_share_pct": 3.46,
   "count": 64736090,
   "allocs": 0,
   "rc_ops_per_op": 0.835
  },
  {
-  "instruction": "WriteElement",
-  "time_share_pct": 2.27,
-  "count": 61341869,
-  "allocs": 0,
-  "rc_ops_per_op": 0.509
- },
- {
   "instruction": "CopyValue",
-  "time_share_pct": 2.24,
+  "time_share_pct": 2.28,
   "count": 80310987,
   "allocs": 0,
   "rc_ops_per_op": 1.061
  },
  {
+  "instruction": "WriteElement",
+  "time_share_pct": 2.23,
+  "count": 61341869,
+  "allocs": 0,
+  "rc_ops_per_op": 0.509
+ },
+ {
   "instruction": "ReturnBool",
-  "time_share_pct": 2.13,
-  "count": 35932690,
+  "time_share_pct": 2.11,
+  "count": 35920376,
   "allocs": 0,
   "rc_ops_per_op": 0.936
  },
  {
   "instruction": "AddConstant",
-  "time_share_pct": 2.09,
-  "count": 93792634,
+  "time_share_pct": 2.07,
+  "count": 93323134,
   "allocs": 0,
   "rc_ops_per_op": 0.0
  },
  {
   "instruction": "WriteFieldNumber",
-  "time_share_pct": 2.0,
+  "time_share_pct": 1.91,
   "count": 83763064,
   "allocs": 0,
   "rc_ops_per_op": 0.0
  },
  {
   "instruction": "LoadNumber",
-  "time_share_pct": 1.8,
-  "count": 156964344,
+  "time_share_pct": 1.79,
+  "count": 150640213,
   "allocs": 0,
   "rc_ops_per_op": 0.0
  },
@@ -113,108 +113,108 @@
  },
  {
   "instruction": "CopyBool",
-  "time_share_pct": 1.39,
-  "count": 84210621,
+  "time_share_pct": 1.36,
+  "count": 83848452,
   "allocs": 0,
   "rc_ops_per_op": 0.0
  },
  {
   "instruction": "LoadNull",
-  "time_share_pct": 1.22,
+  "time_share_pct": 1.11,
   "count": 90020997,
   "allocs": 0,
   "rc_ops_per_op": 0.137
  },
  {
   "instruction": "WriteField",
-  "time_share_pct": 1.08,
+  "time_share_pct": 1.09,
   "count": 34275658,
   "allocs": 0,
   "rc_ops_per_op": 0.946
  },
  {
   "instruction": "Jump",
-  "time_share_pct": 0.72,
-  "count": 67333163,
+  "time_share_pct": 0.71,
+  "count": 67051662,
   "allocs": 0,
   "rc_ops_per_op": 0.0
  },
  {
   "instruction": "LoadBool",
   "time_share_pct": 0.68,
-  "count": 56714265,
+  "count": 56352096,
   "allocs": 0,
   "rc_ops_per_op": 0.0
  },
  {
   "instruction": "LoadConstant",
-  "time_share_pct": 0.61,
+  "time_share_pct": 0.62,
   "count": 18751803,
   "allocs": 0,
   "rc_ops_per_op": 1.491
  },
  {
-  "instruction": "ReturnNumber",
-  "time_share_pct": 0.61,
-  "count": 24428179,
-  "allocs": 0,
-  "rc_ops_per_op": 0.123
- },
- {
-  "instruction": "CopyNumber",
-  "time_share_pct": 0.6,
-  "count": 53257237,
-  "allocs": 0,
-  "rc_ops_per_op": 0.0
- },
- {
   "instruction": "UnboxBool",
-  "time_share_pct": 0.55,
+  "time_share_pct": 0.57,
   "count": 38396360,
   "allocs": 0,
   "rc_ops_per_op": 0.0
  },
  {
   "instruction": "WriteElementNumber",
-  "time_share_pct": 0.53,
+  "time_share_pct": 0.52,
   "count": 22329683,
   "allocs": 0,
   "rc_ops_per_op": 0.0
  },
  {
-  "instruction": "Release",
-  "time_share_pct": 0.47,
-  "count": 16686877,
-  "allocs": 0,
-  "rc_ops_per_op": 1.042
- },
- {
-  "instruction": "ReadElementNumber",
-  "time_share_pct": 0.46,
-  "count": 20792599,
-  "allocs": 0,
-  "rc_ops_per_op": 0.0
- },
- {
   "instruction": "BoxBool",
-  "time_share_pct": 0.46,
+  "time_share_pct": 0.48,
   "count": 43557166,
   "allocs": 0,
   "rc_ops_per_op": 0.007
  },
  {
-  "instruction": "ArrayLength",
-  "time_share_pct": 0.36,
-  "count": 21750139,
+  "instruction": "CopyNumber",
+  "time_share_pct": 0.48,
+  "count": 45519753,
   "allocs": 0,
   "rc_ops_per_op": 0.0
  },
  {
+  "instruction": "ReadElementNumber",
+  "time_share_pct": 0.47,
+  "count": 20792599,
+  "allocs": 0,
+  "rc_ops_per_op": 0.0
+ },
+ {
+  "instruction": "Release",
+  "time_share_pct": 0.46,
+  "count": 16686877,
+  "allocs": 0,
+  "rc_ops_per_op": 1.042
+ },
+ {
+  "instruction": "ReturnNumber",
+  "time_share_pct": 0.46,
+  "count": 18104054,
+  "allocs": 0,
+  "rc_ops_per_op": 0.166
+ },
+ {
   "instruction": "NewInstance",
-  "time_share_pct": 0.36,
+  "time_share_pct": 0.37,
   "count": 3669345,
   "allocs": 3669345,
   "rc_ops_per_op": 0.548
+ },
+ {
+  "instruction": "ArrayLength",
+  "time_share_pct": 0.33,
+  "count": 21750139,
+  "allocs": 0,
+  "rc_ops_per_op": 0.0
  },
  {
   "instruction": "ReadCapture",
@@ -224,46 +224,46 @@
   "rc_ops_per_op": 1.034
  },
  {
-  "instruction": "ReadCell",
-  "time_share_pct": 0.25,
-  "count": 10052085,
-  "allocs": 0,
-  "rc_ops_per_op": 0.802
- },
- {
   "instruction": "NewInstanceIn",
-  "time_share_pct": 0.24,
+  "time_share_pct": 0.29,
   "count": 2916544,
   "allocs": 2916544,
   "rc_ops_per_op": 0.122
  },
  {
+  "instruction": "ReadCell",
+  "time_share_pct": 0.28,
+  "count": 10052085,
+  "allocs": 0,
+  "rc_ops_per_op": 0.802
+ },
+ {
   "instruction": "MakeClosure",
-  "time_share_pct": 0.24,
+  "time_share_pct": 0.25,
   "count": 2746065,
   "allocs": 2746065,
   "rc_ops_per_op": 2.002
  },
  {
   "instruction": "Compare",
-  "time_share_pct": 0.21,
+  "time_share_pct": 0.22,
   "count": 12269569,
   "allocs": 0,
   "rc_ops_per_op": 0.0
  },
  {
-  "instruction": "NewCell",
-  "time_share_pct": 0.16,
-  "count": 4986491,
-  "allocs": 4986491,
-  "rc_ops_per_op": 0.053
- },
- {
   "instruction": "MathUnary",
-  "time_share_pct": 0.15,
+  "time_share_pct": 0.21,
   "count": 4743155,
   "allocs": 0,
   "rc_ops_per_op": 0.0
+ },
+ {
+  "instruction": "NewCell",
+  "time_share_pct": 0.15,
+  "count": 4986491,
+  "allocs": 4986491,
+  "rc_ops_per_op": 0.053
  },
  {
   "instruction": "JumpIfTruthy",
@@ -274,7 +274,7 @@
  },
  {
   "instruction": "UnboxNumber",
-  "time_share_pct": 0.12,
+  "time_share_pct": 0.14,
   "count": 10739874,
   "allocs": 0,
   "rc_ops_per_op": 0.0
@@ -287,25 +287,18 @@
   "rc_ops_per_op": 0.688
  },
  {
-  "instruction": "StringLength",
-  "time_share_pct": 0.07,
-  "count": 2642100,
-  "allocs": 0,
-  "rc_ops_per_op": 0.0
- },
- {
-  "instruction": "NumberIsTruthy",
-  "time_share_pct": 0.07,
-  "count": 5173023,
-  "allocs": 0,
-  "rc_ops_per_op": 0.0
- },
- {
   "instruction": "LoadUndefined",
   "time_share_pct": 0.07,
   "count": 5541054,
   "allocs": 0,
   "rc_ops_per_op": 0.062
+ },
+ {
+  "instruction": "StringLength",
+  "time_share_pct": 0.06,
+  "count": 2642100,
+  "allocs": 0,
+  "rc_ops_per_op": 0.0
  },
  {
   "instruction": "ReadGlobal",
@@ -315,6 +308,13 @@
   "rc_ops_per_op": 1.733
  },
  {
+  "instruction": "EnterRegion",
+  "time_share_pct": 0.05,
+  "count": 1690129,
+  "allocs": 0,
+  "rc_ops_per_op": 0.0
+ },
+ {
   "instruction": "Not",
   "time_share_pct": 0.05,
   "count": 2569878,
@@ -322,15 +322,15 @@
   "rc_ops_per_op": 0.0
  },
  {
-  "instruction": "EnterRegion",
-  "time_share_pct": 0.04,
-  "count": 1690129,
+  "instruction": "NumberIsTruthy",
+  "time_share_pct": 0.05,
+  "count": 5173023,
   "allocs": 0,
   "rc_ops_per_op": 0.0
  },
  {
   "instruction": "ExitRegion",
-  "time_share_pct": 0.03,
+  "time_share_pct": 0.04,
   "count": 130560,
   "allocs": 0,
   "rc_ops_per_op": 4.184
@@ -371,20 +371,6 @@
   "rc_ops_per_op": 1.02
  },
  {
-  "instruction": "NewArray",
-  "time_share_pct": 0.0,
-  "count": 867,
-  "allocs": 867,
-  "rc_ops_per_op": 0.303
- },
- {
-  "instruction": "ReadProperty",
-  "time_share_pct": 0.0,
-  "count": 126,
-  "allocs": 0,
-  "rc_ops_per_op": 2.556
- },
- {
   "instruction": "Negate",
   "time_share_pct": 0.0,
   "count": 53978,
@@ -392,10 +378,10 @@
   "rc_ops_per_op": 0.0
  },
  {
-  "instruction": "WriteGlobal",
+  "instruction": "NewArrayIn",
   "time_share_pct": 0.0,
-  "count": 588,
-  "allocs": 0,
+  "count": 1502,
+  "allocs": 1502,
   "rc_ops_per_op": 1.0
  },
  {
@@ -413,24 +399,24 @@
   "rc_ops_per_op": 0.143
  },
  {
-  "instruction": "DynamicCompare",
+  "instruction": "ReadProperty",
   "time_share_pct": 0.0,
-  "count": 42,
+  "count": 126,
   "allocs": 0,
-  "rc_ops_per_op": 0.0
+  "rc_ops_per_op": 2.556
  },
  {
-  "instruction": "MathBinary",
+  "instruction": "NewArray",
   "time_share_pct": 0.0,
-  "count": 1605,
-  "allocs": 0,
-  "rc_ops_per_op": 0.0
+  "count": 867,
+  "allocs": 867,
+  "rc_ops_per_op": 0.303
  },
  {
-  "instruction": "NewArrayIn",
+  "instruction": "WriteGlobal",
   "time_share_pct": 0.0,
-  "count": 1502,
-  "allocs": 1502,
+  "count": 588,
+  "allocs": 0,
   "rc_ops_per_op": 1.0
  },
  {
@@ -439,6 +425,13 @@
   "count": 70,
   "allocs": 0,
   "rc_ops_per_op": 0.8
+ },
+ {
+  "instruction": "DynamicCompare",
+  "time_share_pct": 0.0,
+  "count": 42,
+  "allocs": 0,
+  "rc_ops_per_op": 0.0
  },
  {
   "instruction": "WriteGlobalNumber",
@@ -465,6 +458,13 @@
   "instruction": "DynamicArithmeticToValue",
   "time_share_pct": 0.0,
   "count": 14,
+  "allocs": 0,
+  "rc_ops_per_op": 0.0
+ },
+ {
+  "instruction": "MathBinary",
+  "time_share_pct": 0.0,
+  "count": 1605,
   "allocs": 0,
   "rc_ops_per_op": 0.0
  },

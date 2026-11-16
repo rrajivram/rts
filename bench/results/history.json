@@ -22,5 +22,13 @@
   "rc_geomean_s": 0.5887,
   "gc_geomean_s": 0.5728,
   "jitless_geomean_s": 0.4417
+ },
+ {
+  "commit": "090e3df",
+  "date": "2026-11-16",
+  "step": "Native code stage 1: numeric functions (Cranelift)",
+  "rc_geomean_s": 0.4936,
+  "gc_geomean_s": 0.4855,
+  "jitless_geomean_s": 0.4364
  }
 ]
