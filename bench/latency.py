@@ -6,8 +6,8 @@ import json, os, re, subprocess
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 W = os.path.join(ROOT, "bench/workloads/requests.ts")
-RC = os.path.join(ROOT, "target/release/rts")
-GC = os.path.join(ROOT, "target/gc/release/rts")
+RC = os.environ.get("RTS", os.path.join(ROOT, "target/release/rts"))
+GC = os.environ.get("RTS_GC", os.path.join(ROOT, "target/gc/release/rts"))
 CONFIGS = {
     "RC + arenas": [RC],
     "RC, no arenas": [RC, "--no-arena"],

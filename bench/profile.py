@@ -12,7 +12,7 @@ average share of time across benchmarks (each benchmark weighs the same).
 import json, os, subprocess, sys, tempfile
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-RTS = os.path.join(ROOT, "target/profile/release/rts")
+RTS = os.environ.get("RTS_PROFILE", os.path.join(ROOT, "target/profile/release/rts"))
 AWFY = os.path.join(ROOT, "bench/awfy/ts")
 SIZES = {"Bounce": 1500, "CD": 250, "DeltaBlue": 12000, "Havlak": 1, "Json": 100, "List": 1500,
          "Mandelbrot": 500, "NBody": 250000, "Permute": 1000, "Queens": 1000, "Richards": 20,

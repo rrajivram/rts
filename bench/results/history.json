@@ -14,5 +14,13 @@
   "rc_geomean_s": 0.6628,
   "gc_geomean_s": 0.5966,
   "jitless_geomean_s": 0.4423
+ },
+ {
+  "commit": "9f9d85e",
+  "date": "2026-11-15",
+  "step": "Inline count updates (fixed Value layout)",
+  "rc_geomean_s": 0.5887,
+  "gc_geomean_s": 0.5728,
+  "jitless_geomean_s": 0.4417
  }
 ]

@@ -18,8 +18,8 @@ target/gc/release = `cargo build --release --features gc --target-dir target/gc`
 import os, re, shutil, statistics, subprocess, sys, tempfile
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-RC = os.path.join(ROOT, "target/release/rts")
-GC = os.path.join(ROOT, "target/gc/release/rts")
+RC = os.environ.get("RTS", os.path.join(ROOT, "target/release/rts"))
+GC = os.environ.get("RTS_GC", os.path.join(ROOT, "target/gc/release/rts"))
 BASE = os.environ.get("BASE")  # optional: another rts binary, as config "base"
 N = int(os.environ.get("RUNS", "5"))
 
