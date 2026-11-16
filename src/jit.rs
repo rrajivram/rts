@@ -632,7 +632,7 @@ impl Elig<'_> {
 
     fn func_ok(&self, f: FuncId) -> bool {
         let hf = &self.hir.funcs[f as usize];
-        if std::env::var("RTS_JIT_WHY").is_ok_and(|n| *n == *hf.name) {
+        if why_wanted(&hf.name) && !why_all() {
             let vars: Vec<String> = hf
                 .this_var
                 .iter()
@@ -667,7 +667,8 @@ impl Elig<'_> {
             return false;
         }
         let ok = hf.body.iter().all(|s| self.stmt(f, s));
-        if !ok && std::env::var("RTS_JIT_WHY").is_ok_and(|n| *n == *hf.name) {
+        if !ok && why_wanted(&hf.name) {
+            WHY_FN.with(|w| *w.borrow_mut() = hf.name.to_string());
             self.why(f, &hf.body);
         }
         ok
@@ -688,7 +689,7 @@ impl Elig<'_> {
                 }
                 HStmt::Loop { body, fresh, test, update, .. } => {
                     if !fresh.iter().all(|v| self.local(f, *v)) {
-                        eprintln!("rts jit: not compiled: loop with per-iteration variables {fresh:?}");
+                        why_say(format!("loop with per-iteration variables {fresh:?}"));
                     } else if let Some(t) = test.as_ref().filter(|t| self.expr(f, t).is_none()) {
                         self.why_expr(f, t);
                     } else if let Some(u) = update.as_ref().filter(|u| self.expr(f, u).is_none()) {
@@ -698,7 +699,7 @@ impl Elig<'_> {
                     }
                 }
                 HStmt::Expr(e) | HStmt::Return(Some(e)) | HStmt::Init(_, Some(e)) => self.why_expr(f, e),
-                _ => eprintln!("rts jit: not compiled: {s:?}"),
+                _ => why_say(format!("{s:?}")),
             }
             return;
         }
@@ -711,7 +712,7 @@ impl Elig<'_> {
                 return self.why_expr(f, x);
             }
         }
-        eprintln!("rts jit: not compiled ({:?}): {:?}", e.ty, e.kind);
+        why_say(format!("({:?}): {:?}", e.ty, e.kind));
     }
 
     fn stmt(&self, f: FuncId, s: &HStmt) -> bool {
@@ -859,6 +860,29 @@ fn throw_site(e: &HExpr) -> Option<(u32, Vec<std::rc::Rc<str>>)> {
         })
         .collect::<Option<Vec<_>>>()?;
     Some((*class, strs))
+}
+
+thread_local! {
+    static WHY_FN: RefCell<String> = const { RefCell::new(String::new()) };
+}
+
+/// `RTS_JIT_WHY=*` explains every function; `RTS_JIT_WHY=name` one.
+fn why_all() -> bool {
+    std::env::var("RTS_JIT_WHY").is_ok_and(|n| n == "*")
+}
+
+fn why_wanted(name: &str) -> bool {
+    std::env::var("RTS_JIT_WHY").is_ok_and(|n| n == "*" || n == name)
+}
+
+fn why_say(msg: String) {
+    let f = WHY_FN.with(|w| w.borrow().clone());
+    if why_all() {
+        let m: String = msg.chars().take(110).collect();
+        eprintln!("rts jit why\t{f}\t{m}");
+    } else {
+        eprintln!("rts jit: {f} not compiled: {msg}");
+    }
 }
 
 /// Every path through `ss` ends in a `return`.

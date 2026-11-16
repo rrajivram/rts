@@ -325,20 +325,40 @@ the next experiments (see [Next steps](#next-steps)).
 
 ## Native code (in progress)
 
-Functions whose parameters, locals and result are all numbers or booleans,
-and that use only arithmetic, comparisons, control flow, `Math.*` and calls to
-other such functions, are compiled to machine code at start-up with
-[Cranelift](https://cranelift.dev) (`src/jit.rs`). The interpreter calls them
-directly; `--no-jit` turns this off. Mandelbrot runs 8.5× faster (180 ms → 21 ms,
-against 18 ms for Node's optimizing JIT). Number semantics are the
-interpreter's (`%`, `**`, ToInt32 and `Math` call the same Rust code), and
-recursion depth is shared with the interpreter, so runaway recursion is a
-RangeError, not a crash.
+Functions are compiled to machine code at start-up with
+[Cranelift](https://cranelift.dev) (`src/jit.rs`) when their parameters,
+locals and result are numbers, booleans, class instances or arrays (or
+null/undefined), and their bodies use arithmetic, comparisons, control flow,
+`Math.*`, field and element access, `new`, array literals and `push`,
+`throw new C('…')`, and calls to other compiled functions (methods included,
+when the class hierarchy shows a single target). The interpreter calls
+compiled code directly; `--no-jit` turns it off, and `RTS_JIT_DEBUG=1` /
+`RTS_JIT_WHY=<function>|*` say what compiled and why not.
 
-Next stages: objects, calls and reference counting in compiled code (with a
-count-elision pass, where scope knowledge pays), then the memory-mode
-comparison on compiled code, then generators, async functions and exceptions.
-LLVM is planned as a later, more optimizing tier.
+Typed suite geometric mean: 0.494 s → 0.237 s (`node --jitless`: 0.452 s).
+List runs 8× faster than in the interpreter, Towers 8.6×, Queens 9.9×,
+Permute 9.2×, Bounce 2.3×; Mandelbrot is within 20% of Node's optimizing JIT.
+
+**Reference counts in compiled code** are maintained inline, with elision
+rules: parameters borrow; a borrowed value used at once (a field read's base,
+a comparison) takes no count; returning a local moves it; and in a *pure*
+function (no field writes, only pure callees) nothing reachable from the
+arguments can be freed, so variables that only hold such values, and the
+arguments passed to pure calls, take no counts at all. On List this cuts
+count updates from 26.0M to 1.27M (`--profile` builds report the total and
+the updates per allocated box). Errors unwind to the interpreter and release
+everything compiled code held.
+
+Findings so far: compiled code without counts at all (the tracing-GC build)
+is only 3% faster on the suite; and compiled code doesn't use scope arenas
+yet, which shows: on a list-building loop, arenas cut peak heap 9× (the nodes
+die at scope exit instead of waiting for the cycle collector).
+
+Next: generic values (`T` in `Vector<T>`) and calls from compiled code back
+into the interpreter (closures, `forEach`), then the memory-mode comparison on
+compiled code (arenas in compiled code; stack maps so the tracing GC can
+collect while compiled code runs), then generators, async functions and
+exceptions. LLVM is planned as a later, more optimizing tier.
 
 ## Supported TypeScript and Node
 
