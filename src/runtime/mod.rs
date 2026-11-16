@@ -425,7 +425,12 @@ impl Hash for HKey {
 pub type MapObj = RefCell<IndexMap<HKey, Value, FxBuildHasher>>;
 pub type SetObj = RefCell<IndexSet<HKey, FxBuildHasher>>;
 
-#[derive(Debug, Clone, Default)]
+/// A JavaScript value. `repr(C, u8)` fixes the layout: a one-byte tag, then
+/// the payload at offset 8. Every `Gc` variant's payload is a pointer to its
+/// box header, so cloning and dropping a value is one tag test and an inline
+/// count update, without matching on the variant (see `Clone` and `Drop`).
+#[derive(Debug, Default)]
+#[repr(C, u8)]
 pub enum Value {
     #[default]
     Undef,
@@ -459,6 +464,69 @@ pub enum Value {
 }
 
 const _: () = assert!(std::mem::size_of::<Value>() == 16);
+
+/// Tags of the variants that are not a `Gc` pointer.
+const TAG_FIRST_GC: u8 = 4; // BigInt; Undef, Null, Bool and Num come before it
+const TAG_CLASS: u8 = 10;
+const TAG_NATIVE: u8 = 13;
+
+impl Value {
+    #[inline(always)]
+    fn tag(&self) -> u8 {
+        // SAFETY: `repr(C, u8)` puts the tag in the first byte.
+        unsafe { *(self as *const Value as *const u8) }
+    }
+
+    /// The box header of a `Gc` variant.
+    #[inline(always)]
+    fn gc_header(&self) -> Option<std::ptr::NonNull<heap::Header>> {
+        let t = self.tag();
+        if t >= TAG_FIRST_GC && t != TAG_CLASS && t != TAG_NATIVE {
+            // SAFETY: `repr(C, u8)` puts every payload at offset 8, and a
+            // `Gc` is a pointer to its box, whose header comes first.
+            Some(unsafe { *((self as *const Value as *const u8).add(8) as *const std::ptr::NonNull<heap::Header>) })
+        } else {
+            None
+        }
+    }
+}
+
+impl Clone for Value {
+    #[inline(always)]
+    fn clone(&self) -> Value {
+        if let Some(h) = self.gc_header() {
+            heap::inc_header(h);
+        } else if let Value::Class(c) = self {
+            return Value::Class(c.clone());
+        }
+        // SAFETY: the count (if any) was just taken for the copy.
+        unsafe { std::ptr::read(self) }
+    }
+}
+
+impl Drop for Value {
+    #[inline(always)]
+    fn drop(&mut self) {
+        if let Some(h) = self.gc_header() {
+            heap::dec_header(h);
+            // The reference is released: leave nothing for the field drops.
+            unsafe { std::ptr::write(self, Value::Undef) };
+        }
+    }
+}
+
+/// Checks the layout `gc_header` relies on (run by the test suite and at start-up in debug builds).
+pub fn check_value_layout() {
+    let o = Object::blank(Shape::new(vec![]), None);
+    let p = Gc::as_ptr(&o) as usize;
+    let v = Value::Obj(o.clone());
+    let h = v.gc_header().expect("Obj is a Gc variant").as_ptr() as usize;
+    assert!(p > h && p - h <= 32, "Value payload layout");
+    assert!(matches!(Value::Undef.tag(), 0) && Value::Num(1.0).gc_header().is_none());
+    assert_eq!(Value::Class(Rc::new(ClassRt { id: 0, name: "".into(), parent: None, shape: Shape::new(vec![]), vtable: vec![], methods: Default::default(), ctor: 0, acyclic: false })).tag(), TAG_CLASS);
+    assert_eq!(Value::Native(Native::ConsoleLog).tag(), TAG_NATIVE);
+    assert!(Value::BigInt(Gc::new(1)).gc_header().is_some());
+}
 
 impl Value {
     /// Whether this value can point back into the heap (anything but
@@ -930,8 +998,8 @@ impl Insp<'_> {
                     Some(c) => c.name.to_string(),
                     None if o.inner.borrow().shape.null_proto => "[Object: null prototype]".to_string(),
                     None => match o.get_inherited("constructor") {
-                        Some(Value::Func(f)) => (self.funcs)(f.func).to_string(),
-                        Some(Value::Class(c)) => c.name.to_string(),
+                        Some(Value::Func(ref f)) => (self.funcs)(f.func).to_string(),
+                        Some(Value::Class(ref c)) => c.name.to_string(),
                         _ => String::new(),
                     },
                 };
@@ -1076,4 +1144,12 @@ pub struct PropCache {
     /// Method-call sites: (receiver shape, receiver class) → function index,
     /// for a name that resolves to a class method rather than an own field.
     pub method: RefCell<Option<(Rc<Shape>, Rc<ClassRt>, u32)>>,
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn value_layout() {
+        super::check_value_layout();
+    }
 }

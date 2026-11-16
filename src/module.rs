@@ -305,7 +305,7 @@ fn resolve_dir(p: &Path) -> Option<PathBuf> {
     }
     if let Some(pkg) = read_package(p) {
         for field in ["module", "main"] {
-            if let Some(Value::Str(m)) = pkg_field(&pkg, field) {
+            if let Some(Value::Str(ref m)) = pkg_field(&pkg, field) {
                 let target = p.join(&*m.s);
                 if let Some(f) = resolve_file(&target).or_else(|| resolve_dir_index(&target)) {
                     return Some(f);

@@ -863,7 +863,7 @@ pub fn call_native(vm: &mut Vm, n: Native, this: Value, args: Vec<Value>) -> NRe
             })
         }
         ObjProtoIsPrototypeOf => Value::Bool(match (&this, arg(&args, 0)) {
-            (Value::Obj(p), Value::Obj(o)) => {
+            (Value::Obj(p), Value::Obj(ref o)) => {
                 let mut q = o.proto();
                 let mut found = false;
                 while let Some(x) = q {
@@ -937,13 +937,13 @@ pub fn call_native(vm: &mut Vm, n: Native, this: Value, args: Vec<Value>) -> NRe
         BooleanFn => Value::Bool(arg(&args, 0).truthy()),
         BigIntFn => {
             let r = match arg(&args, 0) {
-                Value::BigInt(n) => Ok(*n),
+                Value::BigInt(ref n) => Ok(**n),
                 Value::Num(x) if x.fract() != 0.0 || !x.is_finite() => {
                     return Err(vm.range_error(format!("The number {} cannot be converted to a BigInt because it is not an integer", num_to_string(x))));
                 }
                 Value::Num(x) => bigint::from_number(x),
                 Value::Bool(b) => Ok(b as i128),
-                Value::Str(s) => match bigint::parse(&s.s) {
+                Value::Str(ref s) => match bigint::parse(&s.s) {
                     Some(n) => Ok(n),
                     None => return Err(vm.syntax_error(format!("Cannot convert {} to a BigInt", s.s))),
                 },
@@ -1307,7 +1307,7 @@ pub fn call_native(vm: &mut Vm, n: Native, this: Value, args: Vec<Value>) -> NRe
             let mut vals = a.to_vec();
             for x in args {
                 match x {
-                    Value::Arr(b) => vals.extend(b.to_vec()),
+                    Value::Arr(ref b) => vals.extend(b.to_vec()),
                     x => vals.push(x),
                 }
             }
@@ -1406,7 +1406,7 @@ pub fn call_native(vm: &mut Vm, n: Native, this: Value, args: Vec<Value>) -> NRe
                 match n {
                     ArrMap => out.push(r),
                     ArrFlatMap => match r {
-                        Value::Arr(b) => {
+                        Value::Arr(ref b) => {
                             for y in b.to_vec() {
                                 out.push(y)
                             }
@@ -1524,7 +1524,7 @@ pub fn call_native(vm: &mut Vm, n: Native, this: Value, args: Vec<Value>) -> NRe
             fn flat(v: Vec<Value>, d: f64, out: &mut Vec<Value>) {
                 for x in v {
                     match x {
-                        Value::Arr(b) if d >= 1.0 => flat(b.to_vec(), d - 1.0, out),
+                        Value::Arr(ref b) if d >= 1.0 => flat(b.to_vec(), d - 1.0, out),
                         x => out.push(x),
                     }
                 }
@@ -1606,7 +1606,7 @@ pub fn call_native(vm: &mut Vm, n: Native, this: Value, args: Vec<Value>) -> NRe
         ObjFromEntries => {
             let o = Object::new(Shape::new(vec![]), vec![], None);
             for e in iterate(vm, &arg(&args, 0))? {
-                if let Value::Arr(p) = e {
+                if let Value::Arr(ref p) = e {
                     o.set(&p.get(0).to_js_string().s.clone().into(), p.get(1));
                 }
             }
@@ -1662,7 +1662,7 @@ pub fn call_native(vm: &mut Vm, n: Native, this: Value, args: Vec<Value>) -> NRe
             let m = Gc::new(RefCell::new(m));
             if let Some(init) = args.first().filter(|v| !v.is_nullish()) {
                 for e in iterate(vm, init)? {
-                    if let Value::Arr(p) = e {
+                    if let Value::Arr(ref p) = e {
                         m.borrow_mut().insert(HKey(p.get(0)), p.get(1));
                     }
                 }
@@ -1751,8 +1751,8 @@ pub fn call_native(vm: &mut Vm, n: Native, this: Value, args: Vec<Value>) -> NRe
         PerfNow => Value::Num(vm.start.elapsed().as_secs_f64() * 1000.0),
         RegexNew => {
             let (src, flags) = match (arg(&args, 0), arg(&args, 1)) {
-                (Value::Regex(r), Value::Undef) => (r.source.to_string(), r.flags.to_string()),
-                (Value::Regex(r), f) => (r.source.to_string(), f.to_js_string().s.to_string()),
+                (Value::Regex(ref r), Value::Undef) => (r.source.to_string(), r.flags.to_string()),
+                (Value::Regex(ref r), f) => (r.source.to_string(), f.to_js_string().s.to_string()),
                 (s, Value::Undef) => (if matches!(s, Value::Undef) { String::new() } else { s.to_js_string().s.to_string() }, String::new()),
                 (s, f) => (s.to_js_string().s.to_string(), f.to_js_string().s.to_string()),
             };
@@ -1776,7 +1776,7 @@ pub fn call_native(vm: &mut Vm, n: Native, this: Value, args: Vec<Value>) -> NRe
         StrMatch => {
             let s = this_str(&this);
             let re = match arg(&args, 0) {
-                Value::Regex(r) => r,
+                Value::Regex(ref r) => r.clone(),
                 v => Gc::new(regexp::RegExp::new(&v.to_js_string().s, "").map_err(|m| vm.syntax_error(m))?),
             };
             if re.global {
@@ -1799,8 +1799,8 @@ pub fn call_native(vm: &mut Vm, n: Native, this: Value, args: Vec<Value>) -> NRe
         StrMatchAll => {
             let s = this_str(&this);
             let re = match arg(&args, 0) {
-                Value::Regex(r) if !r.global => return te(vm, "String.prototype.matchAll called with a non-global RegExp argument".into()),
-                Value::Regex(r) => r,
+                Value::Regex(ref r) if !r.global => return te(vm, "String.prototype.matchAll called with a non-global RegExp argument".into()),
+                Value::Regex(ref r) => r.clone(),
                 v => Gc::new(regexp::RegExp::new(&v.to_js_string().s, "g").map_err(|m| vm.syntax_error(m))?),
             };
             let mut out = Vec::new();
@@ -1818,7 +1818,7 @@ pub fn call_native(vm: &mut Vm, n: Native, this: Value, args: Vec<Value>) -> NRe
         StrSearch => {
             let s = this_str(&this);
             let re = match arg(&args, 0) {
-                Value::Regex(r) => r,
+                Value::Regex(ref r) => r.clone(),
                 v => Gc::new(regexp::RegExp::new(&v.to_js_string().s, "").map_err(|m| vm.syntax_error(m))?),
             };
             match re.match_at(&s.s, 0) {
@@ -1855,10 +1855,10 @@ pub fn call_native(vm: &mut Vm, n: Native, this: Value, args: Vec<Value>) -> NRe
         }
         ObjDefineAccessor => {
             // (object, name, getter, setter): merge with an existing accessor.
-            let Value::Obj(o) = arg(&args, 0) else { unreachable!() };
+            let Value::Obj(ref o) = arg(&args, 0) else { unreachable!() };
             let name: Rc<str> = (&*arg(&args, 1).to_js_string().s).into();
             let (mut get, mut set) = (arg(&args, 2), arg(&args, 3));
-            if let Some(Value::Accessor(a)) = o.get(&name) {
+            if let Some(Value::Accessor(ref a)) = o.get(&name) {
                 if matches!(get, Value::Undef) {
                     get = a.get.clone();
                 }

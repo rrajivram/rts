@@ -75,7 +75,7 @@ pub fn call(vm: &mut Vm, n: Native, _this: Value, args: Vec<Value>) -> Result<Va
         Hrtime => {
             // [seconds, nanoseconds], relative to `prev` when given.
             let mut t = vm.start.elapsed().as_nanos() as i128 + 1_000_000_000;
-            if let Value::Arr(a) = arg(&args, 0) {
+            if let Value::Arr(ref a) = arg(&args, 0) {
                 let get = |i| a.get(i).to_number();
                 t -= get(0) as i128 * 1_000_000_000 + get(1) as i128;
             }
@@ -631,13 +631,13 @@ pub fn call_console_object(vm: &mut Vm, n: Native, args: Vec<Value>) -> Result<V
         }
         ObjCreate => match arg(&args, 0) {
             Value::Null => Value::Obj(Object::new(Shape::new_null_proto(vec![]), vec![], None)),
-            Value::Obj(p) => Value::Obj(Object::new(Shape::with_proto(p), vec![], None)),
+            Value::Obj(ref p) => Value::Obj(Object::new(Shape::with_proto(p.clone()), vec![], None)),
             _ => Value::Obj(Object::new(Shape::new(vec![]), vec![], None)),
         },
         ObjGetPrototypeOf => match arg(&args, 0) {
-            Value::Obj(o) if o.inner.borrow().shape.null_proto => Value::Null,
-            Value::Obj(o) if o.proto().is_some() => Value::Obj(o.proto().unwrap()),
-            Value::Obj(o) if o.class.is_some() => Value::Class(o.class.clone().unwrap()),
+            Value::Obj(ref o) if o.inner.borrow().shape.null_proto => Value::Null,
+            Value::Obj(ref o) if o.proto().is_some() => Value::Obj(o.proto().unwrap()),
+            Value::Obj(ref o) if o.class.is_some() => Value::Class(o.class.clone().unwrap()),
             _ => Value::Obj(Object::new(Shape::new(vec![]), vec![], None)),
         },
         ObjSetPrototypeOf => {
@@ -645,7 +645,7 @@ pub fn call_console_object(vm: &mut Vm, n: Native, args: Vec<Value>) -> Result<V
             if let Value::Obj(ob) = &o {
                 let mut inner = ob.inner.borrow_mut();
                 inner.shape = match arg(&args, 1) {
-                    Value::Obj(p) => inner.shape.reproto(Some(p), false),
+                    Value::Obj(ref p) => inner.shape.reproto(Some(p.clone()), false),
                     Value::Null => inner.shape.reproto(None, true),
                     _ => inner.shape.reproto(None, false),
                 };
@@ -656,8 +656,8 @@ pub fn call_console_object(vm: &mut Vm, n: Native, args: Vec<Value>) -> Result<V
         ObjHasOwn => {
             let k = arg(&args, 1).to_js_string();
             Value::Bool(match arg(&args, 0) {
-                Value::Obj(o) => o.get(&k.s).is_some(),
-                Value::Arr(a) => k.s.parse::<usize>().is_ok_and(|i| i < a.len()),
+                Value::Obj(ref o) => o.get(&k.s).is_some(),
+                Value::Arr(ref a) => k.s.parse::<usize>().is_ok_and(|i| i < a.len()),
                 _ => false,
             })
         }
@@ -669,7 +669,7 @@ pub fn call_console_object(vm: &mut Vm, n: Native, args: Vec<Value>) -> Result<V
                 let k = vm.call(&f, Value::Undef, vec![x.clone(), Value::Num(i as f64)])?;
                 let key: Rc<str> = (&*k.to_js_string().s).into();
                 match out.get(&key) {
-                    Some(Value::Arr(a)) => a.push(x),
+                    Some(Value::Arr(ref a)) => a.push(x),
                     _ => out.set(&key, Value::Arr(make_array(vec![x]))),
                 }
             }

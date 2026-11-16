@@ -264,6 +264,18 @@ impl<T: Trace + fmt::Debug + 'static> fmt::Debug for Gc<T> {
     }
 }
 
+/// Take a reference to a box, given its header (used by `Value::clone`).
+#[inline(always)]
+pub fn inc_header(h: NonNull<Header>) {
+    inc(unsafe { h.as_ref() });
+}
+
+/// Release a reference to a box, given its header (used by `Value`'s drop).
+#[inline(always)]
+pub fn dec_header(h: NonNull<Header>) {
+    dec(h);
+}
+
 #[cfg(not(feature = "gc"))]
 #[inline(always)]
 fn inc(h: &Header) {

@@ -586,8 +586,8 @@ impl Vm {
 
     /// PromiseResolve(%Promise%, v): `v` itself if it is a promise.
     pub fn promise_of(&mut self, v: Value) -> Gc<Promise> {
-        if let Value::Promise(p) = v {
-            return p;
+        if let Value::Promise(ref p) = v {
+            return p.clone();
         }
         let p = Promise::new();
         self.resolve_promise(&p, v);
@@ -1250,9 +1250,9 @@ pub const PROTOTYPE_KEY: &str = "\u{1}prototype";
 /// pointing back at the function.
 pub fn func_prototype(f: &Gc<Closure>) -> Gc<Object> {
     if let Some(p) = &*f.props.borrow()
-        && let Some(Value::Obj(o)) = p.get(PROTOTYPE_KEY)
+        && let Some(Value::Obj(ref o)) = p.get(PROTOTYPE_KEY)
     {
-        return o;
+        return o.clone();
     }
     let proto = Object::new(Shape::prototype_of(Value::Func(f.clone())), vec![], None);
     let mut props = f.props.borrow_mut();

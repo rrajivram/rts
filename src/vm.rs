@@ -88,6 +88,16 @@ enum Ret {
 #[derive(Debug, Clone, Copy)]
 struct FnRef(*const FunctionCode);
 
+impl Vm {
+    /// A function's code. The program outlives every frame and is never
+    /// changed, so the reference is not tied to a borrow of the VM (no `Rc`
+    /// count traffic per call).
+    #[inline(always)]
+    fn code<'a>(&self, f: u32) -> &'a FunctionCode {
+        unsafe { &*Rc::as_ptr(&self.prog.funcs[f as usize]) }
+    }
+}
+
 impl FnRef {
     fn new(f: &Rc<FunctionCode>) -> FnRef {
         FnRef(Rc::as_ptr(f))
@@ -785,9 +795,9 @@ impl Vm {
             ci.this.map(|r| std::mem::ManuallyDrop::new(unsafe { std::ptr::read(&self.values[vb + r.index()]) }));
         let this_counted = |t: &Option<std::mem::ManuallyDrop<Value>>| t.as_deref().cloned().unwrap_or(Value::Undef);
         let (func, closure) = match &ci.target {
-            CallTarget::Direct(fi) => (self.prog.funcs[*fi as usize].clone(), None),
+            CallTarget::Direct(fi) => (self.code(*fi), None),
             CallTarget::Value(r) => match &self.values[vb + r.index()] {
-                Value::Func(c) => (self.prog.funcs[c.func as usize].clone(), Some(c.clone())),
+                Value::Func(c) => (self.code(c.func), Some(c.clone())),
                 Value::Native(n) => {
                     let n = *n;
                     return self.call_native_ci(n, ci, this_counted(&this), sb, vb);
@@ -814,7 +824,7 @@ impl Vm {
             CallTarget::Method { slot, .. } => match this.as_deref() {
                 Some(Value::Obj(o)) if o.class.is_some() => {
                     let fi = o.class.as_ref().unwrap().vtable[*slot as usize];
-                    (self.prog.funcs[fi as usize].clone(), None)
+                    (self.code(fi), None)
                 }
                 Some(v) => {
                     let d = describe(v);
@@ -853,11 +863,11 @@ impl Vm {
                         None => None,
                     };
                     if let Some(fi) = fi {
-                        break 'prop (self.prog.funcs[fi as usize].clone(), None);
+                        break 'prop (self.code(fi), None);
                     }
                 }
                 match self.lookup_method(&recv, &site.name)? {
-                    Value::Func(c) => (self.prog.funcs[c.func as usize].clone(), Some(c)),
+                    Value::Func(ref c) => (self.code(c.func), Some(c.clone())),
                     Value::Native(n) => return self.call_native_ci(n, ci, recv, sb, vb),
                     f @ Value::Bound(_) => {
                         let args = self.collect_args(ci, sb, vb)?;
@@ -882,7 +892,7 @@ impl Vm {
         }
         let nsb = sb + caller.scalar_slots;
         let nvb = vb + caller.value_slots;
-        self.ensure(nsb, nvb, &func)?;
+        self.ensure(nsb, nvb, func)?;
         let borrowed = func.borrowed;
         match this {
             // Borrowed: the callee's copy is not counted.
@@ -891,8 +901,8 @@ impl Vm {
         }
         if ci.has_spread || (func.rest && !ci.packed_rest) {
             let args = self.collect_args(ci, sb, vb)?;
-            self.bind_values(&func, nsb, nvb, args)?;
-            self.lend_bound(&func, nvb, 1);
+            self.bind_values(func, nsb, nvb, args)?;
+            self.lend_bound(func, nvb, 1);
         } else {
             // Fast path: copy arguments slot to slot, converting kinds only on mismatch.
             let (mut si, mut vi) = (0usize, 1usize);
@@ -938,7 +948,7 @@ impl Vm {
             self.give_result_region(up);
         }
         self.frames.push(Frame {
-            func: FnRef::new(&func),
+            func: FnRef(func as *const FunctionCode),
             pc: 0,
             scalar_base: nsb,
             value_base: nvb,
@@ -1087,7 +1097,7 @@ impl Vm {
                 Ok(())
             }
             Value::Obj(o) if matches!(o.get(&site.name), Some(Value::Accessor(_))) => {
-                let Some(Value::Accessor(a)) = o.get(&site.name) else { unreachable!() };
+                let Some(Value::Accessor(ref a)) = o.get(&site.name) else { unreachable!() };
                 if matches!(a.set, Value::Undef) {
                     return Err(self.type_error(format!("Cannot set property {} of {} which has only a getter", site.name, self.inspect(recv))));
                 }
@@ -1150,7 +1160,7 @@ impl Vm {
     #[inline(never)]
     fn read_accessor(&mut self, x: Value, recv: &Value) -> Result<Value, Value> {
         match x {
-            Value::Accessor(a) => match &a.get {
+            Value::Accessor(ref a) => match &a.get {
                 Value::Undef => Ok(Value::Undef),
                 g => self.call(&g.clone(), recv.clone(), vec![]),
             },
@@ -1844,10 +1854,10 @@ impl Vm {
                             Value::Obj(ob) => {
                                 let key = value!(k).to_js_string();
                                 match ob.get(&key.s) {
-                                    Some(Value::Accessor(a)) => {
+                                    Some(Value::Accessor(ref a)) => {
                                         let recv = value!(o).clone();
                                         self.frames[fi].pc = pc;
-                                        let r = self.read_accessor(Value::Accessor(a), &recv);
+                                        let r = self.read_accessor(Value::Accessor(a.clone()), &recv);
                                                                                 tri!(r)
                                     }
                                     Some(x) => x,
@@ -2019,10 +2029,10 @@ impl Vm {
                             _ => None,
                         };
                         let x = match fast {
-                            Some(Value::Accessor(a)) => {
+                            Some(Value::Accessor(ref a)) => {
                                 let recv = value!(object).clone();
                                 self.frames[fi].pc = pc;
-                                let r = self.read_accessor(Value::Accessor(a), &recv);
+                                let r = self.read_accessor(Value::Accessor(a.clone()), &recv);
                                                                 tri!(r)
                             }
                             Some(x) => x,
