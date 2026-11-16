@@ -18,3 +18,5 @@ lto = "thin"
 [features]
 # Tracing garbage collection instead of reference counting (for comparison).
 gc = []
+# Per-instruction counts, self time and allocations (`rts --profile`).
+profile = []

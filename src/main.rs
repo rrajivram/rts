@@ -15,6 +15,7 @@ fn main() -> ExitCode {
     let mut erase = false;
     let mut mem_stats = false;
     let mut no_arena = false;
+    let mut profile = false;
     let mut path = None;
     let mut script_args = Vec::new();
     for a in std::env::args().skip(1) {
@@ -29,6 +30,7 @@ fn main() -> ExitCode {
             "--no-cycles" => rts::runtime::cycles::disable(),
             "--mem-stats" => mem_stats = true,
             "--no-arena" => no_arena = true,
+            "--profile" => profile = true,
             _ => path = Some(a),
         }
     }
@@ -40,7 +42,7 @@ fn main() -> ExitCode {
         rts::runtime::gc::set_min_heap(n);
     }
     let Some(path) = path else {
-        eprintln!("usage: rts [--dump] [--no-types] [--no-cycles] [--no-arena] [--mem-stats] <file.ts>");
+        eprintln!("usage: rts [--dump] [--no-types] [--no-cycles] [--no-arena] [--mem-stats] [--profile] <file.ts>");
         return ExitCode::from(2);
     };
     let src = match std::fs::read_to_string(&path) {
@@ -65,6 +67,17 @@ fn main() -> ExitCode {
     if no_arena {
         vm.arenas = false;
     }
+    if profile {
+        #[cfg(feature = "profile")]
+        {
+            vm.profile = Some(rts::profile::Profile::start());
+        }
+        #[cfg(not(feature = "profile"))]
+        {
+            eprintln!("rts: --profile needs a build with `--features profile`");
+            return ExitCode::from(2);
+        }
+    }
     let abs = std::fs::canonicalize(&path).map(|p| p.to_string_lossy().into_owned()).unwrap_or(path.clone());
     vm.args = std::iter::once(abs).chain(script_args).collect();
     let code = match vm.run_main() {
@@ -78,6 +91,10 @@ fn main() -> ExitCode {
             ExitCode::from(1)
         }
     };
+    #[cfg(feature = "profile")]
+    if let Some(p) = vm.profile.as_mut() {
+        p.report();
+    }
     if mem_stats {
         rts::runtime::heap::print_stats();
     }

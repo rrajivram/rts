@@ -144,6 +144,12 @@ pub struct Vm {
     pub console_timers: rustc_hash::FxHashMap<String, f64>,
     /// Native calls into the VM in progress: the tracing GC waits for them.
     gc_block: u32,
+    /// Counted references behind borrowed slots of frames bound from values
+    /// (see `lend_bound`): (frame index, value), released when it pops.
+    lent: Vec<(u32, Value)>,
+    /// Per-instruction profile (`--profile`).
+    #[cfg(feature = "profile")]
+    pub profile: Option<Box<crate::profile::Profile>>,
     /// Active scope regions, innermost last (see `escape.rs`).
     pub(crate) regions: Vec<task::RegionRec>,
     /// Arenas of exited regions, for reuse.
@@ -315,6 +321,9 @@ impl Vm {
             process: None,
             co_frames: Vec::new(),
             gc_block: 0,
+            lent: Vec::new(),
+            #[cfg(feature = "profile")]
+            profile: None,
             host_roots: Vec::new(),
             regions: Vec::new(),
             arena_pool: Vec::new(),
@@ -517,6 +526,7 @@ impl Vm {
         } else {
             self.bind_slice(&func, sb, vb, args)?;
         }
+        self.lend_bound(&func, vb, 0);
         let depth = self.frames.len();
         self.frames.push(Frame {
             func: FnRef::new(&func),
@@ -529,6 +539,59 @@ impl Vm {
         self.safepoint();
         self.run(depth)?;
         Ok(std::mem::take(&mut self.native_ret))
+    }
+
+    /// Release a popped frame's slots: deterministic destruction. Borrowed
+    /// slots were never counted, so they are cleared without a decrement.
+    #[inline(always)]
+    fn release_frame(&mut self, fr: &Frame) {
+        let f = fr.func.get();
+        let slots = &mut self.values[fr.value_base..fr.value_base + f.value_slots];
+        let mut borrowed = f.borrowed;
+        if borrowed == 0 {
+            for x in slots {
+                x.release();
+            }
+            return;
+        }
+        for (i, x) in slots.iter_mut().enumerate() {
+            if borrowed & 1 != 0 {
+                unsafe { std::ptr::write(x, Value::Undef) };
+            } else {
+                x.release();
+            }
+            borrowed >>= 1;
+            if i >= 63 {
+                borrowed = 0;
+            }
+        }
+        if let Some(&(f, _)) = self.lent.last()
+            && f as usize >= self.frames.len()
+        {
+            self.lent.retain(|(f, _)| (*f as usize) < self.frames.len());
+        }
+    }
+
+    /// A frame was bound with counted values (a spread or rest call, or a
+    /// call from native code): turn its borrowed slots into uncounted copies
+    /// and keep the counted references in `lent` until the frame is popped.
+    fn lend_bound(&mut self, func: &FunctionCode, vb: usize, from: usize) {
+        let mut b = func.borrowed >> from;
+        let mut i = from;
+        let frame = self.frames.len() as u32;
+        while b != 0 && i < 64 && i < func.value_slots {
+            if b & 1 != 0 {
+                let v = std::mem::take(&mut self.values[vb + i]);
+                if !matches!(v, Value::Undef | Value::Null | Value::Bool(_) | Value::Num(_) | Value::Native(_)) {
+                    unsafe { std::ptr::write(&mut self.values[vb + i], std::ptr::read(&v)) };
+                    self.lent.push((frame, v));
+                } else {
+                    self.values[vb + i] = v;
+                }
+            }
+            b >>= 1;
+            i += 1;
+        }
     }
 
     /// Check that a frame for `func` at these bases fits in the slot stacks.
@@ -716,14 +779,18 @@ impl Vm {
 
     /// Perform a call. Returns Ok(true) if a JS frame was pushed.
     fn do_call(&mut self, caller: &FunctionCode, ci: &CallSite, sb: usize, vb: usize) -> Result<bool, Value> {
-        let this = ci.this.map(|r| self.values[vb + r.index()].clone());
+        // `this` is read without counting: the caller's slot keeps it alive
+        // for the whole call. Paths that hand it on clone it (counted).
+        let this: Option<std::mem::ManuallyDrop<Value>> =
+            ci.this.map(|r| std::mem::ManuallyDrop::new(unsafe { std::ptr::read(&self.values[vb + r.index()]) }));
+        let this_counted = |t: &Option<std::mem::ManuallyDrop<Value>>| t.as_deref().cloned().unwrap_or(Value::Undef);
         let (func, closure) = match &ci.target {
             CallTarget::Direct(fi) => (self.prog.funcs[*fi as usize].clone(), None),
             CallTarget::Value(r) => match &self.values[vb + r.index()] {
                 Value::Func(c) => (self.prog.funcs[c.func as usize].clone(), Some(c.clone())),
                 Value::Native(n) => {
                     let n = *n;
-                    return self.call_native_ci(n, ci, this.unwrap_or(Value::Undef), sb, vb);
+                    return self.call_native_ci(n, ci, this_counted(&this), sb, vb);
                 }
                 Value::Bound(b) => {
                     let b = b.clone();
@@ -744,7 +811,7 @@ impl Vm {
                     return Err(self.type_error(format!("{d} is not a function")));
                 }
             },
-            CallTarget::Method { slot, .. } => match this.as_ref() {
+            CallTarget::Method { slot, .. } => match this.as_deref() {
                 Some(Value::Obj(o)) if o.class.is_some() => {
                     let fi = o.class.as_ref().unwrap().vtable[*slot as usize];
                     (self.prog.funcs[fi as usize].clone(), None)
@@ -757,7 +824,7 @@ impl Vm {
             },
             CallTarget::Property(p) => 'prop: {
                 let site = &caller.property_sites[*p as usize];
-                let recv = this.clone().unwrap_or(Value::Undef);
+                let recv = this_counted(&this);
                 // Method inline cache: same shape and class as last time → same method.
                 if let Value::Obj(o) = &recv
                     && let Some(cls) = &o.class
@@ -807,7 +874,7 @@ impl Vm {
                 }
             }
             CallTarget::Native(n) => {
-                return self.call_native_ci(*n, ci, this.unwrap_or(Value::Undef), sb, vb);
+                return self.call_native_ci(*n, ci, this_counted(&this), sb, vb);
             }
         };
         if self.frames.len() >= MAX_DEPTH {
@@ -816,10 +883,16 @@ impl Vm {
         let nsb = sb + caller.scalar_slots;
         let nvb = vb + caller.value_slots;
         self.ensure(nsb, nvb, &func)?;
-        self.values[nvb] = this.unwrap_or(Value::Undef);
+        let borrowed = func.borrowed;
+        match this {
+            // Borrowed: the callee's copy is not counted.
+            Some(t) if borrowed & 1 != 0 => unsafe { std::ptr::write(&mut self.values[nvb], std::mem::ManuallyDrop::into_inner(t)) },
+            t => self.values[nvb] = this_counted(&t),
+        }
         if ci.has_spread || (func.rest && !ci.packed_rest) {
             let args = self.collect_args(ci, sb, vb)?;
             self.bind_values(&func, nsb, nvb, args)?;
+            self.lend_bound(&func, nvb, 1);
         } else {
             // Fast path: copy arguments slot to slot, converting kinds only on mismatch.
             let (mut si, mut vi) = (0usize, 1usize);
@@ -828,6 +901,11 @@ impl Vm {
                     Some(&(ak, ar)) => {
                         if ak == *pk {
                             match ak {
+                                Kind::Val if borrowed & (1 << vi) != 0 && vi < 64 => unsafe {
+                                    // Borrowed: a bitwise copy, not counted.
+                                    let v = std::ptr::read(&self.values[vb + ar as usize]);
+                                    std::ptr::write(&mut self.values[nvb + vi], v);
+                                },
                                 Kind::Val => {
                                     self.values[nvb + vi] = self.values[vb + ar as usize].clone();
                                 }
@@ -1085,9 +1163,7 @@ impl Vm {
     fn do_return(&mut self, val: Value, stop: usize) -> Result<bool, Value> {
         let fr = self.frames.pop().unwrap();
         // Release the frame's references now: deterministic destruction.
-        for x in &mut self.values[fr.value_base..fr.value_base + fr.func.get().value_slots] {
-            x.release();
-        }
+        self.release_frame(&fr);
         self.pop_regions(self.frames.len());
         let val = match self.pop_co(self.frames.len()) {
             Some(co) => self.complete_coroutine(&co, Ok(val)),
@@ -1106,9 +1182,7 @@ impl Vm {
             && !self.is_co(self.frames.len() - 1)
         {
             let fr = self.frames.pop().unwrap();
-            for x in &mut self.values[fr.value_base..fr.value_base + fr.func.get().value_slots] {
-                x.release();
-            }
+            self.release_frame(&fr);
             self.pop_regions(self.frames.len());
             let top = self.frames.last().unwrap();
             self.scalars[top.scalar_base + d as usize] = bits;
@@ -1129,9 +1203,7 @@ impl Vm {
             && !self.is_co(self.frames.len() - 1)
         {
             let fr = self.frames.pop().unwrap();
-            for x in &mut self.values[fr.value_base..fr.value_base + fr.func.get().value_slots] {
-                x.release();
-            }
+            self.release_frame(&fr);
             self.pop_regions(self.frames.len());
             let top = self.frames.last().unwrap();
             write_big(&mut self.scalars, top.scalar_base + d as usize, n);
@@ -1174,9 +1246,7 @@ impl Vm {
                 return Ok(false);
             }
             let fr = self.frames.pop().unwrap();
-            for x in &mut self.values[fr.value_base..fr.value_base + fr.func.get().value_slots] {
-                x.release();
-            }
+            self.release_frame(&fr);
             self.pop_regions(self.frames.len());
             let co = self.pop_co(self.frames.len());
             if let Some(co) = &co
@@ -1257,6 +1327,10 @@ impl Vm {
                 // Every function ends in a return, so pc never runs off the end.
                 let ins = unsafe { *code.get_unchecked(pc) };
                 pc += 1;
+                #[cfg(feature = "profile")]
+                if let Some(p) = &mut self.profile {
+                    p.tick(ins.kind());
+                }
                 match ins {
                     Instruction::LoadNumber { output, value } => scalar!(output) = bits(value),
                     Instruction::LoadBool { output, value } => scalar!(output) = value as u64,
@@ -1600,7 +1674,12 @@ impl Vm {
                         continue 'outer;
                     }
                     Instruction::ReturnValue { value } => {
-                        let x = std::mem::take(&mut value!(value));
+                        // A borrowed slot's value is not ours to move: count a copy.
+                        let x = if value.index() < 64 && func.borrowed & (1 << value.index()) != 0 {
+                            value!(value).clone()
+                        } else {
+                            std::mem::take(&mut value!(value))
+                        };
                         if tri!(self.do_return(x, stop)) {
                             return Ok(());
                         }

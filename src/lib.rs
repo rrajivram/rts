@@ -15,6 +15,8 @@ pub mod lexer;
 pub mod module;
 pub mod node;
 pub mod parser;
+#[cfg(feature = "profile")]
+pub mod profile;
 pub mod runtime;
 pub mod types;
 pub mod vm;

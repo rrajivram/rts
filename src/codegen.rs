@@ -207,6 +207,25 @@ impl<'a> Codegen<'a> {
             g.note_slot(p.arrival, r, Some(hir.vars[p.var as usize].name.clone()));
             arrivals.push(r);
         }
+        // Borrowed slots: `this` and every value parameter whose arrival slot
+        // is never written again (no default, not rest, and either captured,
+        // so it moves to a cell, or never assigned). Coroutines keep their
+        // frames past the call, so they borrow nothing.
+        let mut borrowed: u64 = 0;
+        if !hf.is_async && !hf.is_generator {
+            borrowed |= 1;
+            for (p, &r) in hf.params.iter().zip(&arrivals) {
+                let info = &hir.vars[p.var as usize];
+                if p.arrival == Kind::Val
+                    && p.default.is_none()
+                    && !p.rest
+                    && r < 64
+                    && (info.captured || !g.cg.escape.assigned.contains(&p.var))
+                {
+                    borrowed |= 1 << r;
+                }
+            }
+        }
         // Constant slots: every distinct numeric literal used in a loop is loaded once.
         let mut nums = Vec::new();
         for p in &hf.params {
@@ -266,6 +285,7 @@ impl<'a> Codegen<'a> {
         let name = hf.name.clone();
         FunctionCode {
             id: fid,
+            borrowed,
             is_async: hf.is_async,
             name,
             code: g.code,

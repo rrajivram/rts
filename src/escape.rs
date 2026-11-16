@@ -48,6 +48,9 @@ pub struct EscapeInfo {
     pub result: FxHashSet<usize>,
     /// Allocation sites seen, and how many are scope-bound (for `--dump`).
     pub total: usize,
+    /// Variables assigned anywhere after their declaration (codegen lends
+    /// parameters that never are: see `FunctionCode::borrowed`).
+    pub assigned: FxHashSet<VarId>,
 }
 
 /// What a callee does with one of its parameters (index 0 is `this`).
@@ -159,6 +162,7 @@ struct Fa<'a> {
     var_block: FxHashMap<VarId, usize>,
     loop_header: u32,
     changed: bool,
+    assigned: FxHashSet<VarId>,
 }
 
 const PARAM_BASE: Node = 1 << 30;
@@ -189,6 +193,7 @@ impl<'a> Fa<'a> {
             var_block: FxHashMap::default(),
             loop_header: 0,
             changed: false,
+            assigned: FxHashSet::default(),
         };
         if let Some(t) = hf.this_var {
             fa.pts.insert(t, vec![PARAM_BASE]);
@@ -636,7 +641,10 @@ impl<'a> Fa<'a> {
 
     fn write_place(&mut self, p: &Place, v: &AV) {
         match p {
-            Place::Var(var) => self.add_pts(*var, v),
+            Place::Var(var) => {
+                self.assigned.insert(*var);
+                self.add_pts(*var, v)
+            }
             Place::Field { obj, .. } | Place::Prop { obj, .. } => {
                 let o = self.expr(obj);
                 self.store_into(&o, v);
@@ -904,6 +912,7 @@ impl<'a> Fa<'a> {
 
     /// Final decisions: each scope-bound site and its region block.
     fn decide(&self, out: &mut EscapeInfo) {
+        out.assigned.extend(self.assigned.iter().copied());
         let esc = self.escaped();
         let n = self.site_key.len();
         out.total += n;

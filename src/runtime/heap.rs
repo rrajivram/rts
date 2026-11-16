@@ -267,6 +267,8 @@ impl<T: Trace + fmt::Debug + 'static> fmt::Debug for Gc<T> {
 #[cfg(not(feature = "gc"))]
 #[inline(always)]
 fn inc(h: &Header) {
+    #[cfg(feature = "profile")]
+    STATS.rc_ops.set(STATS.rc_ops.get() + 1);
     h.rc.set(h.rc.get() + 1);
 }
 
@@ -277,6 +279,8 @@ fn inc(_: &Header) {}
 #[cfg(not(feature = "gc"))]
 #[inline(always)]
 fn dec(p: NonNull<Header>) {
+    #[cfg(feature = "profile")]
+    STATS.rc_ops.set(STATS.rc_ops.get() + 1);
     let h = unsafe { p.as_ref() };
     let c = h.rc.get() - 1;
     h.rc.set(c);
@@ -338,6 +342,8 @@ pub struct Stats {
     pub boxes: Cell<i64>,
     /// Boxes allocated, in total (heap and arenas).
     pub allocated: Cell<u64>,
+    /// Reference-count increments and decrements (counted in profile builds only).
+    pub rc_ops: Cell<u64>,
     /// Collector pauses: count, total and longest, in nanoseconds.
     pub pauses: Cell<u64>,
     pub pause_total_ns: Cell<u64>,
@@ -366,6 +372,7 @@ impl Deref for SyncStats {
 pub static STATS: SyncStats = SyncStats(UnsafeCell::new(Stats {
     boxes: Cell::new(0),
     allocated: Cell::new(0),
+    rc_ops: Cell::new(0),
     pauses: Cell::new(0),
     pause_total_ns: Cell::new(0),
     pause_max_ns: Cell::new(0),
