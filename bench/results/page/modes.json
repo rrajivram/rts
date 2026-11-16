@@ -1,0 +1,842 @@
+[
+ {
+  "benchmark": "Bounce",
+  "config": "RC + arenas",
+  "time_s": 0.6049,
+  "rss_mb": 15.0,
+  "peak_heap_mb": 0.07,
+  "max_pause_ms": 0.0,
+  "objects": 153432,
+  "arena_objects": 3000
+ },
+ {
+  "benchmark": "Bounce",
+  "config": "RC, no arenas",
+  "time_s": 0.6007,
+  "rss_mb": 14.8,
+  "peak_heap_mb": 0.16,
+  "max_pause_ms": 0.0,
+  "objects": 153432,
+  "arena_objects": 0
+ },
+ {
+  "benchmark": "Bounce",
+  "config": "RC, no cycle collector",
+  "time_s": 0.6023,
+  "rss_mb": 14.9,
+  "peak_heap_mb": 0.07,
+  "max_pause_ms": 0.0,
+  "objects": 153432,
+  "arena_objects": 3000
+ },
+ {
+  "benchmark": "Bounce",
+  "config": "tracing GC",
+  "time_s": 0.5548,
+  "rss_mb": 22.6,
+  "peak_heap_mb": 7.53,
+  "max_pause_ms": 1.065,
+  "objects": 153432,
+  "arena_objects": 0
+ },
+ {
+  "benchmark": "Bounce",
+  "config": "node (JIT)",
+  "time_s": 0.021,
+  "rss_mb": 54.7,
+  "peak_heap_mb": null,
+  "max_pause_ms": null,
+  "objects": null,
+  "arena_objects": null
+ },
+ {
+  "benchmark": "Bounce",
+  "config": "node --jitless",
+  "time_s": 0.5477,
+  "rss_mb": 51.6,
+  "peak_heap_mb": null,
+  "max_pause_ms": null,
+  "objects": null,
+  "arena_objects": null
+ },
+ {
+  "benchmark": "CD",
+  "config": "RC + arenas",
+  "time_s": 1.2552,
+  "rss_mb": 17.2,
+  "peak_heap_mb": 2.6,
+  "max_pause_ms": 1.037,
+  "objects": 3234456,
+  "arena_objects": 1265543
+ },
+ {
+  "benchmark": "CD",
+  "config": "RC, no arenas",
+  "time_s": 1.26,
+  "rss_mb": 16.9,
+  "peak_heap_mb": 2.17,
+  "max_pause_ms": 0.829,
+  "objects": 3234456,
+  "arena_objects": 0
+ },
+ {
+  "benchmark": "CD",
+  "config": "RC, no cycle collector",
+  "time_s": 1.1986,
+  "rss_mb": 129.7,
+  "peak_heap_mb": 113.73,
+  "max_pause_ms": 0.0,
+  "objects": 3234456,
+  "arena_objects": 1265543
+ },
+ {
+  "benchmark": "CD",
+  "config": "tracing GC",
+  "time_s": 1.0999,
+  "rss_mb": 23.3,
+  "peak_heap_mb": 7.53,
+  "max_pause_ms": 1.181,
+  "objects": 3234456,
+  "arena_objects": 0
+ },
+ {
+  "benchmark": "CD",
+  "config": "node (JIT)",
+  "time_s": 0.048,
+  "rss_mb": 68.8,
+  "peak_heap_mb": null,
+  "max_pause_ms": null,
+  "objects": null,
+  "arena_objects": null
+ },
+ {
+  "benchmark": "CD",
+  "config": "node --jitless",
+  "time_s": 0.7823,
+  "rss_mb": 60.1,
+  "peak_heap_mb": null,
+  "max_pause_ms": null,
+  "objects": null,
+  "arena_objects": null
+ },
+ {
+  "benchmark": "DeltaBlue",
+  "config": "RC + arenas",
+  "time_s": 0.3604,
+  "rss_mb": 44.9,
+  "peak_heap_mb": 22.38,
+  "max_pause_ms": 5.772,
+  "objects": 1081066,
+  "arena_objects": 1
+ },
+ {
+  "benchmark": "DeltaBlue",
+  "config": "RC, no arenas",
+  "time_s": 0.3605,
+  "rss_mb": 43.5,
+  "peak_heap_mb": 22.34,
+  "max_pause_ms": 5.209,
+  "objects": 1081066,
+  "arena_objects": 0
+ },
+ {
+  "benchmark": "DeltaBlue",
+  "config": "RC, no cycle collector",
+  "time_s": 0.3448,
+  "rss_mb": 36.0,
+  "peak_heap_mb": 21.04,
+  "max_pause_ms": 0.0,
+  "objects": 1081066,
+  "arena_objects": 1
+ },
+ {
+  "benchmark": "DeltaBlue",
+  "config": "tracing GC",
+  "time_s": 0.3238,
+  "rss_mb": 50.1,
+  "peak_heap_mb": 33.42,
+  "max_pause_ms": 3.18,
+  "objects": 1081066,
+  "arena_objects": 0
+ },
+ {
+  "benchmark": "DeltaBlue",
+  "config": "node (JIT)",
+  "time_s": 0.0372,
+  "rss_mb": 81.4,
+  "peak_heap_mb": null,
+  "max_pause_ms": null,
+  "objects": null,
+  "arena_objects": null
+ },
+ {
+  "benchmark": "DeltaBlue",
+  "config": "node --jitless",
+  "time_s": 0.1862,
+  "rss_mb": 78.7,
+  "peak_heap_mb": null,
+  "max_pause_ms": null,
+  "objects": null,
+  "arena_objects": null
+ },
+ {
+  "benchmark": "Havlak",
+  "config": "RC + arenas",
+  "time_s": 1.8215,
+  "rss_mb": 70.0,
+  "peak_heap_mb": 37.38,
+  "max_pause_ms": 13.901,
+  "objects": 10068269,
+  "arena_objects": 0
+ },
+ {
+  "benchmark": "Havlak",
+  "config": "RC, no arenas",
+  "time_s": 1.8222,
+  "rss_mb": 70.0,
+  "peak_heap_mb": 37.38,
+  "max_pause_ms": 12.694,
+  "objects": 10068269,
+  "arena_objects": 0
+ },
+ {
+  "benchmark": "Havlak",
+  "config": "RC, no cycle collector",
+  "time_s": 1.6964,
+  "rss_mb": 118.5,
+  "peak_heap_mb": 100.09,
+  "max_pause_ms": 0.0,
+  "objects": 10068269,
+  "arena_objects": 0
+ },
+ {
+  "benchmark": "Havlak",
+  "config": "tracing GC",
+  "time_s": 1.6133,
+  "rss_mb": 51.9,
+  "peak_heap_mb": 32.06,
+  "max_pause_ms": 4.605,
+  "objects": 10068269,
+  "arena_objects": 0
+ },
+ {
+  "benchmark": "Havlak",
+  "config": "node (JIT)",
+  "time_s": 0.091,
+  "rss_mb": 131.3,
+  "peak_heap_mb": null,
+  "max_pause_ms": null,
+  "objects": null,
+  "arena_objects": null
+ },
+ {
+  "benchmark": "Havlak",
+  "config": "node --jitless",
+  "time_s": 0.9391,
+  "rss_mb": 129.5,
+  "peak_heap_mb": null,
+  "max_pause_ms": null,
+  "objects": null,
+  "arena_objects": null
+ },
+ {
+  "benchmark": "Json",
+  "config": "RC + arenas",
+  "time_s": 0.7465,
+  "rss_mb": 17.0,
+  "peak_heap_mb": 1.96,
+  "max_pause_ms": 0.057,
+  "objects": 3331032,
+  "arena_objects": 0
+ },
+ {
+  "benchmark": "Json",
+  "config": "RC, no arenas",
+  "time_s": 0.7421,
+  "rss_mb": 17.0,
+  "peak_heap_mb": 1.96,
+  "max_pause_ms": 0.069,
+  "objects": 3331032,
+  "arena_objects": 0
+ },
+ {
+  "benchmark": "Json",
+  "config": "RC, no cycle collector",
+  "time_s": 0.7388,
+  "rss_mb": 16.4,
+  "peak_heap_mb": 1.55,
+  "max_pause_ms": 0.0,
+  "objects": 3331032,
+  "arena_objects": 0
+ },
+ {
+  "benchmark": "Json",
+  "config": "tracing GC",
+  "time_s": 0.7005,
+  "rss_mb": 24.8,
+  "peak_heap_mb": 8.03,
+  "max_pause_ms": 1.772,
+  "objects": 3331032,
+  "arena_objects": 0
+ },
+ {
+  "benchmark": "Json",
+  "config": "node (JIT)",
+  "time_s": 0.029,
+  "rss_mb": 59.9,
+  "peak_heap_mb": null,
+  "max_pause_ms": null,
+  "objects": null,
+  "arena_objects": null
+ },
+ {
+  "benchmark": "Json",
+  "config": "node --jitless",
+  "time_s": 0.3541,
+  "rss_mb": 51.8,
+  "peak_heap_mb": null,
+  "max_pause_ms": null,
+  "objects": null,
+  "arena_objects": null
+ },
+ {
+  "benchmark": "List",
+  "config": "RC + arenas",
+  "time_s": 0.7747,
+  "rss_mb": 14.8,
+  "peak_heap_mb": 0.06,
+  "max_pause_ms": 0.0,
+  "objects": 46932,
+  "arena_objects": 46500
+ },
+ {
+  "benchmark": "List",
+  "config": "RC, no arenas",
+  "time_s": 0.7832,
+  "rss_mb": 16.1,
+  "peak_heap_mb": 1.32,
+  "max_pause_ms": 0.085,
+  "objects": 46932,
+  "arena_objects": 0
+ },
+ {
+  "benchmark": "List",
+  "config": "RC, no cycle collector",
+  "time_s": 0.7757,
+  "rss_mb": 14.8,
+  "peak_heap_mb": 0.06,
+  "max_pause_ms": 0.0,
+  "objects": 46932,
+  "arena_objects": 46500
+ },
+ {
+  "benchmark": "List",
+  "config": "tracing GC",
+  "time_s": 0.665,
+  "rss_mb": 20.5,
+  "peak_heap_mb": 5.35,
+  "max_pause_ms": 0.0,
+  "objects": 46932,
+  "arena_objects": 0
+ },
+ {
+  "benchmark": "List",
+  "config": "node (JIT)",
+  "time_s": 0.0236,
+  "rss_mb": 53.3,
+  "peak_heap_mb": null,
+  "max_pause_ms": null,
+  "objects": null,
+  "arena_objects": null
+ },
+ {
+  "benchmark": "List",
+  "config": "node --jitless",
+  "time_s": 0.34,
+  "rss_mb": 47.6,
+  "peak_heap_mb": null,
+  "max_pause_ms": null,
+  "objects": null,
+  "arena_objects": null
+ },
+ {
+  "benchmark": "Mandelbrot",
+  "config": "RC + arenas",
+  "time_s": 0.1777,
+  "rss_mb": 15.0,
+  "peak_heap_mb": 0.03,
+  "max_pause_ms": 0.0,
+  "objects": 432,
+  "arena_objects": 0
+ },
+ {
+  "benchmark": "Mandelbrot",
+  "config": "RC, no arenas",
+  "time_s": 0.1777,
+  "rss_mb": 14.9,
+  "peak_heap_mb": 0.03,
+  "max_pause_ms": 0.0,
+  "objects": 432,
+  "arena_objects": 0
+ },
+ {
+  "benchmark": "Mandelbrot",
+  "config": "RC, no cycle collector",
+  "time_s": 0.177,
+  "rss_mb": 14.8,
+  "peak_heap_mb": 0.02,
+  "max_pause_ms": 0.0,
+  "objects": 432,
+  "arena_objects": 0
+ },
+ {
+  "benchmark": "Mandelbrot",
+  "config": "tracing GC",
+  "time_s": 0.1771,
+  "rss_mb": 14.9,
+  "peak_heap_mb": 0.03,
+  "max_pause_ms": 0.0,
+  "objects": 432,
+  "arena_objects": 0
+ },
+ {
+  "benchmark": "Mandelbrot",
+  "config": "node (JIT)",
+  "time_s": 0.0183,
+  "rss_mb": 51.8,
+  "peak_heap_mb": null,
+  "max_pause_ms": null,
+  "objects": null,
+  "arena_objects": null
+ },
+ {
+  "benchmark": "Mandelbrot",
+  "config": "node --jitless",
+  "time_s": 0.2751,
+  "rss_mb": 47.7,
+  "peak_heap_mb": null,
+  "max_pause_ms": null,
+  "objects": null,
+  "arena_objects": null
+ },
+ {
+  "benchmark": "NBody",
+  "config": "RC + arenas",
+  "time_s": 0.3736,
+  "rss_mb": 14.9,
+  "peak_heap_mb": 0.03,
+  "max_pause_ms": 0.0,
+  "objects": 250442,
+  "arena_objects": 0
+ },
+ {
+  "benchmark": "NBody",
+  "config": "RC, no arenas",
+  "time_s": 0.3715,
+  "rss_mb": 15.0,
+  "peak_heap_mb": 0.03,
+  "max_pause_ms": 0.0,
+  "objects": 250442,
+  "arena_objects": 0
+ },
+ {
+  "benchmark": "NBody",
+  "config": "RC, no cycle collector",
+  "time_s": 0.3771,
+  "rss_mb": 14.8,
+  "peak_heap_mb": 0.03,
+  "max_pause_ms": 0.0,
+  "objects": 250442,
+  "arena_objects": 0
+ },
+ {
+  "benchmark": "NBody",
+  "config": "tracing GC",
+  "time_s": 0.3294,
+  "rss_mb": 22.5,
+  "peak_heap_mb": 9.03,
+  "max_pause_ms": 1.287,
+  "objects": 250442,
+  "arena_objects": 0
+ },
+ {
+  "benchmark": "NBody",
+  "config": "node (JIT)",
+  "time_s": 0.0728,
+  "rss_mb": 56.3,
+  "peak_heap_mb": null,
+  "max_pause_ms": null,
+  "objects": null,
+  "arena_objects": null
+ },
+ {
+  "benchmark": "NBody",
+  "config": "node --jitless",
+  "time_s": 0.5693,
+  "rss_mb": 47.5,
+  "peak_heap_mb": null,
+  "max_pause_ms": null,
+  "objects": null,
+  "arena_objects": null
+ },
+ {
+  "benchmark": "Permute",
+  "config": "RC + arenas",
+  "time_s": 0.7876,
+  "rss_mb": 14.8,
+  "peak_heap_mb": 0.11,
+  "max_pause_ms": 0.0,
+  "objects": 1433,
+  "arena_objects": 0
+ },
+ {
+  "benchmark": "Permute",
+  "config": "RC, no arenas",
+  "time_s": 0.786,
+  "rss_mb": 14.9,
+  "peak_heap_mb": 0.11,
+  "max_pause_ms": 0.0,
+  "objects": 1433,
+  "arena_objects": 0
+ },
+ {
+  "benchmark": "Permute",
+  "config": "RC, no cycle collector",
+  "time_s": 0.7936,
+  "rss_mb": 14.9,
+  "peak_heap_mb": 0.03,
+  "max_pause_ms": 0.0,
+  "objects": 1433,
+  "arena_objects": 0
+ },
+ {
+  "benchmark": "Permute",
+  "config": "tracing GC",
+  "time_s": 0.7095,
+  "rss_mb": 15.0,
+  "peak_heap_mb": 0.15,
+  "max_pause_ms": 0.0,
+  "objects": 1433,
+  "arena_objects": 0
+ },
+ {
+  "benchmark": "Permute",
+  "config": "node (JIT)",
+  "time_s": 0.029,
+  "rss_mb": 51.5,
+  "peak_heap_mb": null,
+  "max_pause_ms": null,
+  "objects": null,
+  "arena_objects": null
+ },
+ {
+  "benchmark": "Permute",
+  "config": "node --jitless",
+  "time_s": 0.6488,
+  "rss_mb": 45.7,
+  "peak_heap_mb": null,
+  "max_pause_ms": null,
+  "objects": null,
+  "arena_objects": null
+ },
+ {
+  "benchmark": "Queens",
+  "config": "RC + arenas",
+  "time_s": 0.724,
+  "rss_mb": 15.5,
+  "peak_heap_mb": 0.91,
+  "max_pause_ms": 0.075,
+  "objects": 40436,
+  "arena_objects": 0
+ },
+ {
+  "benchmark": "Queens",
+  "config": "RC, no arenas",
+  "time_s": 0.7211,
+  "rss_mb": 15.6,
+  "peak_heap_mb": 0.91,
+  "max_pause_ms": 0.077,
+  "objects": 40436,
+  "arena_objects": 0
+ },
+ {
+  "benchmark": "Queens",
+  "config": "RC, no cycle collector",
+  "time_s": 0.7246,
+  "rss_mb": 15.0,
+  "peak_heap_mb": 0.03,
+  "max_pause_ms": 0.0,
+  "objects": 40436,
+  "arena_objects": 0
+ },
+ {
+  "benchmark": "Queens",
+  "config": "tracing GC",
+  "time_s": 0.6464,
+  "rss_mb": 21.8,
+  "peak_heap_mb": 7.28,
+  "max_pause_ms": 0.618,
+  "objects": 40436,
+  "arena_objects": 0
+ },
+ {
+  "benchmark": "Queens",
+  "config": "node (JIT)",
+  "time_s": 0.0202,
+  "rss_mb": 53.9,
+  "peak_heap_mb": null,
+  "max_pause_ms": null,
+  "objects": null,
+  "arena_objects": null
+ },
+ {
+  "benchmark": "Queens",
+  "config": "node --jitless",
+  "time_s": 0.4183,
+  "rss_mb": 47.5,
+  "peak_heap_mb": null,
+  "max_pause_ms": null,
+  "objects": null,
+  "arena_objects": null
+ },
+ {
+  "benchmark": "Richards",
+  "config": "RC + arenas",
+  "time_s": 0.6595,
+  "rss_mb": 15.2,
+  "peak_heap_mb": 0.14,
+  "max_pause_ms": 0.0,
+  "objects": 1392,
+  "arena_objects": 0
+ },
+ {
+  "benchmark": "Richards",
+  "config": "RC, no arenas",
+  "time_s": 0.6568,
+  "rss_mb": 15.3,
+  "peak_heap_mb": 0.14,
+  "max_pause_ms": 0.0,
+  "objects": 1392,
+  "arena_objects": 0
+ },
+ {
+  "benchmark": "Richards",
+  "config": "RC, no cycle collector",
+  "time_s": 0.6702,
+  "rss_mb": 14.8,
+  "peak_heap_mb": 0.13,
+  "max_pause_ms": 0.0,
+  "objects": 1392,
+  "arena_objects": 0
+ },
+ {
+  "benchmark": "Richards",
+  "config": "tracing GC",
+  "time_s": 0.5751,
+  "rss_mb": 15.0,
+  "peak_heap_mb": 0.15,
+  "max_pause_ms": 0.0,
+  "objects": 1392,
+  "arena_objects": 0
+ },
+ {
+  "benchmark": "Richards",
+  "config": "node (JIT)",
+  "time_s": 0.0131,
+  "rss_mb": 53.7,
+  "peak_heap_mb": null,
+  "max_pause_ms": null,
+  "objects": null,
+  "arena_objects": null
+ },
+ {
+  "benchmark": "Richards",
+  "config": "node --jitless",
+  "time_s": 0.2774,
+  "rss_mb": 47.7,
+  "peak_heap_mb": null,
+  "max_pause_ms": null,
+  "objects": null,
+  "arena_objects": null
+ },
+ {
+  "benchmark": "Sieve",
+  "config": "RC + arenas",
+  "time_s": 0.6621,
+  "rss_mb": 15.2,
+  "peak_heap_mb": 0.34,
+  "max_pause_ms": 0.0,
+  "objects": 3432,
+  "arena_objects": 0
+ },
+ {
+  "benchmark": "Sieve",
+  "config": "RC, no arenas",
+  "time_s": 0.6586,
+  "rss_mb": 14.9,
+  "peak_heap_mb": 0.34,
+  "max_pause_ms": 0.0,
+  "objects": 3432,
+  "arena_objects": 0
+ },
+ {
+  "benchmark": "Sieve",
+  "config": "RC, no cycle collector",
+  "time_s": 0.6583,
+  "rss_mb": 14.8,
+  "peak_heap_mb": 0.1,
+  "max_pause_ms": 0.0,
+  "objects": 3432,
+  "arena_objects": 0
+ },
+ {
+  "benchmark": "Sieve",
+  "config": "tracing GC",
+  "time_s": 0.5651,
+  "rss_mb": 22.2,
+  "peak_heap_mb": 7.06,
+  "max_pause_ms": 0.161,
+  "objects": 3432,
+  "arena_objects": 0
+ },
+ {
+  "benchmark": "Sieve",
+  "config": "node (JIT)",
+  "time_s": 0.0377,
+  "rss_mb": 56.3,
+  "peak_heap_mb": null,
+  "max_pause_ms": null,
+  "objects": null,
+  "arena_objects": null
+ },
+ {
+  "benchmark": "Sieve",
+  "config": "node --jitless",
+  "time_s": 0.5342,
+  "rss_mb": 47.4,
+  "peak_heap_mb": null,
+  "max_pause_ms": null,
+  "objects": null,
+  "arena_objects": null
+ },
+ {
+  "benchmark": "Storage",
+  "config": "RC + arenas",
+  "time_s": 0.8041,
+  "rss_mb": 16.3,
+  "peak_heap_mb": 1.32,
+  "max_pause_ms": 0.052,
+  "objects": 5462432,
+  "arena_objects": 1000
+ },
+ {
+  "benchmark": "Storage",
+  "config": "RC, no arenas",
+  "time_s": 0.8005,
+  "rss_mb": 15.8,
+  "peak_heap_mb": 1.29,
+  "max_pause_ms": 0.058,
+  "objects": 5462432,
+  "arena_objects": 0
+ },
+ {
+  "benchmark": "Storage",
+  "config": "RC, no cycle collector",
+  "time_s": 0.7967,
+  "rss_mb": 15.5,
+  "peak_heap_mb": 0.86,
+  "max_pause_ms": 0.0,
+  "objects": 5462432,
+  "arena_objects": 1000
+ },
+ {
+  "benchmark": "Storage",
+  "config": "tracing GC",
+  "time_s": 0.7604,
+  "rss_mb": 22.1,
+  "peak_heap_mb": 7.53,
+  "max_pause_ms": 1.051,
+  "objects": 5462432,
+  "arena_objects": 0
+ },
+ {
+  "benchmark": "Storage",
+  "config": "node (JIT)",
+  "time_s": 0.0358,
+  "rss_mb": 65.5,
+  "peak_heap_mb": null,
+  "max_pause_ms": null,
+  "objects": null,
+  "arena_objects": null
+ },
+ {
+  "benchmark": "Storage",
+  "config": "node --jitless",
+  "time_s": 0.3477,
+  "rss_mb": 59.9,
+  "peak_heap_mb": null,
+  "max_pause_ms": null,
+  "objects": null,
+  "arena_objects": null
+ },
+ {
+  "benchmark": "Towers",
+  "config": "RC + arenas",
+  "time_s": 0.8237,
+  "rss_mb": 15.8,
+  "peak_heap_mb": 1.09,
+  "max_pause_ms": 0.0,
+  "objects": 9433,
+  "arena_objects": 0
+ },
+ {
+  "benchmark": "Towers",
+  "config": "RC, no arenas",
+  "time_s": 0.8179,
+  "rss_mb": 15.7,
+  "peak_heap_mb": 1.09,
+  "max_pause_ms": 0.0,
+  "objects": 9433,
+  "arena_objects": 0
+ },
+ {
+  "benchmark": "Towers",
+  "config": "RC, no cycle collector",
+  "time_s": 0.8395,
+  "rss_mb": 14.9,
+  "peak_heap_mb": 0.03,
+  "max_pause_ms": 0.0,
+  "objects": 9433,
+  "arena_objects": 0
+ },
+ {
+  "benchmark": "Towers",
+  "config": "tracing GC",
+  "time_s": 0.737,
+  "rss_mb": 15.9,
+  "peak_heap_mb": 1.07,
+  "max_pause_ms": 0.0,
+  "objects": 9433,
+  "arena_objects": 0
+ },
+ {
+  "benchmark": "Towers",
+  "config": "node (JIT)",
+  "time_s": 0.0255,
+  "rss_mb": 51.5,
+  "peak_heap_mb": null,
+  "max_pause_ms": null,
+  "objects": null,
+  "arena_objects": null
+ },
+ {
+  "benchmark": "Towers",
+  "config": "node --jitless",
+  "time_s": 0.5559,
+  "rss_mb": 45.9,
+  "peak_heap_mb": null,
+  "max_pause_ms": null,
+  "objects": null,
+  "arena_objects": null
+ }
+]

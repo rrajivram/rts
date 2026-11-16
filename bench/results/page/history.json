@@ -1,0 +1,18 @@
+[
+ {
+  "commit": "2ca28d5",
+  "date": "2026-11-15",
+  "step": "Baseline: scope arenas, result regions, cycle collector",
+  "rc_geomean_s": 0.6947,
+  "gc_geomean_s": 0.5869,
+  "jitless_geomean_s": 0.4407
+ },
+ {
+  "commit": "20fc3fc",
+  "date": "2026-11-15",
+  "step": "Borrowed this and parameters (no count updates for call arguments)",
+  "rc_geomean_s": 0.6628,
+  "gc_geomean_s": 0.5966,
+  "jitless_geomean_s": 0.4423
+ }
+]

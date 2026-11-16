@@ -3,430 +3,430 @@
  "suite": [
   {
    "instruction": "Call",
-   "share": 0.23664910512549217,
+   "share": 0.19915569730199076,
    "count": 167649682,
    "allocs": 9360123,
-   "rc": 264840334
+   "rc": 41197110
   },
   {
    "instruction": "Arithmetic",
-   "share": 0.11337636048333204,
+   "share": 0.11482229373910473,
    "count": 341528009,
    "allocs": 0,
    "rc": 0
   },
   {
    "instruction": "ReadField",
-   "share": 0.09369819982551292,
+   "share": 0.10429239620403424,
    "count": 258780212,
    "allocs": 0,
    "rc": 380349214
   },
   {
    "instruction": "JumpIfCompare",
-   "share": 0.09239392638879841,
+   "share": 0.09567822994342422,
    "count": 214230507,
    "allocs": 0,
    "rc": 0
   },
   {
    "instruction": "ReadFieldNumber",
-   "share": 0.048461653576906,
+   "share": 0.049911223160898285,
    "count": 242524872,
    "allocs": 0,
    "rc": 0
   },
   {
    "instruction": "ReturnUndefined",
-   "share": 0.04443771400050203,
+   "share": 0.04383621782796464,
    "count": 63009813,
    "allocs": 0,
-   "rc": 157316849
-  },
-  {
-   "instruction": "ReturnValue",
-   "share": 0.03908486309501573,
-   "count": 33869926,
-   "allocs": 0,
-   "rc": 140302199
+   "rc": 74129988
   },
   {
    "instruction": "JumpIf",
-   "share": 0.038300909224133,
+   "share": 0.041789072262494495,
    "count": 202879949,
    "allocs": 0,
    "rc": 0
   },
   {
    "instruction": "ReadElement",
-   "share": 0.03684704274132587,
+   "share": 0.040103518075026545,
    "count": 64736090,
    "allocs": 0,
    "rc": 54057510
   },
   {
-   "instruction": "ReturnBool",
-   "share": 0.0219389208888862,
-   "count": 35932690,
+   "instruction": "ReturnValue",
+   "share": 0.03896413318474851,
+   "count": 33869926,
    "allocs": 0,
-   "rc": 83336369
+   "rc": 79119842
   },
   {
    "instruction": "WriteElement",
-   "share": 0.02155636349020427,
+   "share": 0.022371779735075807,
    "count": 61341869,
    "allocs": 0,
    "rc": 31227997
   },
   {
+   "instruction": "ReturnBool",
+   "share": 0.021976932473484836,
+   "count": 35932690,
+   "allocs": 0,
+   "rc": 33634358
+  },
+  {
    "instruction": "CopyValue",
-   "share": 0.01944386743738316,
+   "share": 0.021697033574212272,
    "count": 80310987,
    "allocs": 0,
    "rc": 85186065
   },
   {
    "instruction": "WriteFieldNumber",
-   "share": 0.01939423119942573,
+   "share": 0.021261615996759912,
    "count": 83763064,
    "allocs": 0,
    "rc": 0
   },
   {
+   "instruction": "LoadNumber",
+   "share": 0.01853320144206334,
+   "count": 156964344,
+   "allocs": 0,
+   "rc": 0
+  },
+  {
    "instruction": "StrictEquals",
-   "share": 0.0171131583396272,
+   "share": 0.017993446388118076,
    "count": 100571624,
    "allocs": 0,
    "rc": 0
   },
   {
    "instruction": "AddConstant",
-   "share": 0.016847254605599632,
+   "share": 0.017937119280258325,
    "count": 93792634,
    "allocs": 0,
    "rc": 0
   },
   {
-   "instruction": "LoadNumber",
-   "share": 0.016716718111341664,
-   "count": 156964344,
-   "allocs": 0,
-   "rc": 0
-  },
-  {
    "instruction": "CopyBool",
-   "share": 0.012982796624629736,
+   "share": 0.013862967671113354,
    "count": 84210621,
    "allocs": 0,
    "rc": 0
   },
   {
    "instruction": "LoadNull",
-   "share": 0.011418385973788765,
+   "share": 0.012598417122948066,
    "count": 90020997,
    "allocs": 0,
    "rc": 12299008
   },
   {
    "instruction": "WriteField",
-   "share": 0.010891796812274453,
+   "share": 0.011591448433374773,
    "count": 34275658,
    "allocs": 0,
    "rc": 32428496
   },
   {
    "instruction": "LoadBool",
-   "share": 0.00794891071508532,
+   "share": 0.0074536217504143545,
    "count": 56714265,
    "allocs": 0,
    "rc": 0
   },
   {
    "instruction": "ReturnNumber",
-   "share": 0.007728211957136936,
+   "share": 0.006948445261496055,
    "count": 24428179,
    "allocs": 0,
-   "rc": 32486764
+   "rc": 3009906
   },
   {
    "instruction": "Jump",
-   "share": 0.0064159828658809665,
+   "share": 0.006825662765155031,
    "count": 67333163,
    "allocs": 0,
    "rc": 0
   },
   {
    "instruction": "CopyNumber",
-   "share": 0.0058352683276190346,
+   "share": 0.006512420674950519,
    "count": 53257237,
    "allocs": 0,
    "rc": 0
   },
   {
-   "instruction": "UnboxBool",
-   "share": 0.00576421270855156,
-   "count": 38396360,
-   "allocs": 0,
-   "rc": 0
-  },
-  {
    "instruction": "ReadElementNumber",
-   "share": 0.005347644296236184,
+   "share": 0.005851936604634161,
    "count": 20792599,
    "allocs": 0,
    "rc": 0
   },
   {
    "instruction": "LoadConstant",
-   "share": 0.005151534410714126,
+   "share": 0.005700573970980074,
    "count": 18751803,
    "allocs": 0,
    "rc": 27953192
   },
   {
-   "instruction": "ArrayLength",
-   "share": 0.004489355568907461,
-   "count": 21750139,
+   "instruction": "UnboxBool",
+   "share": 0.005501270907872079,
+   "count": 38396360,
+   "allocs": 0,
+   "rc": 0
+  },
+  {
+   "instruction": "WriteElementNumber",
+   "share": 0.004793536071213652,
+   "count": 22329683,
    "allocs": 0,
    "rc": 0
   },
   {
    "instruction": "Release",
-   "share": 0.0044469790666143184,
+   "share": 0.004655930497699292,
    "count": 16686877,
    "allocs": 0,
    "rc": 17381922
   },
   {
    "instruction": "BoxBool",
-   "share": 0.004407503327380588,
+   "share": 0.004380260985783245,
    "count": 43557166,
    "allocs": 0,
    "rc": 323758
   },
   {
-   "instruction": "WriteElementNumber",
-   "share": 0.004283505280146403,
-   "count": 22329683,
+   "instruction": "ArrayLength",
+   "share": 0.004362629293121249,
+   "count": 21750139,
    "allocs": 0,
    "rc": 0
   },
   {
    "instruction": "NewInstance",
-   "share": 0.003275819347794011,
+   "share": 0.003562904548977023,
    "count": 3669345,
    "allocs": 3669345,
    "rc": 2009137
   },
   {
-   "instruction": "ReadCell",
-   "share": 0.0022859425772443877,
-   "count": 10052085,
-   "allocs": 0,
-   "rc": 8060309
-  },
-  {
    "instruction": "ReadCapture",
-   "share": 0.0021860930166220024,
+   "share": 0.0027963028855731743,
    "count": 9442500,
    "allocs": 0,
    "rc": 9760653
   },
   {
-   "instruction": "MakeClosure",
-   "share": 0.0021313109328186066,
-   "count": 2746065,
-   "allocs": 2746065,
-   "rc": 5496434
+   "instruction": "ReadCell",
+   "share": 0.002567309895467234,
+   "count": 10052085,
+   "allocs": 0,
+   "rc": 8060309
   },
   {
    "instruction": "NewInstanceIn",
-   "share": 0.0020939590289645454,
+   "share": 0.0022862881341632023,
    "count": 2916544,
    "allocs": 2916544,
    "rc": 355455
   },
   {
+   "instruction": "MakeClosure",
+   "share": 0.0022668353145865365,
+   "count": 2746065,
+   "allocs": 2746065,
+   "rc": 5496434
+  },
+  {
    "instruction": "MathUnary",
-   "share": 0.002031010935073331,
+   "share": 0.002092171133496602,
    "count": 4743155,
    "allocs": 0,
    "rc": 0
   },
   {
    "instruction": "Compare",
-   "share": 0.0019788236925337185,
+   "share": 0.002046777471010053,
    "count": 12269569,
    "allocs": 0,
    "rc": 0
   },
   {
-   "instruction": "NewCell",
-   "share": 0.0016470329639908879,
-   "count": 4986491,
-   "allocs": 4986491,
-   "rc": 265874
-  },
-  {
    "instruction": "JumpIfTruthy",
-   "share": 0.001584112307453791,
+   "share": 0.0016301431298580266,
    "count": 16481914,
    "allocs": 0,
    "rc": 0
   },
   {
+   "instruction": "NewCell",
+   "share": 0.0016267428051415476,
+   "count": 4986491,
+   "allocs": 4986491,
+   "rc": 265874
+  },
+  {
    "instruction": "UnboxNumber",
-   "share": 0.0015436673184363824,
+   "share": 0.0015260891508284949,
    "count": 10739874,
    "allocs": 0,
    "rc": 0
   },
   {
    "instruction": "StringLength",
-   "share": 0.0009390113069593436,
+   "share": 0.0010455759516178969,
    "count": 2642100,
    "allocs": 0,
    "rc": 0
   },
   {
-   "instruction": "WriteCell",
-   "share": 0.000868586600660674,
-   "count": 4986506,
-   "allocs": 0,
-   "rc": 3429921
-  },
-  {
    "instruction": "LoadUndefined",
-   "share": 0.0008068838210270688,
+   "share": 0.0009126296203615397,
    "count": 5541054,
    "allocs": 0,
    "rc": 341100
   },
   {
+   "instruction": "WriteCell",
+   "share": 0.0008661902821560932,
+   "count": 4986506,
+   "allocs": 0,
+   "rc": 3429921
+  },
+  {
+   "instruction": "ReadGlobal",
+   "share": 0.0007047792720323944,
+   "count": 1736939,
+   "allocs": 0,
+   "rc": 3009996
+  },
+  {
    "instruction": "NumberIsTruthy",
-   "share": 0.0007299819294239947,
+   "share": 0.000635087093499776,
    "count": 5173023,
    "allocs": 0,
    "rc": 0
   },
   {
    "instruction": "Not",
-   "share": 0.0006185043161394343,
+   "share": 0.0006081366072007874,
    "count": 2569878,
    "allocs": 0,
    "rc": 0
   },
   {
-   "instruction": "ReadGlobal",
-   "share": 0.0006007588261844163,
-   "count": 1736939,
-   "allocs": 0,
-   "rc": 3009996
-  },
-  {
    "instruction": "EnterRegion",
-   "share": 0.0004288089235104983,
+   "share": 0.00043764896673178496,
    "count": 1690129,
    "allocs": 0,
    "rc": 0
   },
   {
    "instruction": "ExitRegion",
-   "share": 0.0003421410880440951,
+   "share": 0.00039757310931734085,
    "count": 130560,
    "allocs": 0,
    "rc": 546252
   },
   {
    "instruction": "BoxNumber",
-   "share": 0.00021626202952019737,
+   "share": 0.0002658438765344568,
    "count": 2930068,
    "allocs": 0,
    "rc": 265899
   },
   {
    "instruction": "PushValue",
-   "share": 0.0001274354548555915,
+   "share": 0.00012696722540226816,
    "count": 163806,
    "allocs": 0,
    "rc": 162006
   },
   {
    "instruction": "ReadGlobalNumber",
-   "share": 7.571016399697462e-05,
+   "share": 7.501084399270008e-05,
    "count": 1525837,
    "allocs": 0,
    "rc": 0
   },
   {
    "instruction": "ToIterationArray",
-   "share": 5.264320471063096e-05,
+   "share": 6.961001051120868e-05,
    "count": 75000,
    "allocs": 0,
    "rc": 76500
   },
   {
    "instruction": "WriteCapture",
-   "share": 2.7500663888226986e-05,
+   "share": 6.269998693196869e-05,
    "count": 48013,
    "allocs": 0,
    "rc": 0
   },
   {
-   "instruction": "<outside>",
-   "share": 1.3911083181833191e-05,
-   "count": 0,
-   "allocs": 0,
-   "rc": 0
+   "instruction": "Concat",
+   "share": 8.939429678875737e-06,
+   "count": 196,
+   "allocs": 196,
+   "rc": 28
   },
   {
    "instruction": "Negate",
-   "share": 5.602929808327254e-06,
+   "share": 6.969373723320258e-06,
    "count": 53978,
    "allocs": 0,
    "rc": 0
   },
   {
-   "instruction": "ReadProperty",
-   "share": 4.831722433203022e-06,
-   "count": 126,
-   "allocs": 0,
-   "rc": 322
-  },
-  {
-   "instruction": "WriteGlobal",
-   "share": 4.655184092814077e-06,
-   "count": 588,
-   "allocs": 0,
-   "rc": 588
-  },
-  {
    "instruction": "NewArray",
-   "share": 3.0257187182450238e-06,
+   "share": 3.975482662906538e-06,
    "count": 867,
    "allocs": 867,
    "rc": 263
   },
   {
    "instruction": "NumberToString",
-   "share": 3.0006011915969332e-06,
+   "share": 3.299964577476378e-06,
    "count": 70,
    "allocs": 70,
    "rc": 14
   },
   {
-   "instruction": "Concat",
-   "share": 5.958422693685305e-07,
-   "count": 196,
-   "allocs": 196,
-   "rc": 28
+   "instruction": "<outside>",
+   "share": 3.0156295297964933e-06,
+   "count": 0,
+   "allocs": 0,
+   "rc": 0
   },
   {
    "instruction": "NewArrayIn",
-   "share": 0.0,
+   "share": 1.4502040206558657e-06,
    "count": 1502,
    "allocs": 1502,
    "rc": 1502
+  },
+  {
+   "instruction": "WriteGlobal",
+   "share": 0.0,
+   "count": 588,
+   "allocs": 0,
+   "rc": 588
+  },
+  {
+   "instruction": "ReadProperty",
+   "share": 0.0,
+   "count": 126,
+   "allocs": 0,
+   "rc": 322
   },
   {
    "instruction": "ReadDynamic",

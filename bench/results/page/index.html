@@ -1,0 +1,329 @@
+<meta name="dash-one-writer">
+<style>
+  .rb { display: grid; gap: var(--cds-gap-xl); font-family: var(--font-anthropic-sans); color: var(--color-fg); }
+  .rb-head { display: grid; gap: var(--cds-gap-sm); }
+  .rb-title { font-family: var(--font-anthropic-serif); font-weight: 400; font-size: var(--cds-font-size-title); margin: 0; }
+  .rb-lede { font-size: var(--cds-font-size-body); line-height: 1.55; max-width: 70ch; margin: 0; }
+  .rb-lede b { font-variant-numeric: tabular-nums; }
+  .rb-tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: var(--cds-gap-md); }
+  .rb-tile { background: var(--color-panel); border: 1px solid var(--color-border-line); border-radius: var(--cds-radius); padding: var(--cds-pad-lg); display: grid; gap: var(--cds-gap-xs); }
+  .rb-tile-label { font-size: var(--cds-font-size-caption); color: var(--color-fg-muted); letter-spacing: .02em; }
+  .rb-tile-value { font-family: var(--font-anthropic-serif); font-size: var(--cds-font-size-title); font-variant-numeric: tabular-nums; }
+  .rb-tile-note { font-size: var(--cds-font-size-caption); color: var(--color-fg-muted); }
+  .rb-sec { display: grid; gap: var(--cds-gap-sm); min-width: 0; }
+  .rb-sec h2 { font-size: var(--cds-font-size-heading); font-weight: var(--cds-font-weight-medium); margin: 0; text-wrap: balance; }
+  .rb-sec p { margin: 0; color: var(--color-fg-muted); font-size: var(--cds-font-size-body); max-width: 70ch; line-height: 1.5; }
+  .rb-chart { position: relative; min-height: 220px; min-width: 0; }
+  .rb-chart svg { display: block; width: 100%; overflow: visible; }
+  .rb-chart text, .rb-chart .tick text { fill: var(--cds-text-secondary); font-size: var(--cds-font-size-caption); font-family: var(--font-anthropic-sans); }
+  .rb-chart .domain, .rb-chart .tick line { stroke: var(--cds-chart-grid); }
+  .rb-legend { display: flex; flex-wrap: wrap; gap: var(--cds-gap-md); font-size: var(--cds-font-size-caption); color: var(--color-fg-muted); }
+  .rb-legend span { display: inline-flex; align-items: center; gap: 6px; }
+  .rb-legend i { width: 10px; height: 10px; border-radius: 50%; display: inline-block; }
+  .rb-tip { position: absolute; pointer-events: none; background: var(--cds-surface-popover); border: 1px solid var(--cds-border); box-shadow: var(--cds-shadow-popover); border-radius: var(--cds-radius); padding: var(--cds-pad-sm) var(--cds-pad-md); font-size: var(--cds-font-size-caption); white-space: nowrap; z-index: 5; font-variant-numeric: tabular-nums; }
+  .rb-wrap { overflow-x: auto; }
+  .rb-table { border-collapse: collapse; width: 100%; font-size: var(--cds-font-size-caption); font-variant-numeric: tabular-nums; }
+  .rb-table th, .rb-table td { padding: 6px 10px; border-bottom: 1px solid var(--color-border-line); text-align: right; white-space: nowrap; }
+  .rb-table th:first-child, .rb-table td:first-child { text-align: left; }
+  .rb-table th { color: var(--color-fg-muted); font-weight: var(--cds-font-weight-medium); }
+  .rb-notes summary { cursor: pointer; font-size: var(--cds-font-size-body); }
+  .rb-notes div { display: grid; gap: var(--cds-gap-sm); padding-top: var(--cds-pad-sm); color: var(--color-fg-muted); max-width: 70ch; line-height: 1.5; font-size: var(--cds-font-size-body); }
+  [data-dash-source-state=refreshing] { opacity: .5; }
+</style>
+
+<div class="rb">
+  <header class="rb-head" id="summary">
+    <h1 class="rb-title">rts Bench</h1>
+    <p class="rb-lede" data-read lang="en">Across the 14 typed Are-We-Fast-Yet benchmarks, reference counting with scope arenas runs at <b data-draw="ratio" data-source="ratios" data-field="rc_vs_gc" data-row="0">—</b>× the time of a tracing GC on the same engine and peaks at <b data-draw="rssratio" data-source="ratios" data-field="rss_vs_gc" data-row="0">—</b>× its memory. In the request loop, its p99.9 latency is <b data-draw="p999rc" data-source="latency" data-field="p999_us" data-where="config=RC + arenas">—</b> µs against <b data-draw="p999gc" data-source="latency" data-field="p999_us" data-where="config=tracing GC">—</b> µs under the tracing GC.</p>
+  </header>
+
+  <div class="rb-tiles" id="tiles">
+    <div class="rb-tile"><span class="rb-tile-label">Time vs tracing GC (geomean)</span><span class="rb-tile-value" data-draw="t-time" data-source="ratios" data-field="rc_vs_gc" data-row="0">—</span><span class="rb-tile-note">lower is faster; 1.00 = same</span></div>
+    <div class="rb-tile"><span class="rb-tile-label">Peak RSS vs tracing GC (geomean)</span><span class="rb-tile-value" data-draw="t-rss" data-source="ratios" data-field="rss_vs_gc" data-row="0">—</span><span class="rb-tile-note">lower uses less memory</span></div>
+    <div class="rb-tile"><span class="rb-tile-label">Arenas on vs off (time, geomean)</span><span class="rb-tile-value" data-draw="t-arena" data-source="ratios" data-field="arena_vs_noarena" data-row="0">—</span><span class="rb-tile-note">below 1.00 means arenas help</span></div>
+    <div class="rb-tile"><span class="rb-tile-label">Time vs node --jitless (geomean)</span><span class="rb-tile-value" data-draw="t-jit" data-source="ratios" data-field="rc_vs_jitless" data-row="0">—</span><span class="rb-tile-note">V8's interpreter, for reference</span></div>
+  </div>
+
+  <section class="rb-sec" id="progress">
+    <h2>Suite time after each step</h2>
+    <p>Geometric mean of the 14 benchmarks' run times, in seconds, measured after each change. The tracing GC and node --jitless lines are the references the default build is chasing.</p>
+    <div class="rb-legend"><span><i style="background: var(--rb-c0)"></i>RC + arenas (default)</span><span><i style="background: var(--rb-c1)"></i>tracing GC</span><span><i style="background: var(--rb-c2)"></i>node --jitless</span></div>
+    <div class="rb-chart" data-draw="history" data-source="history"></div>
+    <div class="rb-wrap">
+      <table class="rb-table" data-source="history" data-row-key="commit">
+        <thead><tr><th data-field="step">Step</th><th data-field="commit">Commit</th><th data-field="rc_geomean_s">RC + arenas (s)</th><th data-field="gc_geomean_s">Tracing GC (s)</th><th data-field="jitless_geomean_s">node --jitless (s)</th></tr></thead>
+        <tbody data-draw="history-rows"></tbody>
+      </table>
+    </div>
+  </section>
+
+  <section class="rb-sec" id="time">
+    <h2>Run time relative to the tracing GC</h2>
+    <p>Each dot is one configuration's time divided by the tracing GC's on the same benchmark (log scale). Left of the line is faster than the GC.</p>
+    <div class="rb-legend" data-draw="cfg-legend"></div>
+    <div class="rb-chart" data-draw="time" data-source="modes"></div>
+  </section>
+
+  <section class="rb-sec" id="memory">
+    <h2>Peak memory</h2>
+    <p>Maximum resident set size of the whole process, in MB. Node's baseline alone is about 45 MB; rts starts at about 15 MB.</p>
+    <div class="rb-chart" data-draw="memory" data-source="modes"></div>
+  </section>
+
+  <section class="rb-sec" id="latency">
+    <h2>Request loop: latency per request</h2>
+    <p>100,000 short requests that allocate temporaries and update a small cache (bench/workloads/requests.ts), in microseconds on a log scale. Collection pauses show up in the tail.</p>
+    <div class="rb-legend"><span><i style="background: var(--rb-c0)"></i>p50</span><span><i style="background: var(--rb-c1)"></i>p99</span><span><i style="background: var(--rb-c2)"></i>p99.9</span><span><i style="background: var(--rb-c3)"></i>max</span></div>
+    <div class="rb-chart" data-draw="latency" data-source="latency"></div>
+  </section>
+
+  <section class="rb-sec" id="profile">
+    <h2>Where the interpreter spends its time</h2>
+    <p>Share of sampled time per instruction kind, averaged over the 14 benchmarks so each weighs the same, from rts --profile. Reference-count updates per execution show which instructions carry the counting cost.</p>
+    <div class="rb-chart" data-draw="profile" data-source="profile"></div>
+    <div class="rb-wrap">
+      <table class="rb-table" data-source="profile" data-row-key="instruction">
+        <thead><tr><th data-field="instruction">Instruction</th><th data-field="time_share_pct">Time share (%)</th><th data-field="count">Executions</th><th data-field="rc_ops_per_op">RC updates / exec</th><th data-field="allocs">Objects allocated</th></tr></thead>
+        <tbody data-draw="profile-rows"></tbody>
+      </table>
+    </div>
+  </section>
+
+  <details class="rb-notes" id="method">
+    <summary>How these numbers are measured</summary>
+    <div>
+      <p>One engine, four memory strategies: scope arenas plus reference counting (the default), reference counting without arenas, reference counting without the cycle collector, and a tracing mark-sweep GC built with --features gc, which keeps no counts at all. The instructions are the same in every build.</p>
+      <p>Benchmarks are the Are-We-Fast-Yet suite ported to typed TypeScript; their output matches Node's byte for byte. Times are each harness's own measurement (start-up excluded), medians of 3 runs on an Apple M-series machine. RSS is the process maximum.</p>
+      <p>The instruction profile counts every execution exactly, and samples time from a separate thread every 20 µs. Reference-count updates are counted in the profiling build only.</p>
+      <p>Reproduce with bench/modes.py, bench/latency.py and bench/profile.py in the rts repository; bench/results/build.py turns their output into this page's files.</p>
+    </div>
+  </details>
+</div>
+
+<script>
+  // Colours for series, in order.
+  (function () {
+    const root = document.querySelector('.rb');
+    if (root) dash.colors.forEach((c, i) => root.style.setProperty('--rb-c' + i, c));
+  })();
+
+  window.rbConfigs = ['RC + arenas', 'RC, no arenas', 'RC, no cycle collector', 'tracing GC', 'node --jitless', 'node (JIT)'];
+
+  window.rbTip = function (el) {
+    let tip = el.querySelector('.rb-tip');
+    if (!tip) {
+      tip = document.createElement('div');
+      tip.className = 'rb-tip';
+      tip.hidden = true;
+      el.appendChild(tip);
+    }
+    return {
+      show(ev, lines) {
+        tip.replaceChildren(...lines.map((l) => { const d = document.createElement('div'); d.textContent = l; return d; }));
+        tip.hidden = false;
+        const box = el.getBoundingClientRect();
+        const x = ev.clientX - box.left, y = ev.clientY - box.top;
+        const w = tip.offsetWidth;
+        tip.style.left = Math.max(0, Math.min(box.width - w, x + 12)) + 'px';
+        tip.style.top = (y + 14) + 'px';
+      },
+      hide() { tip.hidden = true; },
+    };
+  };
+
+  const geo = (xs) => Math.exp(d3.mean(xs, (x) => Math.log(x)));
+
+  dash.calc('ratios', {
+    title: 'Suite ratios',
+    description: 'Geometric means across benchmarks of each ratio between configurations.',
+    inputs: ['modes'],
+    fn: (modes) => {
+      const by = d3.rollup(modes, (v) => v[0], (r) => r.benchmark, (r) => r.config);
+      const ratio = (a, b, f) => geo([...by.values()].filter((m) => m.get(a) && m.get(b)).map((m) => +m.get(a)[f] / +m.get(b)[f]));
+      return [{
+        rc_vs_gc: +ratio('RC + arenas', 'tracing GC', 'time_s').toFixed(3),
+        rss_vs_gc: +ratio('RC + arenas', 'tracing GC', 'rss_mb').toFixed(3),
+        arena_vs_noarena: +ratio('RC + arenas', 'RC, no arenas', 'time_s').toFixed(3),
+        rc_vs_jitless: +ratio('RC + arenas', 'node --jitless', 'time_s').toFixed(3),
+      }];
+    },
+  });
+
+  function rbNumber(name, src, field, fmt, where) {
+    dash.draw(name, (el) => {
+      const d = dash.data(src);
+      if (d.status !== 'ok' || !d.data || !d.data.length) { el.textContent = '—'; return; }
+      const row = where ? d.data.find((r) => String(r[where[0]]) === where[1]) : d.data[0];
+      el.textContent = row ? fmt(+row[field]) : '—';
+    });
+  }
+  const f2 = d3.format('.2f'), f0 = d3.format(',.0f');
+  rbNumber('ratio', 'ratios', 'rc_vs_gc', f2);
+  rbNumber('rssratio', 'ratios', 'rss_vs_gc', f2);
+  rbNumber('t-time', 'ratios', 'rc_vs_gc', f2);
+  rbNumber('t-rss', 'ratios', 'rss_vs_gc', f2);
+  rbNumber('t-arena', 'ratios', 'arena_vs_noarena', f2);
+  rbNumber('t-jit', 'ratios', 'rc_vs_jitless', f2);
+  rbNumber('p999rc', 'latency', 'p999_us', f0, ['config', 'RC + arenas']);
+  rbNumber('p999gc', 'latency', 'p999_us', f0, ['config', 'tracing GC']);
+
+  dash.draw('cfg-legend', (el) => {
+    el.replaceChildren(...window.rbConfigs.filter((c) => c !== 'tracing GC').map((c, i) => {
+      const s = document.createElement('span');
+      const dot = document.createElement('i');
+      dot.style.background = dash.colors[i % dash.colors.length];
+      s.append(dot, document.createTextNode(c));
+      return s;
+    }));
+  });
+</script>
+
+<script>
+  // Dot plot: one row per category, dots per series, with a tooltip.
+  window.rbDots = function (el, opts) {
+    const { rows, cats, series, x, fmt, unit, logScale, ref } = opts;
+    const tip = window.rbTip(el);
+    const W = el.clientWidth || 600;
+    const rowH = 26, top = 8, bottom = 28;
+    let svg = d3.select(el).selectAll('svg').data([0]).join('svg');
+    svg.selectAll('*').remove();
+    const measure = svg.append('text').text(cats.reduce((a, b) => (a.length > b.length ? a : b), ''));
+    const left = Math.ceil((measure.node().getComputedTextLength() || 80) + 12);
+    measure.remove();
+    const H = top + cats.length * rowH + bottom;
+    svg.attr('viewBox', `0 0 ${W} ${H}`).attr('height', H).attr('role', 'img').attr('aria-label', opts.label);
+    const vals = rows.map(x).filter((v) => isFinite(v) && v > 0);
+    const ext = d3.extent(vals);
+    const sx = (logScale ? d3.scaleLog().domain([ext[0] * 0.85, ext[1] * 1.15]) : d3.scaleLinear().domain([0, ext[1] * 1.08])).range([left, W - 16]);
+    const sy = d3.scalePoint().domain(cats).range([top + rowH / 2, top + cats.length * rowH - rowH / 2]);
+    const ax = d3.axisBottom(sx).ticks(Math.max(3, Math.floor((W - left) / 90)), logScale ? '~g' : undefined);
+    svg.append('g').attr('transform', `translate(0,${H - bottom})`).call(ax);
+    svg.append('g').selectAll('line').data(cats).join('line').attr('x1', left).attr('x2', W - 16)
+      .attr('y1', (d) => sy(d)).attr('y2', (d) => sy(d)).style('stroke', 'var(--cds-chart-grid)');
+    svg.append('g').selectAll('text').data(cats).join('text').attr('x', left - 8).attr('y', (d) => sy(d)).attr('dy', '0.32em')
+      .attr('text-anchor', 'end').text((d) => d);
+    if (ref) {
+      svg.append('line').attr('x1', sx(ref)).attr('x2', sx(ref)).attr('y1', top).attr('y2', H - bottom)
+        .style('stroke', 'var(--cds-chart-reference)').style('stroke-dasharray', '3 3');
+    }
+    svg.append('g').selectAll('circle').data(rows.filter((r) => isFinite(x(r)) && x(r) > 0)).join('circle')
+      .attr('cx', (r) => sx(x(r))).attr('cy', (r) => sy(r.cat)).attr('r', 5)
+      .style('fill', (r) => dash.colors[series.indexOf(r.series) % dash.colors.length])
+      .style('fill-opacity', 0.9)
+      .on('pointermove', (ev, r) => tip.show(ev, [r.cat, `${r.series}: ${fmt(x(r))}${unit}`]))
+      .on('pointerleave', () => tip.hide());
+  };
+
+  dash.draw('time', (el) => {
+    const d = dash.data('modes');
+    if (d.status !== 'ok') { el.replaceChildren(document.createTextNode(d.status === 'error' ? 'Failed to load' : '—')); return; }
+    const gc = new Map(d.data.filter((r) => r.config === 'tracing GC').map((r) => [r.benchmark, +r.time_s]));
+    const series = window.rbConfigs.filter((c) => c !== 'tracing GC');
+    const rows = d.data.filter((r) => r.config !== 'tracing GC' && gc.get(r.benchmark))
+      .map((r) => ({ cat: r.benchmark, series: r.config, v: +r.time_s / gc.get(r.benchmark) }));
+    const cats = [...new Set(d.data.map((r) => r.benchmark))];
+    window.rbDots(el, { rows, cats, series, x: (r) => r.v, fmt: d3.format('.2f'), unit: '× GC', logScale: true, ref: 1,
+      label: 'Run time of each configuration relative to the tracing GC, per benchmark' });
+  });
+
+  dash.draw('memory', (el) => {
+    const d = dash.data('modes');
+    if (d.status !== 'ok') { el.replaceChildren(document.createTextNode(d.status === 'error' ? 'Failed to load' : '—')); return; }
+    const series = window.rbConfigs.filter((c) => c !== 'tracing GC');
+    const all = window.rbConfigs;
+    const rows = d.data.map((r) => ({ cat: r.benchmark, series: r.config, v: +r.rss_mb }));
+    const cats = [...new Set(d.data.map((r) => r.benchmark))];
+    window.rbDots(el, { rows, cats, series: all.filter((c) => c !== 'tracing GC').concat(['tracing GC']), x: (r) => r.v, fmt: d3.format('.1f'), unit: ' MB',
+      logScale: false, label: 'Peak resident memory per benchmark and configuration' });
+    void series;
+  });
+
+  dash.draw('latency', (el) => {
+    const d = dash.data('latency');
+    if (d.status !== 'ok') { el.replaceChildren(document.createTextNode(d.status === 'error' ? 'Failed to load' : '—')); return; }
+    const ps = [['p50_us', 'p50'], ['p99_us', 'p99'], ['p999_us', 'p99.9'], ['max_us', 'max']];
+    const rows = d.data.flatMap((r) => ps.map(([f, n]) => ({ cat: r.config, series: n, v: +r[f] })));
+    window.rbDots(el, { rows, cats: d.data.map((r) => r.config), series: ps.map((p) => p[1]), x: (r) => r.v, fmt: d3.format(',.0f'),
+      unit: ' µs', logScale: true, label: 'Request latency percentiles per configuration' });
+  });
+</script>
+
+<script>
+  dash.draw('history', (el) => {
+    const d = dash.data('history');
+    if (d.status !== 'ok') { el.replaceChildren(document.createTextNode(d.status === 'error' ? 'Failed to load' : '—')); return; }
+    const tip = window.rbTip(el);
+    const rows = d.data;
+    const W = el.clientWidth || 600, H = 220, m = { t: 12, r: 16, b: 30, l: 44 };
+    const keys = [['rc_geomean_s', 'RC + arenas'], ['gc_geomean_s', 'tracing GC'], ['jitless_geomean_s', 'node --jitless']];
+    let svg = d3.select(el).selectAll('svg').data([0]).join('svg');
+    svg.selectAll('*').remove();
+    svg.attr('viewBox', `0 0 ${W} ${H}`).attr('height', H).attr('role', 'img').attr('aria-label', 'Suite geometric-mean time after each step');
+    const sx = d3.scalePoint().domain(rows.map((r) => r.commit)).range([m.l + 20, W - m.r - 20]).padding(rows.length < 2 ? 0.5 : 0);
+    const maxY = d3.max(rows, (r) => d3.max(keys, (k) => +r[k[0]]));
+    const sy = d3.scaleLinear().domain([0, maxY * 1.1]).nice().range([H - m.b, m.t]);
+    svg.append('g').attr('transform', `translate(${m.l},0)`).call(d3.axisLeft(sy).ticks(4).tickFormat(d3.format('.2f')));
+    svg.append('g').attr('transform', `translate(0,${H - m.b})`).call(d3.axisBottom(sx));
+    keys.forEach(([f, n], i) => {
+      const c = dash.colors[i % dash.colors.length];
+      svg.append('path').datum(rows).attr('d', d3.line().x((r) => sx(r.commit)).y((r) => sy(+r[f])))
+        .style('fill', 'none').style('stroke', c).style('stroke-width', 2);
+      svg.append('g').selectAll('circle').data(rows).join('circle').attr('cx', (r) => sx(r.commit)).attr('cy', (r) => sy(+r[f])).attr('r', 4.5)
+        .style('fill', c)
+        .on('pointermove', (ev, r) => tip.show(ev, [r.step, `${n}: ${d3.format('.3f')(+r[f])} s`]))
+        .on('pointerleave', () => tip.hide());
+    });
+  });
+
+  dash.draw('history-rows', (tb) => {
+    const d = dash.data('history');
+    if (d.status !== 'ok') { tb.replaceChildren(); return; }
+    tb.replaceChildren(...d.data.slice().reverse().map((r) => {
+      const tr = document.createElement('tr');
+      for (const f of ['step', 'commit', 'rc_geomean_s', 'gc_geomean_s', 'jitless_geomean_s']) {
+        const td = document.createElement('td');
+        td.textContent = typeof r[f] === 'number' ? d3.format('.3f')(r[f]) : r[f];
+        tr.appendChild(td);
+      }
+      return tr;
+    }));
+  });
+
+  dash.draw('profile', (el) => {
+    const d = dash.data('profile');
+    if (d.status !== 'ok') { el.replaceChildren(document.createTextNode(d.status === 'error' ? 'Failed to load' : '—')); return; }
+    const tip = window.rbTip(el);
+    const rows = d.data.slice().sort((a, b) => b.time_share_pct - a.time_share_pct).slice(0, 15);
+    const W = el.clientWidth || 600, barH = 20, m = { t: 4, r: 56, b: 24 };
+    let svg = d3.select(el).selectAll('svg').data([0]).join('svg');
+    svg.selectAll('*').remove();
+    const meas = svg.append('text').text(rows.reduce((a, r) => (r.instruction.length > a.length ? r.instruction : a), ''));
+    const left = Math.ceil((meas.node().getComputedTextLength() || 100) + 12);
+    meas.remove();
+    const H = m.t + rows.length * barH + m.b;
+    svg.attr('viewBox', `0 0 ${W} ${H}`).attr('height', H).attr('role', 'img').attr('aria-label', 'Share of interpreter time by instruction');
+    const sx = d3.scaleLinear().domain([0, d3.max(rows, (r) => +r.time_share_pct)]).nice().range([left, W - m.r]);
+    const sy = d3.scaleBand().domain(rows.map((r) => r.instruction)).range([m.t, m.t + rows.length * barH]).padding(0.2);
+    svg.append('g').attr('transform', `translate(0,${H - m.b})`).call(d3.axisBottom(sx).ticks(4).tickFormat((v) => v + '%'));
+    svg.append('g').selectAll('text').data(rows).join('text').attr('x', left - 8).attr('y', (r) => sy(r.instruction) + sy.bandwidth() / 2)
+      .attr('dy', '0.32em').attr('text-anchor', 'end').text((r) => r.instruction);
+    svg.append('g').selectAll('rect').data(rows).join('rect').attr('x', left).attr('y', (r) => sy(r.instruction))
+      .attr('width', (r) => sx(+r.time_share_pct) - left).attr('height', sy.bandwidth()).style('fill', dash.colors[0])
+      .on('pointermove', (ev, r) => tip.show(ev, [r.instruction, `${d3.format('.1f')(r.time_share_pct)}% of time`, `${d3.format('.2f')(r.rc_ops_per_op)} RC updates per execution`]))
+      .on('pointerleave', () => tip.hide());
+    svg.append('g').selectAll('text').data(rows).join('text').attr('x', (r) => sx(+r.time_share_pct) + 4)
+      .attr('y', (r) => sy(r.instruction) + sy.bandwidth() / 2).attr('dy', '0.32em').text((r) => d3.format('.1f')(r.time_share_pct) + '%');
+  });
+
+  dash.draw('profile-rows', (tb) => {
+    const d = dash.data('profile');
+    if (d.status !== 'ok') { tb.replaceChildren(); return; }
+    const rows = d.data.slice().sort((a, b) => b.time_share_pct - a.time_share_pct).slice(0, 25);
+    tb.replaceChildren(...rows.map((r) => {
+      const tr = document.createElement('tr');
+      const cells = [r.instruction, d3.format('.1f')(r.time_share_pct), d3.format(',')(r.count), d3.format('.2f')(r.rc_ops_per_op), d3.format(',')(r.allocs)];
+      for (const c of cells) { const td = document.createElement('td'); td.textContent = c; tr.appendChild(td); }
+      return tr;
+    }));
+  });
+</script>
