@@ -38,5 +38,13 @@
   "rc_geomean_s": 0.2367,
   "gc_geomean_s": 0.2289,
   "jitless_geomean_s": 0.452
+ },
+ {
+  "commit": "63d753f",
+  "date": "2026-11-16",
+  "step": "Native code: values of any type, calls into the interpreter, globals",
+  "rc_geomean_s": 0.1691,
+  "gc_geomean_s": 0.1498,
+  "jitless_geomean_s": 0.4509
  }
 ]
