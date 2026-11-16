@@ -31,6 +31,7 @@ fn main() -> ExitCode {
             "--mem-stats" => mem_stats = true,
             "--no-arena" => no_arena = true,
             "--profile" => profile = true,
+            "--no-jit" => rts::jit::disable(),
             _ => path = Some(a),
         }
     }
@@ -42,7 +43,7 @@ fn main() -> ExitCode {
         rts::runtime::gc::set_min_heap(n);
     }
     let Some(path) = path else {
-        eprintln!("usage: rts [--dump] [--no-types] [--no-cycles] [--no-arena] [--mem-stats] [--profile] <file.ts>");
+        eprintln!("usage: rts [--dump] [--no-types] [--no-cycles] [--no-arena] [--mem-stats] [--profile] [--no-jit] <file.ts>");
         return ExitCode::from(2);
     };
     let src = match std::fs::read_to_string(&path) {

@@ -11,6 +11,7 @@ pub mod disasm;
 pub mod error;
 pub mod escape;
 pub mod hir;
+pub mod jit;
 pub mod lexer;
 pub mod module;
 pub mod node;
@@ -42,7 +43,9 @@ pub fn compile_file(path: &std::path::Path, src: String, erase_types: bool) -> R
             prelude.extend(parser::parse_program(lexer::tokenize_at(PRELUDE_DATE, base)?)?);
         }
         let hir = check::check_program(&prelude, &graph, erase_types)?;
-        Ok(codegen::compile(&hir))
+        let mut prog = codegen::compile(&hir);
+        jit::compile(&hir, &mut prog);
+        Ok(prog)
     })();
     r.map_err(|e: CompileError| sources.render(&e))
 }

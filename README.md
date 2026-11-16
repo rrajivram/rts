@@ -323,6 +323,23 @@ does: skipping count updates for values the compiler knows are scope-bound,
 and moving ownership of private fields into the owner's region. Those are
 the next experiments (see [Next steps](#next-steps)).
 
+## Native code (in progress)
+
+Functions whose parameters, locals and result are all numbers or booleans,
+and that use only arithmetic, comparisons, control flow, `Math.*` and calls to
+other such functions, are compiled to machine code at start-up with
+[Cranelift](https://cranelift.dev) (`src/jit.rs`). The interpreter calls them
+directly; `--no-jit` turns this off. Mandelbrot runs 8.5× faster (180 ms → 21 ms,
+against 18 ms for Node's optimizing JIT). Number semantics are the
+interpreter's (`%`, `**`, ToInt32 and `Math` call the same Rust code), and
+recursion depth is shared with the interpreter, so runaway recursion is a
+RangeError, not a crash.
+
+Next stages: objects, calls and reference counting in compiled code (with a
+count-elision pass, where scope knowledge pays), then the memory-mode
+comparison on compiled code, then generators, async functions and exceptions.
+LLVM is planned as a later, more optimizing tier.
+
 ## Supported TypeScript and Node
 
 Everything in `tests/programs/` runs with output identical to Node

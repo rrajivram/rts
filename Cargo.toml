@@ -8,6 +8,11 @@ rustc-hash = "2"
 indexmap = "2"
 smallvec = { version = "1", features = ["union", "const_generics"] }
 fancy-regex = "0.14"
+cranelift-codegen = "0.137.1"
+cranelift-frontend = "0.137.1"
+cranelift-jit = "0.137.1"
+cranelift-module = "0.137.1"
+cranelift-native = "0.137.1"
 
 [profile.release]
 debug = true

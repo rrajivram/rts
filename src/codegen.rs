@@ -285,6 +285,7 @@ impl<'a> Codegen<'a> {
         let name = hf.name.clone();
         FunctionCode {
             id: fid,
+            jit: None,
             borrowed,
             is_async: hf.is_async,
             name,
