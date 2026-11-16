@@ -1048,6 +1048,7 @@ struct Layout {
     tag_arr: i64,
     /// Tags from here on (`BigInt`, …) may own a box.
     tag_first_gc: i64,
+    arr: Option<ArrLayout>,
 }
 
 impl Layout {
@@ -1061,9 +1062,61 @@ impl Layout {
             tag_obj: t(Value::Obj(Object::new(crate::runtime::Shape::new(vec![]), vec![], None))),
             tag_arr: t(Value::Arr(crate::runtime::Array::new_num(vec![]))),
             tag_first_gc: t(Value::BigInt(Gc::new(0))),
+            arr: if std::env::var_os("RTS_JIT_NO_INLINE_ARRAYS").is_some() { None } else { ArrLayout::probe() },
         };
         assert!(l.tag_undef < l.tag_first_gc && l.tag_null < l.tag_first_gc && l.tag_bool < l.tag_first_gc && l.tag_num < l.tag_first_gc);
         l
+    }
+}
+
+/// Where an array's elements are, as offsets from its box (`None`: unknown,
+/// so every access calls a helper). `Vec`'s field order is not fixed by
+/// Rust, so it is found by inspecting a vector.
+#[derive(Clone, Copy)]
+struct ArrLayout {
+    /// The `ArrStore` variant byte (0: numbers, 1: values).
+    variant: i32,
+    data: i32,
+    len: i32,
+}
+
+impl ArrLayout {
+    fn probe() -> Option<ArrLayout> {
+        use crate::runtime::{ArrStore, Array};
+        const W: usize = std::mem::size_of::<usize>();
+        if std::mem::size_of::<Vec<f64>>() != 3 * W || std::mem::size_of::<Vec<Value>>() != 3 * W {
+            return None;
+        }
+        // Which word of a vector is the data pointer, and which the length?
+        let words = |p: usize, len: usize, cap: usize, w: [usize; 3]| -> Option<(usize, usize)> {
+            let pi = w.iter().position(|x| *x == p)?;
+            let li = w.iter().position(|x| *x == len)?;
+            let ci = w.iter().position(|x| *x == cap)?;
+            (pi != li && li != ci && pi != ci).then_some((pi, li))
+        };
+        let mut v: Vec<f64> = Vec::with_capacity(7);
+        v.extend([1.0, 2.0, 3.0]);
+        let (p, l, c) = (v.as_ptr() as usize, v.len(), v.capacity());
+        let w: [usize; 3] = unsafe { std::mem::transmute_copy(&v) };
+        let num = words(p, l, c, w)?;
+        let mut v: Vec<Value> = Vec::with_capacity(5);
+        v.extend([Value::Undef, Value::Null]);
+        let (p, l, c) = (v.as_ptr() as usize, v.len(), v.capacity());
+        let w: [usize; 3] = unsafe { std::mem::transmute_copy(&v) };
+        if words(p, l, c, w)? != num {
+            return None;
+        }
+        // The store inside the array's box.
+        let a = Array::new_num(vec![1.0]);
+        let base = a.header_ptr().as_ptr() as usize;
+        let store = a.store.as_ptr() as usize - base;
+        // The variant byte and the vector's offset (`repr(C, u8)`).
+        let tag = |s: &ArrStore| unsafe { *(s as *const ArrStore as *const u8) };
+        if tag(&ArrStore::Num(vec![])) != 0 || tag(&ArrStore::Val(vec![])) != 1 {
+            return None;
+        }
+        let vec_at = store + 8;
+        Some(ArrLayout { variant: store as i32, data: (vec_at + num.0 * W) as i32, len: (vec_at + num.1 * W) as i32 })
     }
 }
 
@@ -1658,7 +1711,12 @@ impl Lower<'_, '_> {
         let (tag, payload) = self.value_words(vj, v);
         self.b.ins().store(mf(), tag, p, off);
         self.b.ins().store(mf(), payload, p, off + 8);
-        // The old value: nothing to do unless it may own a box.
+        self.release_old(old_tag, old);
+    }
+
+    /// Release a value overwritten in a slot (its tag, widened, and payload).
+    fn release_old(&mut self, old_tag: CV, old: CV) {
+        // Nothing to do unless it may own a box.
         let boxed = self.b.ins().icmp_imm_u(IntCC::UnsignedGreaterThanOrEqual, old_tag, self.lay.tag_first_gc);
         let (tag_obj, tag_arr) = (self.lay.tag_obj, self.lay.tag_arr);
         self.if_then(boxed, |s| {
@@ -1694,8 +1752,165 @@ impl Lower<'_, '_> {
         if !r.owned && rest.iter().any(|x| self.el.effects(x, var)) { self.hold(r) } else { r }
     }
 
-    /// Read `a[i]` as `want`.
+    /// `i` as an index into the array at `a` (a real array, `al` its
+    /// layout), and whether it is an integer within bounds.
+    fn arr_index(&mut self, a: CV, i: CV, al: ArrLayout) -> (CV, CV) {
+        let ii = self.b.ins().fcvt_to_sint_sat(types::I64, i);
+        let back = self.b.ins().fcvt_from_sint(types::F64, ii);
+        let exact = self.b.ins().fcmp(FloatCC::Equal, back, i);
+        let len = self.b.ins().load(types::I64, mf(), a, al.len);
+        let inb = self.b.ins().icmp(IntCC::UnsignedLessThan, ii, len);
+        (ii, self.b.ins().band(exact, inb))
+    }
+
+    /// Branch to `fast` if `a` is an array whose store variant is `variant`
+    /// (any, if None) and `i` an index within it; else to `slow`. Returns
+    /// the integer index (valid in `fast`).
+    fn arr_guard(&mut self, a: CV, i: CV, al: ArrLayout, variant: Option<i64>, fast: Block, slow: Block) -> CV {
+        let real = self.b.ins().icmp_imm_u(IntCC::UnsignedGreaterThanOrEqual, a, 2);
+        let chk = self.b.create_block();
+        self.b.ins().brif(real, chk, &[], slow, &[]);
+        self.b.seal_block(chk);
+        self.b.switch_to_block(chk);
+        let (ii, ok) = self.arr_index(a, i, al);
+        let ok = match variant {
+            Some(v) => {
+                let var = self.b.ins().load(types::I8, mf(), a, al.variant);
+                let is = self.b.ins().icmp_imm_u(IntCC::Equal, var, v);
+                self.b.ins().band(ok, is)
+            }
+            None => ok,
+        };
+        self.b.ins().brif(ok, fast, &[], slow, &[]);
+        ii
+    }
+
+    /// Read `a[i]` as `want`: inline for an in-bounds integer index into
+    /// the expected storage, else through the helper.
     fn arr_get(&mut self, a: CV, i: CV, want: JV) -> CV {
+        let Some(al) = self.lay.arr else { return self.arr_get_slow(a, i, want) };
+        let (fast, slow, done) = (self.b.create_block(), self.b.create_block(), self.b.create_block());
+        let ty = cl_ty(want.jk());
+        self.b.append_block_param(done, ty);
+        let ii = self.arr_guard(a, i, al, Some(if want == JV::Num { 0 } else { 1 }), fast, slow);
+        self.b.seal_block(fast);
+        self.b.switch_to_block(fast);
+        let data = self.b.ins().load(types::I64, mf(), a, al.data);
+        if want == JV::Num {
+            let off = self.b.ins().ishl_imm_u(ii, 3);
+            let at = self.b.ins().iadd(data, off);
+            let v = self.b.ins().load(types::F64, mf(), at, 0);
+            self.b.ins().jump(done, &[v.into()]);
+        } else {
+            let off = self.b.ins().ishl_imm_u(ii, 4);
+            let at = self.b.ins().iadd(data, off);
+            let tag = self.b.ins().load(types::I8, mf(), at, 0);
+            let tag = self.b.ins().uextend(types::I64, tag);
+            let payload = self.b.ins().load(types::I64, mf(), at, 8);
+            let (v, good) = if want == JV::Bool {
+                (self.b.ins().ireduce(types::I8, payload), self.b.ins().icmp_imm_u(IntCC::Equal, tag, self.lay.tag_bool))
+            } else {
+                let heap = match want {
+                    JV::Arr => self.lay.tag_arr,
+                    JV::Obj => self.lay.tag_obj,
+                    _ => -1,
+                };
+                let is_heap = self.b.ins().icmp_imm_u(IntCC::Equal, tag, heap);
+                let is_null = self.b.ins().icmp_imm_u(IntCC::Equal, tag, self.lay.tag_null);
+                let is_undef = self.b.ins().icmp_imm_u(IntCC::Equal, tag, self.lay.tag_undef);
+                let zero = self.b.ins().iconst(types::I64, 0);
+                let one = self.b.ins().iconst(types::I64, 1);
+                let nullish = self.b.ins().select(is_null, zero, one);
+                let v = self.b.ins().select(is_heap, payload, nullish);
+                let any = self.b.ins().bor(is_heap, is_null);
+                (v, self.b.ins().bor(any, is_undef))
+            };
+            self.b.ins().brif(good, done, &[v.into()], slow, &[]);
+        }
+        self.b.seal_block(slow);
+        self.b.switch_to_block(slow);
+        let v = self.arr_get_slow(a, i, want);
+        self.b.ins().jump(done, &[v.into()]);
+        self.b.seal_block(done);
+        self.b.switch_to_block(done);
+        self.b.block_params(done)[0]
+    }
+
+    /// `a[i] = v` (`v` a `vj`, owned if a reference): inline for an
+    /// in-bounds integer index (numbers into number storage, anything into
+    /// value storage), else through the helper.
+    fn arr_set(&mut self, a: CV, i: CV, vj: JV, v: CV) {
+        let Some(al) = self.lay.arr else { return self.arr_set_slow(a, i, vj, v) };
+        let (fast, slow, done) = (self.b.create_block(), self.b.create_block(), self.b.create_block());
+        // Non-numbers only go inline into value storage.
+        let ii = self.arr_guard(a, i, al, if vj == JV::Num { None } else { Some(1) }, fast, slow);
+        self.b.seal_block(fast);
+        self.b.switch_to_block(fast);
+        let data = self.b.ins().load(types::I64, mf(), a, al.data);
+        let vals = self.b.create_block();
+        if vj == JV::Num {
+            let var = self.b.ins().load(types::I8, mf(), a, al.variant);
+            let nums = self.b.create_block();
+            self.b.ins().brif(var, vals, &[], nums, &[]);
+            self.b.seal_block(nums);
+            self.b.switch_to_block(nums);
+            let off = self.b.ins().ishl_imm_u(ii, 3);
+            let at = self.b.ins().iadd(data, off);
+            self.b.ins().store(mf(), v, at, 0);
+            self.b.ins().jump(done, &[]);
+        } else {
+            self.b.ins().jump(vals, &[]);
+        }
+        self.b.seal_block(vals);
+        self.b.switch_to_block(vals);
+        let off = self.b.ins().ishl_imm_u(ii, 4);
+        let at = self.b.ins().iadd(data, off);
+        let old_tag = self.b.ins().load(types::I8, mf(), at, 0);
+        let old_tag = self.b.ins().uextend(types::I64, old_tag);
+        let old = self.b.ins().load(types::I64, mf(), at, 8);
+        let (tag, payload) = self.value_words(vj, v);
+        self.b.ins().store(mf(), tag, at, 0);
+        self.b.ins().store(mf(), payload, at, 8);
+        self.release_old(old_tag, old);
+        self.b.ins().jump(done, &[]);
+        self.b.seal_block(slow);
+        self.b.switch_to_block(slow);
+        self.arr_set_slow(a, i, vj, v);
+        self.b.ins().jump(done, &[]);
+        self.b.seal_block(done);
+        self.b.switch_to_block(done);
+    }
+
+    /// `a.length`.
+    fn arr_len(&mut self, a: CV) -> CV {
+        let Some(al) = self.lay.arr else { return self.arr_len_slow(a) };
+        let (fast, slow, done) = (self.b.create_block(), self.b.create_block(), self.b.create_block());
+        self.b.append_block_param(done, types::F64);
+        let real = self.b.ins().icmp_imm_u(IntCC::UnsignedGreaterThanOrEqual, a, 2);
+        self.b.ins().brif(real, fast, &[], slow, &[]);
+        self.b.seal_block(fast);
+        self.b.seal_block(slow);
+        self.b.switch_to_block(fast);
+        let n = self.b.ins().load(types::I64, mf(), a, al.len);
+        let n = self.b.ins().fcvt_from_uint(types::F64, n);
+        self.b.ins().jump(done, &[n.into()]);
+        self.b.switch_to_block(slow);
+        let n = self.arr_len_slow(a);
+        self.b.ins().jump(done, &[n.into()]);
+        self.b.seal_block(done);
+        self.b.switch_to_block(done);
+        self.b.block_params(done)[0]
+    }
+
+    fn arr_len_slow(&mut self, a: CV) -> CV {
+        let call = self.b.ins().call(self.h.arr_len, &[a]);
+        let n = self.b.inst_results(call)[0];
+        self.check_status();
+        n
+    }
+
+    /// Read `a[i]` as `want`, through the helper.
+    fn arr_get_slow(&mut self, a: CV, i: CV, want: JV) -> CV {
         let w = match want {
             JV::Num => W_NUM,
             JV::Bool => W_BOOL,
@@ -1714,8 +1929,8 @@ impl Lower<'_, '_> {
         }
     }
 
-    /// `a[i] = v` (`v` a `vj`, owned if a reference).
-    fn arr_set(&mut self, a: CV, i: CV, vj: JV, v: CV) {
+    /// `a[i] = v`, through the helper.
+    fn arr_set_slow(&mut self, a: CV, i: CV, vj: JV, v: CV) {
         let (tag, payload) = self.value_words(vj, v);
         let tag = self.b.ins().uextend(types::I64, tag);
         let num = self.b.ins().iconst(types::I32, (vj == JV::Num) as i64);
@@ -2066,9 +2281,7 @@ impl Lower<'_, '_> {
             }
             Place::ArrLen { obj, .. } => {
                 let a = self.rexpr(obj);
-                let call = self.b.ins().call(self.h.arr_len, &[a.v]);
-                let v = self.b.inst_results(call)[0];
-                self.check_status();
+                let v = self.arr_len(a.v);
                 self.release(a);
                 RV { v, owned: false }
             }

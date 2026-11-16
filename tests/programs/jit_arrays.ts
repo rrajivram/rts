@@ -154,3 +154,16 @@ const g = grid(4);
 console.log(cell(g, 3, 2), g.length);
 const ds = disks(20);
 console.log(biggest(ds), replace(ds, 3), ds[3].size, biggest(ds));
+
+function edges(a: number[], ds: (Disk | null)[]): number {
+  a[a.length] = 7;
+  a[-1] = 3;
+  a[1.5] = 4;
+  a[a.length + 2] = 9;
+  ds[0] = null;
+  ds[ds.length] = new Disk(42);
+  return a.length * 100 + ds.length;
+}
+const ea = [1, 2, 3];
+const ed: (Disk | null)[] = [new Disk(1)];
+console.log(edges(ea, ed), ea.length, ea[3], ea[6], ed[0], ed[1]!.size);

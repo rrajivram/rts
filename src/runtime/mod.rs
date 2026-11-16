@@ -72,7 +72,10 @@ impl JsStr {
     }
 }
 
+/// An array's elements. `repr(C, u8)`: the variant is the first byte and
+/// the vector starts at offset 8 (compiled code reads elements directly).
 #[derive(Debug)]
+#[repr(C, u8)]
 pub enum ArrStore {
     Num(Vec<f64>),
     Val(Vec<Value>),
