@@ -284,7 +284,7 @@ fn cmp(op: CmpOp, x: f64, y: f64) -> bool {
     }
 }
 
-fn str_cmp(op: CmpOp, a: &str, b: &str) -> bool {
+pub(crate) fn str_cmp(op: CmpOp, a: &str, b: &str) -> bool {
     // JS compares UTF-16 code units; identical to byte order for ASCII.
     let o = if a.is_ascii() && b.is_ascii() {
         a.cmp(b)
@@ -551,6 +551,154 @@ impl Vm {
         Ok(std::mem::take(&mut self.native_ret))
     }
 
+    // ── entry points for compiled code (`jit.rs`) ──
+    //
+    // Compiled code holds references the tracing GC can't see, so each of
+    // these blocks it (as `call` does) while it runs.
+
+    /// Call function `fid` (one that captures nothing), as `CallTarget::Direct`.
+    pub(crate) fn jit_call_func(&mut self, fid: u32, this: Value, args: &[Value]) -> Result<Value, Value> {
+        if let Some(r) = self.call_native_values(fid, &this, args) {
+            return r;
+        }
+        let f = Value::Func(Gc::new(Closure { func: fid, caps: Box::new([]), props: Default::default() }));
+        self.call_slice(&f, this, args)
+    }
+
+    /// `recv.<method in vtable slot>(…)`, as `CallTarget::Method`.
+    pub(crate) fn jit_call_vslot(&mut self, slot: u32, recv: Value, args: &[Value]) -> Result<Value, Value> {
+        match &recv {
+            Value::Obj(o) if o.class.is_some() => {
+                let fi = o.class.as_ref().unwrap().vtable[slot as usize];
+                self.jit_call_func(fi, recv, args)
+            }
+            v => {
+                let d = describe(v);
+                Err(self.type_error(format!("cannot call a method on {d}")))
+            }
+        }
+    }
+
+    /// `recv.name(…)` with the method looked up by name, as `CallTarget::Property`.
+    pub(crate) fn jit_call_named(&mut self, site: &PropertySite, recv: Value, args: &[Value]) -> Result<Value, Value> {
+        if let Value::Obj(o) = &recv
+            && let Some(cls) = &o.class
+        {
+            let hit = match &*site.cache.method.borrow() {
+                Some((sh, c, fi)) if Rc::ptr_eq(c, cls) && o.has_shape(sh) => Some(*fi),
+                _ => None,
+            };
+            let fi = match hit {
+                Some(fi) => Some(fi),
+                None if o.lookup(&site.name).is_none() => {
+                    let mut k = Some(cls.clone());
+                    let mut found = None;
+                    while let Some(c) = k {
+                        if let Some(fi) = c.methods.get(&*site.name) {
+                            found = Some(*fi);
+                            break;
+                        }
+                        k = c.parent.clone();
+                    }
+                    if let Some(fi) = found {
+                        *site.cache.method.borrow_mut() = Some((o.shape(), cls.clone(), fi));
+                    }
+                    found
+                }
+                None => None,
+            };
+            if let Some(fi) = fi {
+                return self.jit_call_func(fi, recv, args);
+            }
+        }
+        self.gc_block += 1;
+        let m = self.lookup_method(&recv, &site.name);
+        self.gc_block -= 1;
+        match m? {
+            f @ (Value::Func(_) | Value::Native(_) | Value::Bound(_)) => self.call_slice(&f, recv, args),
+            v => {
+                let d = describe(&v);
+                Err(self.type_error(format!("{}.{} is not a function (it is {d})", recv.type_of(), site.name)))
+            }
+        }
+    }
+
+    /// Any callable value, as `CallTarget::Value`.
+    pub(crate) fn jit_call_value(&mut self, f: &Value, this: Value, args: &[Value]) -> Result<Value, Value> {
+        match f {
+            Value::Class(c) => Err(self.type_error(format!("Class constructor {} cannot be invoked without 'new'", c.name))),
+            Value::Func(c) if c.caps.is_empty() && self.code(c.func).jit.is_some() => {
+                let fid = c.func;
+                match self.call_native_values(fid, &this, args) {
+                    Some(r) => r,
+                    None => self.call_slice(f, this, args),
+                }
+            }
+            Value::Func(_) | Value::Native(_) | Value::Bound(_) => self.call_slice(f, this, args),
+            v => {
+                let d = describe(v);
+                Err(self.type_error(format!("{d} is not a function")))
+            }
+        }
+    }
+
+    /// A built-in, as `CallTarget::Native`.
+    pub(crate) fn jit_call_native(&mut self, n: Native, this: Value, args: &[Value]) -> Result<Value, Value> {
+        self.gc_block += 1;
+        let r = call_native(self, n, this, args.to_vec());
+        self.gc_block -= 1;
+        r
+    }
+
+    /// `recv.name`, as `ReadProperty`.
+    pub(crate) fn jit_get_prop(&mut self, site: &PropertySite, recv: &Value) -> Result<Value, Value> {
+        self.gc_block += 1;
+        let r = match recv {
+            Value::Obj(ob) => {
+                let hit = match &*site.cache.entry.borrow() {
+                    Some((sh, slot)) if ob.has_shape(sh) => Some(ob.slot(*slot as usize)),
+                    _ => None,
+                };
+                match hit {
+                    Some(x) => self.read_accessor(x, recv),
+                    None => self.get_prop_slow(recv, site),
+                }
+            }
+            Value::Arr(a) if site.is_length => Ok(Value::Num(a.len() as f64)),
+            _ => self.get_prop_slow(recv, site),
+        };
+        self.gc_block -= 1;
+        r
+    }
+
+    /// `recv.name = val`, as `WriteProperty`.
+    pub(crate) fn jit_set_prop(&mut self, site: &PropertySite, recv: &Value, val: Value) -> Result<(), Value> {
+        self.gc_block += 1;
+        let r = self.set_prop(recv, site, val);
+        self.gc_block -= 1;
+        r
+    }
+
+    /// `new C(…)` for a class whose constructor isn't compiled.
+    pub(crate) fn jit_construct(&mut self, class: u32, args: &[Value]) -> Result<Value, Value> {
+        let c = Value::Class(self.prog.classes[class as usize].clone());
+        self.gc_block += 1;
+        let r = self.construct(&c, args.to_vec());
+        self.gc_block -= 1;
+        r
+    }
+
+    /// `ToString` (template literals, `String(x)`).
+    pub(crate) fn jit_to_string(&mut self, v: &Value) -> Result<Value, Value> {
+        self.gc_block += 1;
+        let r = match v {
+            Value::Obj(_) => self.to_string_value(v).map(Value::Str),
+            v => Ok(Value::Str(v.to_js_string())),
+        };
+        self.gc_block -= 1;
+        r
+    }
+
     /// Call a function compiled to native code (`jit.rs`), if this call site
     /// passes exactly its parameters, as values compiled code can take.
     /// None: use the interpreter.
@@ -567,28 +715,66 @@ impl Vm {
         {
             return None;
         }
-        let mut argv = [0u64; 16];
+        // Two words per argument at most (a value: tag and payload). Only
+        // the words written are read.
+        let mut argv = [std::mem::MaybeUninit::<u64>::uninit(); 32];
+        let argv_ptr = argv.as_mut_ptr() as *mut u64;
+        let put = |i: usize, w: u64| unsafe { argv_ptr.add(i).write(w) };
         let mut i = 0;
         if jf.this {
-            argv[0] = JitFn::arg_bits(JV::Obj, this.unwrap_or(&Value::Undef))?;
+            put(0, JitFn::arg_bits(JV::Obj, this.unwrap_or(&Value::Undef))?);
             i = 1;
         }
         for (&(_, r), &k) in ci.args.iter().zip(&jf.params) {
-            argv[i] = match k {
-                JV::Num | JV::Bool => self.scalars[sb + r as usize],
-                _ => JitFn::arg_bits(k, &self.values[vb + r as usize])?,
-            };
+            match k {
+                JV::Num | JV::Bool => put(i, self.scalars[sb + r as usize]),
+                // Borrowed: the caller's slot keeps it alive.
+                JV::Val => {
+                    let [t, p] = JitFn::val_words(&self.values[vb + r as usize]);
+                    put(i, t);
+                    i += 1;
+                    put(i, p);
+                }
+                _ => put(i, JitFn::arg_bits(k, &self.values[vb + r as usize])?),
+            }
             i += 1;
         }
+        let r = match self.enter_native_code(jf, argv_ptr) {
+            Ok(r) => r,
+            Err(e) => return Some(Err(e)),
+        };
+        match ci.output {
+            Some((Kind::Val, d)) => self.values[vb + d as usize] = jf.ret_value(r),
+            Some((_, d)) => self.scalars[sb + d as usize] = r,
+            None => drop(jf.ret_value(r)),
+        }
+        // Compiled code pushed no frames: take the safepoint here, with
+        // every value back in a slot.
+        self.safepoint();
+        Some(Ok(false))
+    }
+
+    /// Run compiled code with these argument words: its result bits, or
+    /// the exception it unwound with.
+    #[inline(always)]
+    fn enter_native_code(&mut self, jf: &crate::jit::JitFn, argv: *const u64) -> Result<u64, Value> {
         let ctx = crate::jit::ctx();
         let r = unsafe {
-            (*ctx).depth = self.frames.len() as u32;
-            (jf.entry)(ctx, argv.as_ptr())
+            (*ctx).depth = (self.frames.len() as u32).max((*ctx).base_depth);
+            // The VM doesn't move, nor do its global vectors grow, while it runs.
+            if (*ctx).vm != self as *mut Vm || (*ctx).global_values != self.global_values.as_mut_ptr() {
+                (*ctx).vm = self as *mut Vm;
+                (*ctx).global_scalars = self.global_scalars.as_mut_ptr();
+                (*ctx).global_values = self.global_values.as_mut_ptr();
+            }
+            (jf.entry)(ctx, argv)
         };
         let status = unsafe { (*ctx).status };
         if status != 0 {
             unsafe { (*ctx).status = 0 };
-            return Some(Err(if status == crate::jit::STATUS_OVERFLOW {
+            return Err(if status == crate::jit::STATUS_EXCEPTION {
+                crate::jit::take_exception()
+            } else if status == crate::jit::STATUS_OVERFLOW {
                 self.range_error("Maximum call stack size exceeded".into())
             } else if status == crate::jit::STATUS_THROW {
                 let (cid, args) = crate::jit::take_throw();
@@ -599,17 +785,38 @@ impl Vm {
             } else {
                 let m = crate::jit::take_error();
                 self.type_error(m)
-            }));
+            });
         }
-        match ci.output {
-            Some((Kind::Val, d)) => self.values[vb + d as usize] = jf.ret_value(r),
-            Some((_, d)) => self.scalars[sb + d as usize] = r,
-            None => drop(jf.ret_value(r)),
+        Ok(r)
+    }
+
+    /// Call compiled function `fid` with values, if it is compiled and the
+    /// arguments are values it takes. None: use the interpreter.
+    fn call_native_values(&mut self, fid: u32, this: &Value, args: &[Value]) -> Option<Result<Value, Value>> {
+        use crate::jit::{JitFn, JV};
+        let func = self.code(fid);
+        let jf = func.jit.as_deref()?;
+        if args.len() != jf.params.len() || args.len() > 15 {
+            return None;
         }
-        // Compiled code pushed no frames: take the safepoint here, with
-        // every value back in a slot.
-        self.safepoint();
-        Some(Ok(false))
+        let mut argv = [0u64; 32];
+        let mut i = 0;
+        if jf.this {
+            argv[0] = JitFn::arg_bits(JV::Obj, this)?;
+            i = 1;
+        }
+        for (a, &k) in args.iter().zip(&jf.params) {
+            if k == JV::Val {
+                let [t, p] = JitFn::val_words(a);
+                argv[i] = t;
+                argv[i + 1] = p;
+                i += 2;
+            } else {
+                argv[i] = JitFn::arg_bits(k, a)?;
+                i += 1;
+            }
+        }
+        Some(self.enter_native_code(jf, argv.as_ptr()).map(|r| jf.ret_value(r)))
     }
 
     /// Release a popped frame's slots: deterministic destruction. Borrowed
@@ -740,6 +947,7 @@ impl Vm {
             for sh in &this.prog.shapes {
                 crate::runtime::trace_shape(sh, t);
             }
+            crate::jit::trace_roots(t);
         });
     }
 
