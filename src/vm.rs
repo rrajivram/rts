@@ -556,7 +556,7 @@ impl Vm {
     /// None: use the interpreter.
     #[inline(never)]
     fn call_native_code(&mut self, jf: &crate::jit::JitFn, func: &FunctionCode, ci: &CallSite, this: Option<&Value>, sb: usize, vb: usize) -> Option<Result<bool, Value>> {
-        use crate::jit::{JitFn, JK};
+        use crate::jit::{JitFn, JV};
         let n = func.params.len();
         if ci.has_spread || ci.args.len() != n || n > 15 || ci.args.iter().zip(&func.params).any(|(a, p)| a.0 != *p) {
             return None;
@@ -570,13 +570,13 @@ impl Vm {
         let mut argv = [0u64; 16];
         let mut i = 0;
         if jf.this {
-            argv[0] = JitFn::arg_bits(JK::Ref, this.unwrap_or(&Value::Undef))?;
+            argv[0] = JitFn::arg_bits(JV::Obj, this.unwrap_or(&Value::Undef))?;
             i = 1;
         }
         for (&(_, r), &k) in ci.args.iter().zip(&jf.params) {
             argv[i] = match k {
-                JK::Ref => JitFn::arg_bits(k, &self.values[vb + r as usize])?,
-                _ => self.scalars[sb + r as usize],
+                JV::Num | JV::Bool => self.scalars[sb + r as usize],
+                _ => JitFn::arg_bits(k, &self.values[vb + r as usize])?,
             };
             i += 1;
         }
@@ -590,6 +590,12 @@ impl Vm {
             unsafe { (*ctx).status = 0 };
             return Some(Err(if status == crate::jit::STATUS_OVERFLOW {
                 self.range_error("Maximum call stack size exceeded".into())
+            } else if status == crate::jit::STATUS_THROW {
+                let (cid, args) = crate::jit::take_throw();
+                let c = Value::Class(self.prog.classes[cid as usize].clone());
+                match self.construct(&c, args.iter().map(|s| Value::str(s.to_string())).collect()) {
+                    Ok(e) | Err(e) => e,
+                }
             } else {
                 let m = crate::jit::take_error();
                 self.type_error(m)
