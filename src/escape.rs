@@ -791,7 +791,10 @@ impl<'a> Fa<'a> {
         }
         let esc = self.escaped();
         let other = self.escaped_other();
+        // At least one returned object must be allocated here: a function
+        // returning only primitives has nothing for a caller's region.
         let fresh = !self.ret_unknown
+            && !self.ret.is_empty()
             && self.ret.iter().all(|&r| !Self::is_param(r) && !other.contains(&r));
         let mut p = vec![ParamSum::default(); self.n_params];
         for (j, ps) in p.iter_mut().enumerate() {

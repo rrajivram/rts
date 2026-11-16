@@ -1,7 +1,14 @@
 # rts
 
-rts is a TypeScript runtime written in Rust. It has **no garbage collector**
-and **uses static types to choose storage and instructions ahead of time**.
+rts is a TypeScript runtime written in Rust. It has **no tracing garbage
+collector**: memory is freed by scope where the compiler can prove it, by
+reference counting elsewhere, and by a cycle collector for garbage cycles. It
+also **uses static types to choose storage and instructions ahead of time**.
+
+The project tests a thesis: *scope-based memory management beats a tracing
+GC.* The same engine can be built with a tracing GC instead, so the
+comparison changes nothing but the memory strategy. See
+[Memory: does scope-based management pay off?](#memory-does-scope-based-management-pay-off).
 
 This is a proof of concept. It runs TypeScript (and plain JavaScript)
 directly from source, with no transpile step: ES modules and CommonJS,
@@ -17,7 +24,13 @@ cargo build --release
 tests/run.sh                              # conformance tests (compared against Node)
 bench/run.py                              # benchmarks vs node, node --jitless, rjs
 bench/types.py                            # typed vs --no-types on the same engine
+bench/awfy/compare.sh                     # Are-We-Fast-Yet suite: output must match Node
+python3 bench/modes.py                    # memory modes: arenas / RC / GC / Node
 ```
+
+Memory flags: `--mem-stats` (heap, arena and collector statistics on exit),
+`--no-arena` (no scope arenas), `--no-cycles` (no cycle collector). The
+tracing-GC build is `cargo build --release --features gc --target-dir target/gc`.
 
 ## How it works
 
@@ -180,6 +193,132 @@ without types:
 
 The last one is the 2.9× on `closures`.
 
+## Memory: does scope-based management pay off?
+
+**The thesis:** freeing memory by scope, falling back to reference counting
+where scope can't be proven, beats a tracing garbage collector.
+
+### Method
+
+**One engine, four memory strategies.** Only the memory strategy changes;
+the instructions are identical.
+
+| configuration | how memory is freed |
+|---|---|
+| **RC + arenas** (default) | scope arenas where escape analysis proves it, reference counting elsewhere, cycle collector for garbage cycles |
+| **RC, no arenas** (`--no-arena`) | reference counting and cycle collector only |
+| **RC, no cycle collector** (`--no-cycles`) | reference counting only (cycles leak) |
+| **tracing GC** (`--features gc`) | mark-sweep; counts are not maintained at all |
+
+**Workloads.**
+- The Are-We-Fast-Yet suite, ported to typed TypeScript (`bench/awfy/ts`).
+  The ports run on Node unchanged, and rts's output matches Node's
+  byte-for-byte.
+- A request-loop workload, `bench/workloads/requests.ts`.
+
+**Measurement.**
+- Time is the harness's own measurement, so start-up isn't included. Each
+  figure is the median of 3 runs on an Apple M-series machine.
+- RSS is the process maximum.
+- Node (V8 with JIT) and `node --jitless` (V8's interpreter) are reference
+  points only. They differ in far more than memory management.
+
+To reproduce:
+
+    cargo build --release && cargo build --release --features gc --target-dir target/gc
+    SUITE=ts python3 bench/modes.py
+
+### Results: time
+
+| benchmark | objects | in arenas | RC+arenas | RC, no arenas | tracing GC | node --jitless | node (JIT) |
+|---|--:|--:|--:|--:|--:|--:|--:|
+| Bounce | 153,432 | 2% | 0.63 s | 0.63 s | 0.56 s | 0.54 s | 0.021 s |
+| CD | 3,234,456 | 39% | 1.36 s | 1.39 s | 1.11 s | 0.76 s | 0.048 s |
+| DeltaBlue | 1,081,066 | 0% | 0.38 s | 0.38 s | 0.32 s | 0.19 s | 0.037 s |
+| Havlak | 10,068,269 | 0% | 1.97 s | 1.97 s | 1.61 s | 0.92 s | 0.091 s |
+| Json | 3,331,032 | 0% | 0.78 s | 0.78 s | 0.69 s | 0.35 s | 0.030 s |
+| List | 46,932 | 99% | 0.81 s | 0.82 s | 0.62 s | 0.34 s | 0.024 s |
+| Mandelbrot | 432 | 0% | 0.18 s | 0.18 s | 0.18 s | 0.27 s | 0.018 s |
+| NBody | 250,442 | 0% | 0.36 s | 0.35 s | 0.33 s | 0.57 s | 0.072 s |
+| Permute | 1,433 | 0% | 0.86 s | 0.86 s | 0.66 s | 0.65 s | 0.029 s |
+| Queens | 40,436 | 0% | 0.75 s | 0.75 s | 0.63 s | 0.42 s | 0.021 s |
+| Richards | 1,392 | 0% | 0.71 s | 0.71 s | 0.56 s | 0.27 s | 0.014 s |
+| Sieve | 3,432 | 0% | 0.66 s | 0.66 s | 0.57 s | 0.54 s | 0.037 s |
+| Storage | 5,462,432 | 0% | 0.86 s | 0.86 s | 0.75 s | 0.35 s | 0.035 s |
+| Towers | 9,433 | 0% | 0.91 s | 0.90 s | 0.72 s | 0.55 s | 0.026 s |
+
+### Results: peak memory and pauses
+
+| benchmark | RC+arenas | RC, no cycle collector | tracing GC | node --jitless | max pause RC | max pause GC |
+|---|--:|--:|--:|--:|--:|--:|
+| Bounce | 15 MB | 15 MB | 23 MB | 52 MB | 0.0 ms | 1.1 ms |
+| CD | 17 MB | 130 MB | 23 MB | 60 MB | 1.1 ms | 1.2 ms |
+| DeltaBlue | 42 MB | 37 MB | 51 MB | 79 MB | 5.5 ms | 3.3 ms |
+| Havlak | 71 MB | 119 MB | 52 MB | 118 MB | 14.2 ms | 4.3 ms |
+| Json | 17 MB | 16 MB | 24 MB | 52 MB | 0.1 ms | 1.8 ms |
+| List | 15 MB | 15 MB | 21 MB | 47 MB | 0.0 ms | 0.0 ms |
+| Mandelbrot | 15 MB | 15 MB | 15 MB | 48 MB | 0.0 ms | 0.0 ms |
+| NBody | 15 MB | 15 MB | 23 MB | 47 MB | 0.0 ms | 1.3 ms |
+| Permute | 15 MB | 15 MB | 15 MB | 46 MB | 0.0 ms | 0.0 ms |
+| Queens | 16 MB | 15 MB | 22 MB | 48 MB | 0.1 ms | 0.7 ms |
+| Richards | 15 MB | 15 MB | 15 MB | 47 MB | 0.0 ms | 0.0 ms |
+| Sieve | 15 MB | 15 MB | 22 MB | 48 MB | 0.0 ms | 0.2 ms |
+| Storage | 16 MB | 16 MB | 22 MB | 60 MB | 0.1 ms | 1.0 ms |
+| Towers | 16 MB | 15 MB | 16 MB | 46 MB | 0.0 ms | 0.0 ms |
+
+### Results: request loop (100,000 requests)
+
+| configuration | mean | p50 | p99 | p99.9 | max | RSS |
+|---|--:|--:|--:|--:|--:|--:|
+| RC + arenas | 25.7 µs | 28.5 µs | 47 µs | **107 µs** | 140 µs | 12.8 MB |
+| RC, no arenas | 25.5 µs | 28.3 µs | 47 µs | 105 µs | 134 µs | 12.7 MB |
+| RC, no cycle collector | 25.7 µs | 28.7 µs | 47 µs | 54 µs | 136 µs | 10.8 MB |
+| tracing GC | 25.6 µs | 23.5 µs | 40 µs | **1,424 µs** | 1,822–4,358 µs | 20.1 MB |
+| node (JIT) | 7.8 µs | 8.6 µs | 15 µs | 26 µs | 152 µs | 97 MB |
+
+In this workload, 5.6 million of the 31 million objects (18%) were allocated
+in scope arenas, and none outlived its scope.
+
+### What the numbers say
+
+1. **Determinism wins on tail latency.** Average throughput is the same with
+   either strategy. At p99.9, though, a request under the tracing GC
+   sometimes waits through a collection: 1.4 ms, 13× worse than reference
+   counting. With reference counting the slowest requests stay near
+   100–140 µs, and the remaining tail comes from the cycle collector:
+   without it, p99.9 is 54 µs.
+2. **Reference counting uses less memory.** Peak RSS is 18% lower than the
+   tracing GC across the suite (geometric mean), because garbage is freed
+   immediately instead of when the heap has doubled. The exception is
+   Havlak (71 MB against 52 MB), where the cycle collector's candidate buffer
+   holds dead boxes until the next collection. rts as a whole uses 3–6× less
+   memory than Node.
+3. **Reference counting costs throughput.** Across the suite it is 18%
+   slower than the tracing GC (geometric mean; 5–29% per benchmark). A
+   profile of Havlak attributes about 19% of time to count updates when
+   values are copied and dropped. The cycle collector adds 0–8%.
+4. **Scope arenas, as implemented, have no measurable effect.** The run time
+   ratio is 1.00 (geometric mean). Arenas take 99% of List's objects, 39% of
+   CD's and 18% of the request loop's, yet time, peak memory and latency are
+   unchanged. Two reasons:
+   - Freeing an object whose count reaches zero is already cheap and
+     immediate, so a bump-allocated arena saves only the malloc/free pair.
+   - Count updates still happen on arena objects.
+
+   The analysis also finds little to bind. Idiomatic code mostly stores new
+   objects into fields and collections (`this.items.push(x)`,
+   `node.next = n`), and the analysis can't prove those safe without
+   ownership information. Factory methods (`a.minus(b)`) are handled by
+   result regions; that is where CD's 39% comes from.
+
+**Verdict, as of this commit.** The deterministic half of the thesis holds:
+predictable latency and lower peak memory, at roughly 18% of throughput.
+Scope-based freeing on top of reference counting does not yet pay for itself.
+For it to matter, scope knowledge has to remove work that reference counting
+does: skipping count updates for values the compiler knows are scope-bound,
+and moving ownership of private fields into the owner's region. Those are
+the next experiments (see [Next steps](#next-steps)).
+
 ## Supported TypeScript and Node
 
 Everything in `tests/programs/` runs with output identical to Node
@@ -260,8 +399,6 @@ microtask ordering.
 - Decorators, `enum`-less `declare` ambient modules' contents (they are
   skipped), `with`, `eval`/`new Function`, `Proxy`, `Reflect`, and
   property attributes (`enumerable: false`, real freezing).
-- Prototype chains on plain objects (`Object.create(proto)` copies),
-  `new` on a class value of unknown type.
 - `Buffer`, `TextEncoder`/`TextDecoder`, `URL`, `fetch`, `http`, `net`,
   `child_process`, `worker_threads`, `Intl`.
 - Stack traces: errors have no `stack` contents and `console.log(err)`
@@ -274,29 +411,28 @@ microtask ordering.
 
 ## Next steps
 
-Roughly in order of what's needed to run real npm packages:
+For the memory thesis:
+
+1. **Owned sub-objects.** A constructor's own allocations
+   (`this.items = new Array()`) could live in the region of the object being
+   built. The open problem is bounding growth when a long-lived object keeps
+   replacing such a field.
+2. **Container-aware analysis.** `Vector.append(x)` currently makes `x`
+   escape: the analysis can't prove the backing array isn't shared. Ownership
+   of private fields would fix that.
+3. **Cheaper counting.** Most count traffic is slot-to-slot copies that the
+   compiler could prove redundant (borrowing a value for the duration of a
+   call).
+
+For running npm packages:
 
 1. **`Buffer`, `TextEncoder`, `URL`, `fetch`/`http`.** Most packages that do
    I/O need at least `Buffer`. `node:fs` currently reads and writes strings.
-2. **Error locations.** Uncaught errors have no stack trace yet. A pc → source
-   line table is reserved (`FuncCode::lines`); `Error.stack` should be
-   filled from it.
-3. **Reference cycles.** In order:
-   1. Static analysis of the class field graph, since most types cannot form
-      cycles.
-   2. Inferred `weak` back-references (parent pointers).
-   3. A trial-deletion cycle collector limited to cycle-capable types.
-4. **Prototype chains and property attributes** for plain objects
-   (`Object.create(proto)`, `defineProperty` with `enumerable`/`writable`),
-   `Proxy`/`Reflect`, decorators.
-5. **Unboxed object fields.** Store `number` fields as `f64` in the object
-   layout. Today `ReadFieldNumber` pays a `RefCell` borrow and a tag check, which is
-   the main cost in `nbody`.
-6. **Faster calls.** Calls cost about 30ns. To reduce that: inline small
-   non-recursive functions (the HOF inliner already does this for callbacks),
-   use a slimmer frame layout, and use direct-threaded dispatch.
-7. **`.d.ts` files.** npm packages ship JS plus declarations. JS already
-   runs (untyped); types from `.d.ts` files would give typed boundaries.
+2. **Error locations.** Uncaught errors have no stack trace yet.
+3. **Property attributes, `Proxy`/`Reflect`, decorators.**
+4. **`.d.ts` files.** npm packages ship JS plus declarations. JS already
+   runs (untyped); types from `.d.ts` files would give typed boundaries, and
+   with them escape analysis across package boundaries.
 
 ## Layout
 
@@ -312,9 +448,16 @@ Roughly in order of what's needed to run real npm packages:
 | `src/disasm.rs` | `--dump`: instructions with slots shown by variable name |
 | `src/vm.rs` | the interpreter |
 | `src/vm_task.rs` | generators, async functions, promises, the event loop, iteration |
+| `src/escape.rs` | escape analysis: which allocations are scope-bound, and result regions |
+| `src/runtime/heap.rs` | `Gc<T>`, the box header, `Trace`, the counting allocator, `--mem-stats` |
+| `src/runtime/arena.rs` | scope arenas (bump allocation on the `Allocator` trait) |
+| `src/runtime/cycles.rs` | the cycle collector (Bacon–Rajan trial deletion) |
+| `src/runtime/gc.rs` | the tracing mark-sweep GC (`--features gc`), the baseline |
+| `src/runtime/trace.rs` | `Trace` for every heap type |
 | `src/runtime/` | values, objects, shapes, `inspect`, natives, BigInt arithmetic (`bigint.rs`), regular expressions (`regexp.rs`), coroutine and promise types (`task.rs`) |
 | `src/prelude.ts`, `src/prelude_date.ts` | built-in classes written in TypeScript (`Error` family; `Date`, compiled only when used) |
 | `src/node/` | Node built-in modules in TypeScript, and their natives (`natives.rs`) |
 | `tests/programs/` | programs whose output must match Node |
 | `tests/rts/` | rts-specific behaviour (checked `any` boundaries) |
-| `bench/` | benchmarks and runner |
+| `bench/` | benchmarks and runners (`modes.py`: memory modes) |
+| `bench/awfy/` | the Are-We-Fast-Yet suite: upstream JavaScript (`js/`) and typed ports (`ts/`) |

@@ -15,7 +15,7 @@ target/gc/release = `cargo build --release --features gc --target-dir target/gc`
     node       Node.js (V8, JIT)
     jitless    node --jitless (V8's interpreter)
 """
-import os, re, statistics, subprocess, sys
+import os, re, shutil, statistics, subprocess, sys, tempfile
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 RC = os.path.join(ROOT, "target/release/rts")
@@ -38,10 +38,29 @@ if BASE:
 SUITE = os.environ.get("SUITE", "ts")  # ts: typed ports; js: upstream JavaScript
 AWFY = os.path.join(ROOT, "bench/awfy", SUITE)
 HARNESS = "harness.ts" if SUITE == "ts" else "harness.js"
-# AWFY at a fixed size that runs ~0.1-2 s in rts (inner iterations).
-SIZES = {"Bounce": 100, "CD": 100, "DeltaBlue": 2000, "Havlak": 1, "Json": 10, "List": 100,
-         "Mandelbrot": 500, "NBody": 250000, "Permute": 100, "Queens": 100, "Richards": 5,
-         "Sieve": 300, "Storage": 50, "Towers": 50}
+# Inner iterations: the suite's standard sizes, except Richards and Havlak,
+# which are cut so an interpreter finishes in a few seconds (Havlak verifies
+# only at 1, 15, 150, ...).
+SIZES = {"Bounce": 1500, "CD": 250, "DeltaBlue": 12000, "Havlak": 1, "Json": 100, "List": 1500,
+         "Mandelbrot": 500, "NBody": 250000, "Permute": 1000, "Queens": 1000, "Richards": 20,
+         "Sieve": 3000, "Storage": 1000, "Towers": 600}
+
+
+def node_copy():
+    """Node can't strip TypeScript without WebAssembly (so not with --jitless):
+    give it a type-stripped copy of the typed suite, imports renamed to .js."""
+    if SUITE != "ts":
+        return AWFY, "harness.js"
+    out = tempfile.mkdtemp(prefix="rts-awfy-")
+    strip = ("const m=require('node:module'),fs=require('fs'),path=require('path');"
+             "const [src,dst]=process.argv.slice(1);"
+             "for(const f of fs.readdirSync(src)){if(!f.endsWith('.ts'))continue;"
+             "let js=m.stripTypeScriptTypes(fs.readFileSync(path.join(src,f),'utf8'));"
+             "js=js.replace(/from '(\\.\\/[^']+)\\.ts'/g,\"from '$1.js'\");"
+             "fs.writeFileSync(path.join(dst,f.replace(/\\.ts$/,'.js')),js);}"
+             "fs.writeFileSync(path.join(dst,'package.json'),'{\"type\":\"module\"}');")
+    subprocess.run(["node", "-e", strip, AWFY, out], check=True)
+    return out, "harness.js"
 
 
 def programs():
@@ -49,7 +68,7 @@ def programs():
     want = set(want.split(",")) if want else None
     for b, n in SIZES.items():
         if want is None or b in want:
-            yield b, [HARNESS, b, "1", str(n)], AWFY
+            yield b, [b, "1", str(n)]
 
 
 def run(cmd, cwd):
@@ -59,6 +78,11 @@ def run(cmd, cwd):
     err = p.stderr
     rss = int(re.search(r"(\d+)\s+maximum resident set size", err).group(1))
     wall = float(re.search(r"([\d.]+) real", err).group(1))
+    m = re.search(r"runtime: (\d+)us", p.stdout)
+    if m:
+        # The harness's own measurement: the benchmark only, without
+        # start-up and compilation.
+        wall = int(m.group(1)) / 1e6
     stats = {}
     for key, pat in [("heap", r"peak heap\s+([\d.]+) MB"), ("pauses", r"pauses\s+(\d+)"),
                      ("pause_max", r"max ([\d.]+) ms\)"), ("pause_total", r"total ([\d.]+) ms"),
@@ -74,8 +98,12 @@ def main():
     import json
     configs = os.environ.get("CONFIGS", ",".join(CONFIGS)).split(",")
     rows = []
-    for name, args, cwd in programs():
+    node_dir, node_harness = node_copy() if any(c in ("node", "jitless") for c in configs) else (AWFY, HARNESS)
+    for name, bargs in programs():
         for c in configs:
+            is_node = c in ("node", "jitless")
+            cwd = node_dir if is_node else AWFY
+            args = [node_harness if is_node else HARNESS] + bargs
             walls, rsss, last = [], [], {}
             try:
                 for _ in range(N):

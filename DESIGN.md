@@ -140,19 +140,132 @@ around them. Monomorphization can come later.
 - A call to a top-level function that is never reassigned compiles to
   a `Call` with `CallTarget::Direct`, with no closure lookup.
 
-## Memory: no tracing GC
+## Memory: scopes first, counts second, no tracing GC
 
-- Heap values (strings, arrays, objects, closures) are `Rc`. They are freed
-  deterministically when the last reference goes away.
-- Numbers and booleans in typed code never touch the heap or a refcount.
-- **Known gap:** reference cycles leak. Examples are a doubly linked list, a
-  parent pointer, or a closure stored in a variable it captures. Planned
-  mitigations, in order:
-  1. Static cycle analysis over the class field graph. Most types provably cannot
-     form cycles and need nothing.
-  2. Weak back-references, inferred or annotated.
-  3. A trial-deletion cycle collector (Bacon–Rajan) restricted to
-     cycle-capable types.
+The thesis rts tests: memory managed by scope (and, where scope can't be
+proven, by reference counting) is better than a tracing garbage collector.
+Three mechanisms, from most to least static:
+
+1. **Scope arenas** (`src/escape.rs`, `src/runtime/arena.rs`). A whole-program
+   escape analysis finds allocations that can never outlive a block. Those are
+   bump-allocated in the block's arena and freed together when the block
+   exits. Their reference counts are never what frees them.
+2. **Reference counting** (`src/runtime/heap.rs`). Every other heap value is a
+   `Gc<T>` with a count, freed the moment the count reaches zero.
+3. **Cycle collection** (`src/runtime/cycles.rs`). Reference counting can't
+   free garbage cycles. Boxes that might head one are buffered, and a
+   trial-deletion collector (Bacon & Rajan 2001) checks them at safepoints.
+
+A tracing mark-sweep GC (`src/runtime/gc.rs`, `cargo build --features gc`)
+exists only as the baseline for the comparison.
+
+Numbers and booleans in typed code never touch the heap at all: they live
+unboxed in number slots.
+
+### The heap pointer
+
+`Gc<T>` is rts's own pointer, not `std::rc::Rc`. On stable Rust, `Rc` can't
+take a custom allocator (`Rc::new_in` is unstable), but the `Allocator` trait,
+`Box::new_in` and `Vec::new_in` are stable. Every box is a 16-byte header plus
+the value:
+
+| field | |
+|---|---|
+| `rc: u32` | the count (arena boxes count from `ARENA_COUNT`, 2³⁰) |
+| `flags: u32` | acyclic, buffered, arena, dead, two colour bits, mark bit |
+| `vt: &VTable` | per-type `trace`, `drop` and `Layout`, for type-erased boxes |
+
+Boxes are allocated through `Allocator`: `Global` for the heap, an `Arena` for
+scope-bound objects. The process allocator is a counting wrapper around
+`System`, so `--mem-stats` reports exact live and peak heap bytes. The slot
+stacks are reserved straight from the system allocator: they are address
+space, not heap.
+
+`Trace` (`src/runtime/trace.rs`) lists every `Gc` pointer a value holds. Both
+collectors use it. One subtlety: containers shared through a plain `Rc`, such
+as a `Shape` holding a prototype, hold one counted reference however many
+boxes share them. The cycle collector must not see their pointers (it would
+subtract the reference once per sharer); the tracing GC must.
+
+### Escape analysis
+
+The analysis runs on the HIR after type checking. It is flow-insensitive
+points-to over allocation sites, one function at a time:
+
+- **Points-to sets.** Each local variable gets the set of sites it may hold.
+  Each site gets the set of sites stored into it (its *contents*,
+  field-insensitive).
+- **What makes a site escape.** Being stored in a global, a captured variable
+  or an unknown object, or being passed to an unknown callee, thrown or
+  yielded. A value read out of an object may also be something the analysis
+  never saw, so storing into such a value counts as an escape.
+- **Calls.** A call to a known function uses that function's *summary*: for
+  each parameter, whether it escapes, whether it may come back as the result,
+  and which other parameters' objects it is stored into. Summaries are
+  computed to a whole-program fixpoint; if it doesn't settle, every summary
+  becomes "everything escapes". A virtual call joins the summaries of all
+  overrides. Built-ins come from a table, and anything not in it makes its
+  arguments escape.
+- **Region choice.** A site that doesn't escape is bound to the innermost
+  block enclosing every variable and container it can reach. It stays on the
+  heap if a loop body lies between the allocation and that block, because
+  the arena would otherwise grow with each iteration.
+- **Result regions** (region polymorphism). Suppose every value a function
+  returns is one of its own fresh allocations, as with `plus()`, `minus()`
+  or `times()`. Then each call to it is treated as an allocation site in the
+  caller, and the caller picks the region. At run time the call passes a
+  region index (`CallSite.region`), and the callee's returned objects are
+  allocated there (`New*In { up: RESULT_REGION }`). Without a passed region
+  they go to the heap. `return f(...)` passes the caller's region on.
+
+Codegen gives each chosen block `EnterRegion` / `ExitRegion`. The exit first
+clears every slot the block used (its variables and temporaries) and then
+resets the arena. `break`, `continue`, `catch` and an inlined `return` leave
+regions with `ExitRegionsTo`, and a frame's regions die with the frame.
+
+**Checked, not trusted.** Each arena box counts from `ARENA_COUNT + 1`. At
+reset, every value is dropped, newest first and repeated until nothing
+changes, and each box's count must come back to `ARENA_COUNT`. A box that is
+still referenced indicates an analysis bug. Its memory is then deliberately
+leaked rather than freed, and counted (`outlived their scope` in
+`--mem-stats`; `RTS_ARENA_CHECK=1` reports each case). So a wrong analysis
+can cost memory but never cause a use-after-free. Every test and benchmark
+reports 0.
+
+### Cycle collection
+
+A decrement that leaves a count above zero buffers the box as a possible
+cycle root, unless its type can't form a cycle. That covers leaf types
+(strings, BigInts, regexes, symbols) and instances of classes whose fields
+are all primitive. The checker computes the class property (`HClass::acyclic`);
+a dynamic write of an object into such an instance clears the flag.
+
+When the buffer fills, the collector first purges dead and re-incremented
+entries, which is cheap. It runs the three trial-deletion phases (mark gray,
+scan, collect white) only if enough live candidates remain. Before freeing
+the white boxes, it restores the counts that trial deletion subtracted from
+live children. Otherwise freeing would subtract them a second time.
+
+Collection runs only at safepoints: right after a frame is pushed, when no
+heap value is mutably borrowed. A `RefCell` that is borrowed anyway is treated
+as opaque, which is conservative: its children just look externally referenced.
+
+### Tracing GC (baseline)
+
+With `--features gc`, `clone` and `drop` of a `Gc` do nothing and every box
+is on an intrusive list. When live bytes reach twice what survived the last
+collection (8 MB minimum), the next safepoint marks from the roots and sweeps
+the list.
+
+- **Roots:** the active slot stacks, globals, frame closures, running
+  coroutines, the event loop's jobs and timers, and constants.
+- **Native code:** a native that calls back into the VM may hold values in
+  Rust locals, so collection waits until such calls return (`gc_block`).
+- **Event-loop jobs:** each job roots what it holds and then runs its
+  callbacks with collection allowed.
+- **Stress settings:** `RTS_GC_MIN_HEAP=0` collects at every safepoint, and
+  `RTS_CC_THRESHOLD=1` does the same for the cycle collector. The tests pass
+  under both.
 
 ## Modules
 

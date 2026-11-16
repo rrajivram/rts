@@ -72,7 +72,16 @@ impl Arena {
     }
 
     /// The region exits: drop every box's value and recycle the chunks.
+    #[inline]
     pub fn reset(&self) {
+        if self.cur.get() == 0 {
+            return; // nothing was allocated
+        }
+        self.reset_slow();
+    }
+
+    #[inline(never)]
+    fn reset_slow(&self) {
         let mut boxes = self.boxes.borrow_mut();
         if !boxes.is_empty() {
             STATS.arena_resets.set(STATS.arena_resets.get() + 1);

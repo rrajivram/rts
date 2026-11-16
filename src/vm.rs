@@ -931,6 +931,7 @@ impl Vm {
                 "Cannot read properties of {} (reading '{name}')",
                 recv.to_display()
             ))),
+            Value::Native(Native::Hrtime) if name == "bigint" => Ok(Value::Native(Native::HrtimeBigint)),
             Value::Func(f) if f.props.borrow().as_ref().is_some_and(|p| p.get(name).is_some()) => {
                 Ok(f.props.borrow().as_ref().unwrap().get(name).unwrap())
             }
