@@ -43,12 +43,12 @@ fn sys_error(vm: &mut Vm, e: std::io::Error, syscall: &str, path: &str) -> Value
 
 pub fn call(vm: &mut Vm, n: Native, _this: Value, args: &[Value]) -> Result<Value, Value> {
     use Native::*;
-    let path = || s(&arg(&args, 0));
+    let path = || s(&arg(args, 0));
     Ok(match n {
         ProcessObject => vm.process_object(),
         ProcessExit => {
             vm.flush();
-            let code = match arg(&args, 0) {
+            let code = match arg(args, 0) {
                 Value::Undef => vm.exit_code(),
                 v => v.to_number() as i32,
             };
@@ -62,7 +62,7 @@ pub fn call(vm: &mut Vm, n: Native, _this: Value, args: &[Value]) -> Result<Valu
             Value::Undef
         }
         StdoutWrite | StderrWrite => {
-            let text = s(&arg(&args, 0));
+            let text = s(&arg(args, 0));
             if n == StdoutWrite {
                 vm.write_out(&text);
             } else {
@@ -75,7 +75,7 @@ pub fn call(vm: &mut Vm, n: Native, _this: Value, args: &[Value]) -> Result<Valu
         Hrtime => {
             // [seconds, nanoseconds], relative to `prev` when given.
             let mut t = vm.start.elapsed().as_nanos() as i128 + 1_000_000_000;
-            if let Value::Arr(ref a) = arg(&args, 0) {
+            if let Value::Arr(ref a) = arg(args, 0) {
                 let get = |i| a.get(i).to_number();
                 t -= get(0) as i128 * 1_000_000_000 + get(1) as i128;
             }
@@ -89,7 +89,7 @@ pub fn call(vm: &mut Vm, n: Native, _this: Value, args: &[Value]) -> Result<Valu
             Err(e) => return Err(sys_error(vm, e, "open", &path())),
         },
         FsWriteFile | FsAppendFile => {
-            let data = s(&arg(&args, 1));
+            let data = s(&arg(args, 1));
             let r = if n == FsWriteFile {
                 std::fs::write(path(), data)
             } else {
@@ -103,7 +103,7 @@ pub fn call(vm: &mut Vm, n: Native, _this: Value, args: &[Value]) -> Result<Valu
         }
         FsExists => Value::Bool(std::path::Path::new(&path()).exists()),
         FsMkdir => {
-            let r = if arg(&args, 1).truthy() { std::fs::create_dir_all(path()) } else { std::fs::create_dir(path()) };
+            let r = if arg(args, 1).truthy() { std::fs::create_dir_all(path()) } else { std::fs::create_dir(path()) };
             if let Err(e) = r {
                 return Err(sys_error(vm, e, "mkdir", &path()));
             }
@@ -137,10 +137,10 @@ pub fn call(vm: &mut Vm, n: Native, _this: Value, args: &[Value]) -> Result<Valu
             let p = path();
             let meta = std::fs::metadata(&p);
             let r = match meta {
-                Ok(m) if m.is_dir() && arg(&args, 1).truthy() => std::fs::remove_dir_all(&p),
+                Ok(m) if m.is_dir() && arg(args, 1).truthy() => std::fs::remove_dir_all(&p),
                 Ok(m) if m.is_dir() => std::fs::remove_dir(&p),
                 Ok(_) => std::fs::remove_file(&p),
-                Err(_) if arg(&args, 2).truthy() => Ok(()),
+                Err(_) if arg(args, 2).truthy() => Ok(()),
                 Err(e) => Err(e),
             };
             if let Err(e) = r {
@@ -149,7 +149,7 @@ pub fn call(vm: &mut Vm, n: Native, _this: Value, args: &[Value]) -> Result<Valu
             Value::Undef
         }
         FsRename | FsCopy => {
-            let (a, b) = (path(), s(&arg(&args, 1)));
+            let (a, b) = (path(), s(&arg(args, 1)));
             let r = if n == FsRename { std::fs::rename(&a, &b) } else { std::fs::copy(&a, &b).map(|_| ()) };
             if let Err(e) = r {
                 return Err(sys_error(vm, e, if n == FsRename { "rename" } else { "copyfile" }, &a));
@@ -177,14 +177,14 @@ pub fn call(vm: &mut Vm, n: Native, _this: Value, args: &[Value]) -> Result<Valu
                 ],
             )
         }
-        UtilFormat => Value::str(format_args(vm, &args)),
+        UtilFormat => Value::str(format_args(vm, args)),
         UtilInspect => {
-            let depth = match arg(&args, 1) {
+            let depth = match arg(args, 1) {
                 Value::Num(d) => d as usize,
                 Value::Null => usize::MAX,
                 _ => 2,
             };
-            Value::str(vm.inspect_depth(&arg(&args, 0), depth))
+            Value::str(vm.inspect_depth(&arg(args, 0), depth))
         }
         EnvObject => {
             let mut keys = Vec::new();
@@ -516,22 +516,22 @@ pub fn call_more(vm: &mut Vm, n: Native, args: &[Value]) -> Result<Value, Value>
         DateNowMs => Value::Num(
             std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0.0, |d| d.as_millis() as f64),
         ),
-        DateOffset => Value::Num(tz_offset(arg(&args, 0).to_number())),
-        DateZoneName => Value::str(tz_name(arg(&args, 0).to_number())),
-        DateParse => Value::Num(parse_date(&s(&arg(&args, 0)))),
-        DeepEqual => Value::Bool(deep_equal(&arg(&args, 0), &arg(&args, 1))),
+        DateOffset => Value::Num(tz_offset(arg(args, 0).to_number())),
+        DateZoneName => Value::str(tz_name(arg(args, 0).to_number())),
+        DateParse => Value::Num(parse_date(&s(&arg(args, 0)))),
+        DeepEqual => Value::Bool(deep_equal(&arg(args, 0), &arg(args, 1))),
         ObjectIs => {
-            let (a, b) = (arg(&args, 0), arg(&args, 1));
+            let (a, b) = (arg(args, 0), arg(args, 1));
             Value::Bool(match (&a, &b) {
                 (Value::Num(x), Value::Num(y)) => (x.is_nan() && y.is_nan()) || (x == y && x.is_sign_negative() == y.is_sign_negative()),
                 _ => a.strict_eq(&b),
             })
         }
-        EncodeUriComponent => Value::str(uri_encode(&s(&arg(&args, 0)), "")),
-        EncodeUri => Value::str(uri_encode(&s(&arg(&args, 0)), ";,/?:@&=+$#")),
+        EncodeUriComponent => Value::str(uri_encode(&s(&arg(args, 0)), "")),
+        EncodeUri => Value::str(uri_encode(&s(&arg(args, 0)), ";,/?:@&=+$#")),
         DecodeUriComponent | DecodeUri => {
             let reserved = if n == DecodeUri { ";,/?:@&=+$#" } else { "" };
-            match uri_decode(&s(&arg(&args, 0)), reserved) {
+            match uri_decode(&s(&arg(args, 0)), reserved) {
                 Some(t) => Value::str(t),
                 None => {
                     let e = vm.make_error_pub("URI malformed".into());
@@ -557,13 +557,13 @@ pub fn call_console_object(vm: &mut Vm, n: Native, args: &[Value]) -> Result<Val
     };
     Ok(match n {
         ConsoleDir => {
-            let line = vm.inspect(&arg(&args, 0));
+            let line = vm.inspect(&arg(args, 0));
             vm.print(&line);
             Value::Undef
         }
         ConsoleGroup => {
             if !args.is_empty() {
-                let line = format_args(vm, &args);
+                let line = format_args(vm, args);
                 vm.print(&line);
             }
             vm.console_indent += 2;
@@ -574,7 +574,7 @@ pub fn call_console_object(vm: &mut Vm, n: Native, args: &[Value]) -> Result<Val
             Value::Undef
         }
         ConsoleAssert => {
-            if !arg(&args, 0).truthy() {
+            if !arg(args, 0).truthy() {
                 let rest = &args[args.len().min(1)..];
                 let msg = if rest.is_empty() { "Assertion failed".to_string() } else { format!("Assertion failed: {}", format_args(vm, rest)) };
                 vm.eprint(&msg);
@@ -582,7 +582,7 @@ pub fn call_console_object(vm: &mut Vm, n: Native, args: &[Value]) -> Result<Val
             Value::Undef
         }
         ConsoleCount => {
-            let l = label(&args);
+            let l = label(args);
             let c = vm.console_counts.entry(l.clone()).or_insert(0);
             *c += 1;
             let line = format!("{l}: {c}");
@@ -590,16 +590,16 @@ pub fn call_console_object(vm: &mut Vm, n: Native, args: &[Value]) -> Result<Val
             Value::Undef
         }
         ConsoleCountReset => {
-            vm.console_counts.remove(&label(&args));
+            vm.console_counts.remove(&label(args));
             Value::Undef
         }
         ConsoleTime => {
             let now = vm.now_ms();
-            vm.console_timers.insert(label(&args), now);
+            vm.console_timers.insert(label(args), now);
             Value::Undef
         }
         ConsoleTimeEnd => {
-            let l = label(&args);
+            let l = label(args);
             if let Some(t) = vm.console_timers.get(&l).copied() {
                 let ms = vm.now_ms() - t;
                 let line = format!("{l}: {:.3}ms", ms);
@@ -608,12 +608,12 @@ pub fn call_console_object(vm: &mut Vm, n: Native, args: &[Value]) -> Result<Val
             Value::Undef
         }
         ConsoleTable => {
-            let t = console_table(vm, &arg(&args, 0));
+            let t = console_table(vm, &arg(args, 0));
             vm.print(&t);
             Value::Undef
         }
         ObjDefineProperty => {
-            let (o, k, d) = (arg(&args, 0), arg(&args, 1), arg(&args, 2));
+            let (o, k, d) = (arg(args, 0), arg(args, 1), arg(args, 2));
             let Value::Obj(target) = &o else {
                 crate::runtime::natives::set_dyn(&o, &k, vm.get_property(&d, "value")?);
                 return Ok(o);
@@ -629,22 +629,22 @@ pub fn call_console_object(vm: &mut Vm, n: Native, args: &[Value]) -> Result<Val
             }
             o
         }
-        ObjCreate => match arg(&args, 0) {
+        ObjCreate => match arg(args, 0) {
             Value::Null => Value::Obj(Object::new(Shape::new_null_proto(vec![]), vec![], None)),
             Value::Obj(ref p) => Value::Obj(Object::new(Shape::with_proto(p.clone()), vec![], None)),
             _ => Value::Obj(Object::new(Shape::new(vec![]), vec![], None)),
         },
-        ObjGetPrototypeOf => match arg(&args, 0) {
+        ObjGetPrototypeOf => match arg(args, 0) {
             Value::Obj(ref o) if o.null_proto() => Value::Null,
             Value::Obj(ref o) if o.proto().is_some() => Value::Obj(o.proto().unwrap()),
             Value::Obj(ref o) if o.class.is_some() => Value::Class(o.class.clone().unwrap()),
             _ => Value::Obj(Object::new(Shape::new(vec![]), vec![], None)),
         },
         ObjSetPrototypeOf => {
-            let o = arg(&args, 0);
+            let o = arg(args, 0);
             if let Value::Obj(ob) = &o {
                 let sh = ob.shape();
-                ob.set_shape(match arg(&args, 1) {
+                ob.set_shape(match arg(args, 1) {
                     Value::Obj(ref p) => sh.reproto(Some(p.clone()), false),
                     Value::Null => sh.reproto(None, true),
                     _ => sh.reproto(None, false),
@@ -654,16 +654,16 @@ pub fn call_console_object(vm: &mut Vm, n: Native, args: &[Value]) -> Result<Val
         }
         ObjIsFrozen => Value::Bool(false),
         ObjHasOwn => {
-            let k = arg(&args, 1).to_js_string();
-            Value::Bool(match arg(&args, 0) {
+            let k = arg(args, 1).to_js_string();
+            Value::Bool(match arg(args, 0) {
                 Value::Obj(ref o) => o.get(&k.s).is_some(),
                 Value::Arr(ref a) => k.s.parse::<usize>().is_ok_and(|i| i < a.len()),
                 _ => false,
             })
         }
         ObjGroupBy => {
-            let items = crate::runtime::natives::iterate(vm, &arg(&args, 0))?;
-            let f = arg(&args, 1);
+            let items = crate::runtime::natives::iterate(vm, &arg(args, 0))?;
+            let f = arg(args, 1);
             let out = Object::new(Shape::new_null_proto(vec![]), vec![], None);
             for (i, x) in items.into_iter().enumerate() {
                 let k = vm.call(&f, Value::Undef, vec![x.clone(), Value::Num(i as f64)])?;
@@ -677,7 +677,7 @@ pub fn call_console_object(vm: &mut Vm, n: Native, args: &[Value]) -> Result<Val
         }
         StrRaw => {
             // String.raw(strings, ...subs)
-            let strings = arg(&args, 0);
+            let strings = arg(args, 0);
             let raw = vm.get_property(&strings, "raw")?;
             let parts = crate::runtime::natives::iterate(vm, &raw)?;
             let mut out = String::new();

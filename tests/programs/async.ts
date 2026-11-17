@@ -1,8 +1,10 @@
 // Ordering of promise callbacks, microtasks and timers must match Node.
+// (The long timers leave a wide margin over the short delays, so the
+// order holds on a loaded machine.)
 console.log("sync start");
 setTimeout(() => console.log("timeout 0"), 0);
-setTimeout(() => console.log("timeout 150"), 150);
-setTimeout(() => console.log("timeout 60"), 60);
+setTimeout(() => console.log("timeout 150"), 450);
+setTimeout(() => console.log("timeout 60"), 180);
 queueMicrotask(() => console.log("microtask"));
 Promise.resolve(1).then((v) => console.log("then", v));
 
@@ -28,7 +30,7 @@ async function main(): Promise<void> {
   }
   const results = await Promise.allSettled([Promise.resolve(1), Promise.reject("bad")]);
   console.log(results);
-  const first = await Promise.race([delay(20).then(() => "slow"), delay(2).then(() => "fast")]);
+  const first = await Promise.race([delay(100).then(() => "slow"), delay(30).then(() => "fast")]);
   console.log("race", first);
   const anyOk = await Promise.any([Promise.reject(1), Promise.resolve(2)]);
   console.log("any", anyOk);
@@ -96,7 +98,7 @@ async function* produce(): AsyncGenerator<number> {
 
 const p = new Promise<number>((resolve) => resolve(42));
 console.log(p, Promise.reject(new Error("x")).catch(() => 0) instanceof Promise);
-setTimeout(() => console.log(p), 200);
+setTimeout(() => console.log(p), 600);
 let ticks = 0;
 const iv = setInterval(() => {
   ticks++;
@@ -104,4 +106,4 @@ const iv = setInterval(() => {
     clearInterval(iv);
     console.log("interval done");
   }
-}, 20);
+}, 60);

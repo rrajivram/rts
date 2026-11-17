@@ -727,6 +727,9 @@ impl Vm {
         vb: usize,
     ) -> Option<Result<bool, Value>> {
         use crate::jit::{JitFn, JV};
+        if !crate::jit::ready(jf) {
+            return None;
+        }
         let n = func.params.len();
         if ci.has_spread || ci.args.len() != n || n > 15 || ci.args.iter().zip(&func.params).any(|(a, p)| a.0 != *p) {
             return None;
@@ -789,7 +792,7 @@ impl Vm {
                 (*ctx).global_scalars = self.global_scalars.as_mut_ptr();
                 (*ctx).global_values = self.global_values.as_mut_ptr();
             }
-            (jf.entry)(ctx, argv)
+            (jf.entry.get().unwrap())(ctx, argv)
         };
         let status = unsafe { (*ctx).status };
         if status != 0 {
@@ -818,6 +821,9 @@ impl Vm {
         use crate::jit::JitFn;
         let func = self.code(fid);
         let jf = func.jit.as_deref()?;
+        if !crate::jit::ready(jf) {
+            return None;
+        }
         // Extra arguments (a callback's index and array, say) are dropped.
         if args.len() < jf.params.len() || jf.params.len() > 15 {
             return None;

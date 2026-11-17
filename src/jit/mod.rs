@@ -109,6 +109,7 @@ pub use helpers::no_arenas;
 #[cfg(feature = "gc")]
 pub use helpers::trace_roots;
 pub use lower::compile;
+pub(crate) use lower::ready;
 #[cfg(feature = "profile")]
 pub use rcsites::rc_sites_report;
 
@@ -264,7 +265,13 @@ impl JV {
 /// A compiled function, as the interpreter calls it.
 #[derive(Debug)]
 pub struct JitFn {
-    pub entry: Entry,
+    /// The function's id.
+    pub fid: u32,
+    /// Its entry point, once compiled (see `lower::ready`).
+    pub entry: std::cell::Cell<Option<Entry>>,
+    /// Calls before it was compiled, and how many it waits for.
+    pub calls: std::cell::Cell<u32>,
+    pub warm: u32,
     /// Takes its closure's cells (`Closure::caps`) as its first argument.
     pub env: bool,
     /// Takes the arena for its result next (0: the heap).
@@ -383,6 +390,11 @@ fn peek_ref(r: u64, k: JV) -> std::mem::ManuallyDrop<Value> {
 static mut ENABLED: bool = true;
 
 /// `--no-jit`.
+/// Whether native code is on (`--no-jit` turns it off).
+pub fn enabled() -> bool {
+    unsafe { ENABLED }
+}
+
 pub fn disable() {
     unsafe { ENABLED = false };
 }

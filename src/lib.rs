@@ -47,7 +47,13 @@ pub fn compile_file(path: &std::path::Path, src: String, erase_types: bool) -> R
         // arenas as the interpreter (its sites are keyed by HIR address).
         let escape = escape::analyze(&hir);
         let mut prog = codegen::compile(&hir, &escape);
-        jit::compile(&hir, &mut prog, &escape);
+        // Native code is compiled lazily, as functions get called: the
+        // compiler keeps the program's HIR for as long as it runs.
+        if jit::enabled() {
+            let hir: &'static hir::HProgram = Box::leak(Box::new(hir));
+            let escape: &'static escape::EscapeInfo = Box::leak(Box::new(escape));
+            jit::compile(hir, &mut prog, escape);
+        }
         Ok(prog)
     })();
     r.map_err(|e: CompileError| sources.render(&e))

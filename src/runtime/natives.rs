@@ -862,7 +862,7 @@ pub fn call_native(vm: &mut Vm, n: Native, this: Value, args: &[Value]) -> NResu
         n if n.is_task() => return crate::vm::call_task_native(vm, n, this, args),
         n if (n as u16) >= (ProcessObject as u16) => return crate::node::natives::call_more(vm, n, args),
         ObjProtoHasOwn | ObjProtoPropIsEnum => {
-            let k = arg(&args, 0);
+            let k = arg(args, 0);
             Value::Bool(match &this {
                 Value::Obj(o) => o.get(&k.to_js_string().s).is_some(),
                 Value::Arr(a) => as_index(&k).is_some_and(|i| i < a.len()) || (n == ObjProtoHasOwn && &*k.to_js_string().s == "length"),
@@ -871,7 +871,7 @@ pub fn call_native(vm: &mut Vm, n: Native, this: Value, args: &[Value]) -> NResu
                 _ => false,
             })
         }
-        ObjProtoIsPrototypeOf => Value::Bool(match (&this, arg(&args, 0)) {
+        ObjProtoIsPrototypeOf => Value::Bool(match (&this, arg(args, 0)) {
             (Value::Obj(p), Value::Obj(ref o)) => {
                 let mut q = o.proto();
                 let mut found = false;
@@ -905,7 +905,7 @@ pub fn call_native(vm: &mut Vm, n: Native, this: Value, args: &[Value]) -> NResu
         }),
         ObjProtoToLocaleString => Value::Str(vm.to_string_value(&this)?),
         ConsoleLog | ConsoleError | ConsoleWarn => {
-            let line = crate::node::natives::format_args(vm, &args);
+            let line = crate::node::natives::format_args(vm, args);
             if n == ConsoleLog {
                 vm.print(&line);
             } else {
@@ -915,8 +915,8 @@ pub fn call_native(vm: &mut Vm, n: Native, this: Value, args: &[Value]) -> NResu
         }
         MathFloor | MathCeil | MathRound | MathTrunc | MathSqrt | MathAbs | MathSign | MathSin | MathCos
         | MathTan | MathAsin | MathAcos | MathAtan | MathExp | MathLog | MathLog2 | MathLog10 | MathCbrt
-        | MathFround | MathClz32 => Value::Num(math1(n, num(&args, 0))),
-        MathAtan2 | MathPow | MathImul => Value::Num(math2(n, num(&args, 0), num(&args, 1))),
+        | MathFround | MathClz32 => Value::Num(math1(n, num(args, 0))),
+        MathAtan2 | MathPow | MathImul => Value::Num(math2(n, num(args, 0), num(args, 1))),
         MathMin | MathMax | MathHypot => {
             let mut acc = match n {
                 MathMin => f64::INFINITY,
@@ -933,19 +933,19 @@ pub fn call_native(vm: &mut Vm, n: Native, this: Value, args: &[Value]) -> NResu
             Value::Num(acc)
         }
         MathRandom => Value::Num(random()),
-        ParseInt => Value::Num(parse_int(&arg(&args, 0).to_js_string().s, num(&args, 1))),
-        ParseFloat => Value::Num(parse_float(&arg(&args, 0).to_js_string().s)),
-        IsNaN => Value::Bool(num(&args, 0).is_nan()),
-        IsFinite => Value::Bool(num(&args, 0).is_finite()),
+        ParseInt => Value::Num(parse_int(&arg(args, 0).to_js_string().s, num(args, 1))),
+        ParseFloat => Value::Num(parse_float(&arg(args, 0).to_js_string().s)),
+        IsNaN => Value::Bool(num(args, 0).is_nan()),
+        IsFinite => Value::Bool(num(args, 0).is_finite()),
         StringFn => match args.first() {
             None => Value::str(""),
             Some(Value::Symbol(sym)) => Value::str(format!("Symbol({})", sym.description.as_deref().unwrap_or(""))),
             Some(v) => Value::Str(vm.to_string_value(v)?),
         },
         NumberFn => Value::Num(args.first().map_or(0.0, |v| v.to_number())),
-        BooleanFn => Value::Bool(arg(&args, 0).truthy()),
+        BooleanFn => Value::Bool(arg(args, 0).truthy()),
         BigIntFn => {
-            let r = match arg(&args, 0) {
+            let r = match arg(args, 0) {
                 Value::BigInt(ref n) => Ok(**n),
                 Value::Num(x) if x.fract() != 0.0 || !x.is_finite() => {
                     return Err(vm.range_error(format!("The number {} cannot be converted to a BigInt because it is not an integer", num_to_string(x))));
@@ -963,14 +963,14 @@ pub fn call_native(vm: &mut Vm, n: Native, this: Value, args: &[Value]) -> NResu
                 Err(e) => return Err(vm.bigint_error(e)),
             }
         }
-        NumIsInteger => Value::Bool(matches!(arg(&args, 0), Value::Num(x) if x.is_finite() && x.fract() == 0.0)),
+        NumIsInteger => Value::Bool(matches!(arg(args, 0), Value::Num(x) if x.is_finite() && x.fract() == 0.0)),
         NumIsSafeInteger => {
-            Value::Bool(matches!(arg(&args, 0), Value::Num(x) if x.is_finite() && x.fract() == 0.0 && x.abs() <= 9007199254740991.0))
+            Value::Bool(matches!(arg(args, 0), Value::Num(x) if x.is_finite() && x.fract() == 0.0 && x.abs() <= 9007199254740991.0))
         }
-        NumIsFinite => Value::Bool(matches!(arg(&args, 0), Value::Num(x) if x.is_finite())),
-        NumIsNaN => Value::Bool(matches!(arg(&args, 0), Value::Num(x) if x.is_nan())),
+        NumIsFinite => Value::Bool(matches!(arg(args, 0), Value::Num(x) if x.is_finite())),
+        NumIsNaN => Value::Bool(matches!(arg(args, 0), Value::Num(x) if x.is_nan())),
         NumToFixed => {
-            let d = int_arg(&args, 0, 0.0);
+            let d = int_arg(args, 0, 0.0);
             if !(0.0..=100.0).contains(&d) {
                 return Err(vm.range_error("toFixed() digits argument must be between 0 and 100".into()));
             }
@@ -998,7 +998,7 @@ pub fn call_native(vm: &mut Vm, n: Native, this: Value, args: &[Value]) -> NResu
             }
         }
         NumToString => {
-            let r = int_arg(&args, 0, 10.0) as u32;
+            let r = int_arg(args, 0, 10.0) as u32;
             if !(2..=36).contains(&r) {
                 return Err(vm.range_error("toString() radix must be between 2 and 36".into()));
             }
@@ -1012,7 +1012,7 @@ pub fn call_native(vm: &mut Vm, n: Native, this: Value, args: &[Value]) -> NResu
         // ───── strings ─────
         StrCharAt => {
             let s = this_str(&this);
-            let i = int_arg(&args, 0, 0.0);
+            let i = int_arg(args, 0, 0.0);
             if i < 0.0 {
                 Value::str("")
             } else {
@@ -1021,7 +1021,7 @@ pub fn call_native(vm: &mut Vm, n: Native, this: Value, args: &[Value]) -> NResu
         }
         StrCharCodeAt => {
             let s = this_str(&this);
-            let i = int_arg(&args, 0, 0.0);
+            let i = int_arg(args, 0, 0.0);
             if i < 0.0 {
                 Value::Num(f64::NAN)
             } else {
@@ -1030,7 +1030,7 @@ pub fn call_native(vm: &mut Vm, n: Native, this: Value, args: &[Value]) -> NResu
         }
         StrCodePointAt => {
             let s = this_str(&this);
-            let i = int_arg(&args, 0, 0.0);
+            let i = int_arg(args, 0, 0.0);
             let u = s.utf16();
             if i < 0.0 || i as usize >= u.len() {
                 Value::Undef
@@ -1045,13 +1045,13 @@ pub fn call_native(vm: &mut Vm, n: Native, this: Value, args: &[Value]) -> NResu
         }
         StrIndexOf => {
             let s = this_str(&this);
-            let needle = arg(&args, 0).to_js_string();
-            let from = int_arg(&args, 1, 0.0).max(0.0) as usize;
+            let needle = arg(args, 0).to_js_string();
+            let from = int_arg(args, 1, 0.0).max(0.0) as usize;
             Value::Num(str_index_of(&s, &needle.s, from))
         }
         StrLastIndexOf => {
             let s = this_str(&this);
-            let needle = arg(&args, 0).to_js_string();
+            let needle = arg(args, 0).to_js_string();
             let h = s.utf16();
             let n: Vec<u16> = needle.s.encode_utf16().collect();
             let from = match args.get(1) {
@@ -1073,21 +1073,21 @@ pub fn call_native(vm: &mut Vm, n: Native, this: Value, args: &[Value]) -> NResu
         }
         StrIncludes => {
             let s = this_str(&this);
-            let needle = arg(&args, 0).to_js_string();
-            let from = int_arg(&args, 1, 0.0).max(0.0) as usize;
+            let needle = arg(args, 0).to_js_string();
+            let from = int_arg(args, 1, 0.0).max(0.0) as usize;
             Value::Bool(str_index_of(&s, &needle.s, from) >= 0.0)
         }
         StrStartsWith => {
             let s = this_str(&this);
-            let needle = arg(&args, 0).to_js_string();
-            let pos = int_arg(&args, 1, 0.0).max(0.0) as usize;
+            let needle = arg(args, 0).to_js_string();
+            let pos = int_arg(args, 1, 0.0).max(0.0) as usize;
             let rest = s.slice16(pos, usize::MAX);
             Value::Bool(rest.starts_with(&*needle.s))
         }
         StrEndsWith => {
             let s = this_str(&this);
-            let needle = arg(&args, 0).to_js_string();
-            let end = int_arg(&args, 1, s.len16() as f64).max(0.0) as usize;
+            let needle = arg(args, 0).to_js_string();
+            let end = int_arg(args, 1, s.len16() as f64).max(0.0) as usize;
             Value::Bool(s.slice16(0, end).ends_with(&*needle.s))
         }
         StrSlice | StrSubstring | StrSubstr => {
@@ -1095,17 +1095,17 @@ pub fn call_native(vm: &mut Vm, n: Native, this: Value, args: &[Value]) -> NResu
             let len = s.len16();
             let (a, b) = match n {
                 StrSlice => (
-                    rel_index(int_arg(&args, 0, 0.0), len),
-                    rel_index(int_arg(&args, 1, len as f64), len),
+                    rel_index(int_arg(args, 0, 0.0), len),
+                    rel_index(int_arg(args, 1, len as f64), len),
                 ),
                 StrSubstring => {
-                    let a = int_arg(&args, 0, 0.0).clamp(0.0, len as f64) as usize;
-                    let b = int_arg(&args, 1, len as f64).clamp(0.0, len as f64) as usize;
+                    let a = int_arg(args, 0, 0.0).clamp(0.0, len as f64) as usize;
+                    let b = int_arg(args, 1, len as f64).clamp(0.0, len as f64) as usize;
                     (a.min(b), a.max(b))
                 }
                 _ => {
-                    let a = rel_index(int_arg(&args, 0, 0.0), len);
-                    let l = int_arg(&args, 1, (len - a) as f64).max(0.0) as usize;
+                    let a = rel_index(int_arg(args, 0, 0.0), len);
+                    let l = int_arg(args, 1, (len - a) as f64).max(0.0) as usize;
                     (a, (a + l).min(len))
                 }
             };
@@ -1143,7 +1143,7 @@ pub fn call_native(vm: &mut Vm, n: Native, this: Value, args: &[Value]) -> NResu
             Value::Arr(Array::new_val(parts.into_iter().take(limit).collect()))
         }
         StrRepeat => {
-            let c = num(&args, 0);
+            let c = num(args, 0);
             if c < 0.0 || c.is_infinite() {
                 return Err(vm.range_error(format!("Invalid count value: {}", num_to_string(c))));
             }
@@ -1151,7 +1151,7 @@ pub fn call_native(vm: &mut Vm, n: Native, this: Value, args: &[Value]) -> NResu
         }
         StrPadStart | StrPadEnd => {
             let s = this_str(&this);
-            let target = int_arg(&args, 0, 0.0).max(0.0) as usize;
+            let target = int_arg(args, 0, 0.0).max(0.0) as usize;
             let fill = match args.get(1) {
                 None | Some(Value::Undef) => " ".to_string(),
                 Some(v) => v.to_js_string().s.to_string(),
@@ -1175,12 +1175,12 @@ pub fn call_native(vm: &mut Vm, n: Native, this: Value, args: &[Value]) -> NResu
                 return te(vm, "replaceAll must be called with a global RegExp".into());
             }
             let s = this_str(&this);
-            regex_replace(vm, re, &s, &arg(&args, 1))?
+            regex_replace(vm, re, &s, &arg(args, 1))?
         }
         StrReplace | StrReplaceAll => {
             let s = this_str(&this);
-            let pat = arg(&args, 0).to_js_string();
-            let rep = arg(&args, 1);
+            let pat = arg(args, 0).to_js_string();
+            let rep = arg(args, 1);
             let all = n == StrReplaceAll;
             let mut out = String::new();
             let mut rest: &str = &s.s;
@@ -1230,7 +1230,7 @@ pub fn call_native(vm: &mut Vm, n: Native, this: Value, args: &[Value]) -> NResu
         StrAt => {
             let s = this_str(&this);
             let len = s.len16() as f64;
-            let mut i = int_arg(&args, 0, 0.0);
+            let mut i = int_arg(args, 0, 0.0);
             if i < 0.0 {
                 i += len;
             }
@@ -1242,7 +1242,7 @@ pub fn call_native(vm: &mut Vm, n: Native, this: Value, args: &[Value]) -> NResu
         }
         StrLocaleCompare => {
             let a = this_str(&this);
-            let b = arg(&args, 0).to_js_string();
+            let b = arg(args, 0).to_js_string();
             Value::Num(match a.s.cmp(&b.s) {
                 std::cmp::Ordering::Less => -1.0,
                 std::cmp::Ordering::Equal => 0.0,
@@ -1290,8 +1290,8 @@ pub fn call_native(vm: &mut Vm, n: Native, this: Value, args: &[Value]) -> NResu
         ArrSlice => {
             let a = arr_of(&this).or_else(|m| te(vm, m))?;
             let len = a.len();
-            let s = rel_index(int_arg(&args, 0, 0.0), len);
-            let e = rel_index(int_arg(&args, 1, len as f64), len);
+            let s = rel_index(int_arg(args, 0, 0.0), len);
+            let e = rel_index(int_arg(args, 1, len as f64), len);
             let st = a.store.borrow();
             Value::Arr(match &*st {
                 ArrStore::Num(v) => Array::new_num(if s < e { v[s..e].to_vec() } else { vec![] }),
@@ -1302,11 +1302,11 @@ pub fn call_native(vm: &mut Vm, n: Native, this: Value, args: &[Value]) -> NResu
             let a = arr_of(&this).or_else(|m| te(vm, m))?;
             let mut vals = a.to_vec();
             let len = vals.len();
-            let start = rel_index(int_arg(&args, 0, 0.0), len);
+            let start = rel_index(int_arg(args, 0, 0.0), len);
             let del = if args.len() < 2 {
                 len - start
             } else {
-                (int_arg(&args, 1, 0.0).max(0.0) as usize).min(len - start)
+                (int_arg(args, 1, 0.0).max(0.0) as usize).min(len - start)
             };
             let inserted: Vec<Value> = args.iter().skip(2).cloned().collect();
             let removed: Vec<Value> = vals.splice(start..start + del, inserted).collect();
@@ -1350,17 +1350,17 @@ pub fn call_native(vm: &mut Vm, n: Native, this: Value, args: &[Value]) -> NResu
                 ArrToReversed => call_native(vm, ArrReverse, copy, &[])?,
                 _ => {
                     let len = a.len();
-                    let i = int_arg(&args, 0, 0.0);
+                    let i = int_arg(args, 0, 0.0);
                     let i = if i < 0.0 { len as f64 + i } else { i };
                     if i < 0.0 || i >= len as f64 {
-                        return Err(vm.range_error(format!("Invalid index : {}", num_to_string(int_arg(&args, 0, 0.0)))));
+                        return Err(vm.range_error(format!("Invalid index : {}", num_to_string(int_arg(args, 0, 0.0)))));
                     }
-                    set_dyn(&copy, &Value::Num(i), arg(&args, 1));
+                    set_dyn(&copy, &Value::Num(i), arg(args, 1));
                     copy
                 }
             }
         }
-        StructuredClone => deep_clone(&arg(&args, 0)),
+        StructuredClone => deep_clone(&arg(args, 0)),
         GlobalThis => {
             let names = ["setTimeout", "setInterval", "clearTimeout", "clearInterval", "queueMicrotask", "structuredClone"];
             let fns = [SetTimeout, SetInterval, ClearTimeout, ClearTimeout, QueueMicrotask, StructuredClone];
@@ -1380,14 +1380,14 @@ pub fn call_native(vm: &mut Vm, n: Native, this: Value, args: &[Value]) -> NResu
         }
         ArrIndexOf | ArrLastIndexOf | ArrIncludes => {
             let a = arr_of(&this).or_else(|m| te(vm, m))?;
-            let x = arg(&args, 0);
+            let x = arg(args, 0);
             let vals = a.to_vec();
             let found = if n == ArrLastIndexOf {
                 vals.iter().rposition(|v| v.strict_eq(&x))
             } else if n == ArrIncludes {
                 vals.iter().position(|v| HKey(v.clone()) == HKey(x.clone()))
             } else {
-                let from = rel_index(int_arg(&args, 1, 0.0), vals.len());
+                let from = rel_index(int_arg(args, 1, 0.0), vals.len());
                 vals.iter().skip(from).position(|v| v.strict_eq(&x)).map(|i| i + from)
             };
             if n == ArrIncludes {
@@ -1399,7 +1399,7 @@ pub fn call_native(vm: &mut Vm, n: Native, this: Value, args: &[Value]) -> NResu
         ArrMap | ArrFilter | ArrForEach | ArrFind | ArrFindIndex | ArrFindLast | ArrFindLastIndex | ArrSome
         | ArrEvery | ArrFlatMap => {
             let a = arr_of(&this).or_else(|m| te(vm, m))?;
-            let f = arg(&args, 0);
+            let f = arg(args, 0);
             let len = a.len();
             // Results start as number storage and degrade on the first non-number.
             let out = Array::new_num(Vec::new());
@@ -1463,7 +1463,7 @@ pub fn call_native(vm: &mut Vm, n: Native, this: Value, args: &[Value]) -> NResu
         }
         ArrReduce | ArrReduceRight => {
             let a = arr_of(&this).or_else(|m| te(vm, m))?;
-            let f = arg(&args, 0);
+            let f = arg(args, 0);
             let len = a.len();
             let mut idx: Vec<usize> = (0..len).collect();
             if n == ArrReduceRight {
@@ -1486,7 +1486,7 @@ pub fn call_native(vm: &mut Vm, n: Native, this: Value, args: &[Value]) -> NResu
         }
         ArrSort => {
             let a = arr_of(&this).or_else(|m| te(vm, m))?;
-            let f = arg(&args, 0);
+            let f = arg(args, 0);
             // Fast path: numeric store with no comparator still sorts by string.
             let mut vals = a.to_vec();
             let undef_count = vals.iter().filter(|v| matches!(v, Value::Undef)).count();
@@ -1507,10 +1507,10 @@ pub fn call_native(vm: &mut Vm, n: Native, this: Value, args: &[Value]) -> NResu
         }
         ArrFill => {
             let a = arr_of(&this).or_else(|m| te(vm, m))?;
-            let x = arg(&args, 0);
+            let x = arg(args, 0);
             let len = a.len();
-            let s = rel_index(int_arg(&args, 1, 0.0), len);
-            let e = rel_index(int_arg(&args, 2, len as f64), len);
+            let s = rel_index(int_arg(args, 1, 0.0), len);
+            let e = rel_index(int_arg(args, 2, len as f64), len);
             if let (Value::Num(v), true) = (&x, s == 0 && e == len) {
                 *a.store.borrow_mut() = ArrStore::Num(vec![*v; len]);
             } else {
@@ -1523,7 +1523,7 @@ pub fn call_native(vm: &mut Vm, n: Native, this: Value, args: &[Value]) -> NResu
         ArrAt => {
             let a = arr_of(&this).or_else(|m| te(vm, m))?;
             let len = a.len() as f64;
-            let mut i = int_arg(&args, 0, 0.0);
+            let mut i = int_arg(args, 0, 0.0);
             if i < 0.0 {
                 i += len;
             }
@@ -1531,7 +1531,7 @@ pub fn call_native(vm: &mut Vm, n: Native, this: Value, args: &[Value]) -> NResu
         }
         ArrFlat => {
             let a = arr_of(&this).or_else(|m| te(vm, m))?;
-            let depth = int_arg(&args, 0, 1.0);
+            let depth = int_arg(args, 0, 1.0);
             fn flat(v: Vec<Value>, d: f64, out: &mut Vec<Value>) {
                 for x in v {
                     match x {
@@ -1558,9 +1558,9 @@ pub fn call_native(vm: &mut Vm, n: Native, this: Value, args: &[Value]) -> NResu
                 .collect();
             Value::Arr(Array::new_val(out))
         }
-        ArrIsArray => Value::Bool(matches!(arg(&args, 0), Value::Arr(_))),
+        ArrIsArray => Value::Bool(matches!(arg(args, 0), Value::Arr(_))),
         ArrFrom => {
-            let src = arg(&args, 0);
+            let src = arg(args, 0);
             let items = match &src {
                 Value::Obj(o) => {
                     // Array.from({ length: n })
@@ -1592,9 +1592,9 @@ pub fn call_native(vm: &mut Vm, n: Native, this: Value, args: &[Value]) -> NResu
         },
 
         // ───── Object / JSON ─────
-        ObjKeys => Value::Arr(Array::new_val(keys_of(&arg(&args, 0)))),
+        ObjKeys => Value::Arr(Array::new_val(keys_of(&arg(args, 0)))),
         ObjValues | ObjEntries => {
-            let o = arg(&args, 0);
+            let o = arg(args, 0);
             let keys = keys_of(&o);
             let mut out = Vec::new();
             for k in keys {
@@ -1604,7 +1604,7 @@ pub fn call_native(vm: &mut Vm, n: Native, this: Value, args: &[Value]) -> NResu
             Value::Arr(make_array(out))
         }
         ObjAssign => {
-            let target = arg(&args, 0);
+            let target = arg(args, 0);
             for src in args.iter().skip(1) {
                 for k in keys_of(src) {
                     let v = get_dyn(src, &k);
@@ -1613,21 +1613,21 @@ pub fn call_native(vm: &mut Vm, n: Native, this: Value, args: &[Value]) -> NResu
             }
             target
         }
-        ObjFreeze => arg(&args, 0),
+        ObjFreeze => arg(args, 0),
         ObjFromEntries => {
             let o = Object::new(Shape::new(vec![]), vec![], None);
-            for e in iterate(vm, &arg(&args, 0))? {
+            for e in iterate(vm, &arg(args, 0))? {
                 if let Value::Arr(ref p) = e {
                     o.set(&p.get(0).to_js_string().s.clone().into(), p.get(1));
                 }
             }
             Value::Obj(o)
         }
-        JsonStringify if json_needs_prepare(&args) => {
+        JsonStringify if json_needs_prepare(args) => {
             // A replacer or toJSON methods: build the value to serialize first.
-            let replacer = arg(&args, 1);
-            let root = Value::Obj(Object::new(Shape::new(vec!["".into()]), vec![arg(&args, 0)], None));
-            let v = json_prepare(vm, &root, Value::str(""), arg(&args, 0), &replacer, 0)?;
+            let replacer = arg(args, 1);
+            let root = Value::Obj(Object::new(Shape::new(vec!["".into()]), vec![arg(args, 0)], None));
+            let v = json_prepare(vm, &root, Value::str(""), arg(args, 0), &replacer, 0)?;
             let mut rest = args.to_vec();
             rest[0] = v.unwrap_or(Value::Undef);
             if rest.len() > 1 {
@@ -1641,25 +1641,25 @@ pub fn call_native(vm: &mut Vm, n: Native, this: Value, args: &[Value]) -> NResu
                 Some(Value::Str(s)) => s.s.chars().take(10).collect(),
                 _ => String::new(),
             };
-            if contains_bigint(&arg(&args, 0), 0) {
+            if contains_bigint(&arg(args, 0), 0) {
                 return te(vm, "Do not know how to serialize a BigInt".into());
             }
             let mut out = String::new();
-            if json_stringify(&arg(&args, 0), &indent, "", &mut out) {
+            if json_stringify(&arg(args, 0), &indent, "", &mut out) {
                 Value::str(out)
             } else {
                 Value::Undef
             }
         }
         JsonParse => {
-            let s = arg(&args, 0).to_js_string();
+            let s = arg(args, 0).to_js_string();
             let mut p = JsonParser { b: s.s.as_bytes(), s: &s.s, i: 0 };
             let v = p.value();
             p.ws();
             match v {
-                Ok(v) if p.i == p.b.len() && is_callable_value(&arg(&args, 1)) => {
+                Ok(v) if p.i == p.b.len() && is_callable_value(&arg(args, 1)) => {
                     let root = Value::Obj(Object::new(Shape::new(vec!["".into()]), vec![v.clone()], None));
-                    json_revive(vm, &root, Value::str(""), &arg(&args, 1))?
+                    json_revive(vm, &root, Value::str(""), &arg(args, 1))?
                 }
                 Ok(v) if p.i == p.b.len() => v,
                 Ok(_) => return Err(vm.syntax_error(format!("Unexpected non-whitespace character after JSON at position {}", p.i))),
@@ -1695,22 +1695,22 @@ pub fn call_native(vm: &mut Vm, n: Native, this: Value, args: &[Value]) -> NResu
                 return te(vm, format!("Method Map.prototype.{} called on incompatible receiver", n.name()));
             };
             match n {
-                MapGet => m.borrow().get(&HKey(arg(&args, 0))).cloned().unwrap_or(Value::Undef),
+                MapGet => m.borrow().get(&HKey(arg(args, 0))).cloned().unwrap_or(Value::Undef),
                 MapSet => {
-                    let k = HKey(arg(&args, 0));
-                    let v = arg(&args, 1);
+                    let k = HKey(arg(args, 0));
+                    let v = arg(args, 1);
                     m.borrow_mut().insert(k, v);
                     this.clone()
                 }
-                MapHas => Value::Bool(m.borrow().contains_key(&HKey(arg(&args, 0)))),
-                MapDelete => Value::Bool(m.borrow_mut().shift_remove(&HKey(arg(&args, 0))).is_some()),
+                MapHas => Value::Bool(m.borrow().contains_key(&HKey(arg(args, 0)))),
+                MapDelete => Value::Bool(m.borrow_mut().shift_remove(&HKey(arg(args, 0))).is_some()),
                 MapClear => {
                     m.borrow_mut().clear();
                     Value::Undef
                 }
                 MapSize => Value::Num(m.borrow().len() as f64),
                 MapForEach => {
-                    let f = arg(&args, 0);
+                    let f = arg(args, 0);
                     let entries: Vec<(Value, Value)> = m.borrow().iter().map(|(k, v)| (k.0.clone(), v.clone())).collect();
                     for (k, v) in entries {
                         vm.call(&f, Value::Undef, vec![v, k, this.clone()])?;
@@ -1733,18 +1733,18 @@ pub fn call_native(vm: &mut Vm, n: Native, this: Value, args: &[Value]) -> NResu
             };
             match n {
                 SetAdd => {
-                    s.borrow_mut().insert(HKey(arg(&args, 0)));
+                    s.borrow_mut().insert(HKey(arg(args, 0)));
                     this.clone()
                 }
-                SetHas => Value::Bool(s.borrow().contains(&HKey(arg(&args, 0)))),
-                SetDelete => Value::Bool(s.borrow_mut().shift_remove(&HKey(arg(&args, 0)))),
+                SetHas => Value::Bool(s.borrow().contains(&HKey(arg(args, 0)))),
+                SetDelete => Value::Bool(s.borrow_mut().shift_remove(&HKey(arg(args, 0)))),
                 SetClear => {
                     s.borrow_mut().clear();
                     Value::Undef
                 }
                 SetSize => Value::Num(s.borrow().len() as f64),
                 SetForEach => {
-                    let f = arg(&args, 0);
+                    let f = arg(args, 0);
                     let items: Vec<Value> = s.borrow().iter().map(|k| k.0.clone()).collect();
                     for v in items {
                         vm.call(&f, Value::Undef, vec![v.clone(), v, this.clone()])?;
@@ -1761,7 +1761,7 @@ pub fn call_native(vm: &mut Vm, n: Native, this: Value, args: &[Value]) -> NResu
         ),
         PerfNow => Value::Num(vm.start.elapsed().as_secs_f64() * 1000.0),
         RegexNew => {
-            let (src, flags) = match (arg(&args, 0), arg(&args, 1)) {
+            let (src, flags) = match (arg(args, 0), arg(args, 1)) {
                 (Value::Regex(ref r), Value::Undef) => (r.source.to_string(), r.flags.to_string()),
                 (Value::Regex(ref r), f) => (r.source.to_string(), f.to_js_string().s.to_string()),
                 (s, Value::Undef) => (if matches!(s, Value::Undef) { String::new() } else { s.to_js_string().s.to_string() }, String::new()),
@@ -1776,7 +1776,7 @@ pub fn call_native(vm: &mut Vm, n: Native, this: Value, args: &[Value]) -> NResu
             let Value::Regex(re) = &this else {
                 return te(vm, format!("RegExp.prototype.{} called on incompatible receiver", n.name()));
             };
-            let s = arg(&args, 0).to_js_string();
+            let s = arg(args, 0).to_js_string();
             let m = regexp::exec(re, &s);
             match (n, m) {
                 (RegexTest, m) => Value::Bool(m.is_some()),
@@ -1786,7 +1786,7 @@ pub fn call_native(vm: &mut Vm, n: Native, this: Value, args: &[Value]) -> NResu
         }
         StrMatch => {
             let s = this_str(&this);
-            let re = match arg(&args, 0) {
+            let re = match arg(args, 0) {
                 Value::Regex(ref r) => r.clone(),
                 v => Gc::new(regexp::RegExp::new(&v.to_js_string().s, "").map_err(|m| vm.syntax_error(m))?),
             };
@@ -1809,7 +1809,7 @@ pub fn call_native(vm: &mut Vm, n: Native, this: Value, args: &[Value]) -> NResu
         }
         StrMatchAll => {
             let s = this_str(&this);
-            let re = match arg(&args, 0) {
+            let re = match arg(args, 0) {
                 Value::Regex(ref r) if !r.global => return te(vm, "String.prototype.matchAll called with a non-global RegExp argument".into()),
                 Value::Regex(ref r) => r.clone(),
                 v => Gc::new(regexp::RegExp::new(&v.to_js_string().s, "g").map_err(|m| vm.syntax_error(m))?),
@@ -1828,7 +1828,7 @@ pub fn call_native(vm: &mut Vm, n: Native, this: Value, args: &[Value]) -> NResu
         }
         StrSearch => {
             let s = this_str(&this);
-            let re = match arg(&args, 0) {
+            let re = match arg(args, 0) {
                 Value::Regex(ref r) => r.clone(),
                 v => Gc::new(regexp::RegExp::new(&v.to_js_string().s, "").map_err(|m| vm.syntax_error(m))?),
             };
@@ -1843,14 +1843,14 @@ pub fn call_native(vm: &mut Vm, n: Native, this: Value, args: &[Value]) -> NResu
         },
         TemplateObject => {
             // (n, cooked strings…, raw strings…): the strings array of a tagged template.
-            let n = arg(&args, 0).to_number() as usize;
+            let n = arg(args, 0).to_number() as usize;
             let cooked = Array::new_val(args[1..1 + n].to_vec());
             let raw = Value::Arr(Array::new_val(args[1 + n..].to_vec()));
             *cooked.props.borrow_mut() = Some(Object::new(Shape::new(vec!["raw".into()]), vec![raw], None));
             Value::Arr(cooked)
         }
         ObjRest => {
-            let src = arg(&args, 0);
+            let src = arg(args, 0);
             let skip: Vec<Gc<JsStr>> = args[1..].iter().map(|k| k.to_js_string()).collect();
             let mut keys = Vec::new();
             let mut vals = Vec::new();
@@ -1866,9 +1866,9 @@ pub fn call_native(vm: &mut Vm, n: Native, this: Value, args: &[Value]) -> NResu
         }
         ObjDefineAccessor => {
             // (object, name, getter, setter): merge with an existing accessor.
-            let Value::Obj(ref o) = arg(&args, 0) else { unreachable!() };
-            let name: Rc<str> = (&*arg(&args, 1).to_js_string().s).into();
-            let (mut get, mut set) = (arg(&args, 2), arg(&args, 3));
+            let Value::Obj(ref o) = arg(args, 0) else { unreachable!() };
+            let name: Rc<str> = (&*arg(args, 1).to_js_string().s).into();
+            let (mut get, mut set) = (arg(args, 2), arg(args, 3));
             if let Some(Value::Accessor(ref a)) = o.get(&name) {
                 if matches!(get, Value::Undef) {
                     get = a.get.clone();

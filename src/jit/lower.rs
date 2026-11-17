@@ -247,6 +247,10 @@ pub(super) struct Lower<'a, 'b> {
     iters: FxHashMap<usize, Variable>,
     /// Compiled functions this one calls, imported on first use.
     funcs: FxHashMap<FuncId, FuncRef>,
+    /// Every function called directly (it must be defined with this one).
+    called: &'a RefCell<Vec<FuncId>>,
+    /// Functions already compiled (or being compiled in this batch).
+    defined: &'a FxHashSet<FuncId>,
     /// Every compiled function's id and signature (for importing it).
     fdecls: &'a FxHashMap<FuncId, (ClFuncId, Signature)>,
     /// Calls through function values: the kinds keys, and the table of
@@ -2754,6 +2758,10 @@ impl Lower<'_, '_> {
         impls.dedup();
         impls.sort();
         impls.dedup();
+        let n_impls = impls.len();
+        // Each implementation through the entry table (compiled lazily: a
+        // null entry goes through the interpreter, which compiles it).
+        let slow = self.b.create_block();
         for g in impls {
             let mut hit: Option<CV> = None;
             for (k, _) in targets.iter().filter(|(_, h)| *h == g) {
@@ -2764,10 +2772,26 @@ impl Lower<'_, '_> {
                     None => eq,
                 });
             }
-            let (call_b, next) = (self.b.create_block(), self.b.create_block());
-            self.b.ins().brif(hit.unwrap(), call_b, &[], next, &[]);
-            self.b.seal_block(call_b);
+            let (check_b, call_b, next) = (self.b.create_block(), self.b.create_block(), self.b.create_block());
+            self.b.ins().brif(hit.unwrap(), check_b, &[], next, &[]);
+            self.b.seal_block(check_b);
             self.b.seal_block(next);
+            self.b.switch_to_block(check_b);
+            // A direct call when compiled already, or when there are few
+            // implementations (compiled with this function); through the
+            // table otherwise (each is compiled when first called).
+            let direct = self.defined.contains(&g) || n_impls <= 4;
+            let ptr = if direct {
+                self.b.ins().jump(call_b, &[]);
+                None
+            } else {
+                let ent = self.b.ins().iconst(types::I64, unsafe { self.entries.add(g as usize) } as i64);
+                let ptr = self.b.ins().load(types::I64, mf(), ent, std::mem::offset_of!(NativeEntry, entry) as i32);
+                let ready = self.b.ins().icmp_imm_u(IntCC::NotEqual, ptr, 0);
+                self.b.ins().brif(ready, call_b, &[], slow, &[]);
+                Some(ptr)
+            };
+            self.b.seal_block(call_b);
             self.b.switch_to_block(call_b);
             let mut vals = vec![self.ctx];
             if self.takes_rarena.contains(&g) {
@@ -2781,13 +2805,24 @@ impl Lower<'_, '_> {
                     vals.push(r.v);
                 }
             }
-            let fr = self.func_ref(g);
-            let call = self.b.ins().call(fr, &vals);
+            let call = match ptr {
+                Some(ptr) => {
+                    let sref = self.b.import_signature(self.fdecls[&g].1.clone());
+                    self.b.ins().call_indirect(sref, ptr, &vals)
+                }
+                None => {
+                    let fr = self.func_ref(g);
+                    self.b.ins().call(fr, &vals)
+                }
+            };
             let res = RV::of_words(&self.b.inst_results(call).to_vec());
             let (rt, rp) = self.value_words(ret_jv(&self.hir.funcs[g as usize]).unwrap(), res);
             self.b.ins().jump(merge, &[rt.into(), rp.into()]);
             self.b.switch_to_block(next);
         }
+        self.b.ins().jump(slow, &[]);
+        self.b.seal_block(slow);
+        self.b.switch_to_block(slow);
         // Any other receiver: through the interpreter, with the values.
         {
             use cranelift_codegen::ir::{StackSlotData, StackSlotKind};
@@ -3194,6 +3229,7 @@ impl Lower<'_, '_> {
         if let Some(r) = self.funcs.get(&g) {
             return *r;
         }
+        self.called.borrow_mut().push(g);
         let (id, sig) = &self.fdecls[&g];
         let signature = self.b.func.import_signature(sig.clone());
         let name = self.b.func.declare_imported_user_function(cranelift_codegen::ir::UserExternalName { namespace: 0, index: id.as_u32() });
@@ -3435,9 +3471,66 @@ pub(super) fn var_jv(hir: &HProgram, v: VarId) -> JV {
     jv(&hir.vars[v as usize].ty).unwrap()
 }
 
-/// Compile every eligible function and attach its entry point to `prog`.
-/// Returns how many were compiled.
-pub fn compile(hir: &HProgram, prog: &mut Program, esc: &crate::escape::EscapeInfo) -> usize {
+/// The native-code compiler, kept for the program's lifetime: functions are
+/// declared up front and defined (compiled) lazily, on their second call
+/// (`RTS_JIT_EAGER`: all at start), each with the functions it calls directly.
+pub(super) struct Jit {
+    hir: &'static HProgram,
+    esc: &'static crate::escape::EscapeInfo,
+    el: Elig<'static>,
+    takes_rarena: FxHashSet<FuncId>,
+    lay: Layout,
+    m: JITModule,
+    h_ids: Vec<ClFuncId>,
+    call_idx: usize,
+    /// Each eligible function's typed definition and entry trampoline.
+    ids: FxHashMap<FuncId, (ClFuncId, ClFuncId)>,
+    fdecls: FxHashMap<FuncId, (ClFuncId, Signature)>,
+    entries: *mut NativeEntry,
+    keys: RefCell<FxHashMap<(Vec<JV>, JV), u32>>,
+    sig0: Signature,
+    vars_of: FxHashMap<FuncId, Vec<VarId>>,
+    globals: FxHashMap<VarId, u32>,
+    classes: Vec<std::rc::Rc<ClassRt>>,
+    stats: RcStats,
+    defined: FxHashSet<FuncId>,
+    /// Each function's `JitFn` (in the program), by id; null if not eligible.
+    jitfns: Vec<*const JitFn>,
+    debug: bool,
+    /// A definition failed: nothing more is compiled.
+    broken: bool,
+}
+
+static mut JIT: *mut Jit = std::ptr::null_mut();
+
+/// Calls before a function without loops is compiled (the second call
+/// compiles it). A function with a loop is compiled on its first call: it
+/// may run long, and a call already running stays in the interpreter.
+const WARM_CALLS: u32 = 1;
+
+/// Called by the interpreter before calling `jf`: true if its code is ready
+/// (compiling it, and what it calls directly, once it is warm).
+#[inline]
+pub(crate) fn ready(jf: &JitFn) -> bool {
+    if jf.entry.get().is_some() {
+        return true;
+    }
+    let n = jf.calls.get();
+    if n < jf.warm {
+        jf.calls.set(n + 1);
+        return false;
+    }
+    let j = unsafe { JIT };
+    if j.is_null() {
+        return false;
+    }
+    unsafe { (*j).define(jf.fid) };
+    jf.entry.get().is_some()
+}
+
+/// Set up the compiler and give every eligible function a (not yet
+/// compiled) `JitFn`. Returns how many functions are eligible.
+pub fn compile(hir: &'static HProgram, prog: &mut Program, esc: &'static crate::escape::EscapeInfo) -> usize {
     if !unsafe { ENABLED } {
         return 0;
     }
@@ -3474,7 +3567,7 @@ pub fn compile(hir: &HProgram, prog: &mut Program, esc: &crate::escape::EscapeIn
     let mut flags = settings::builder();
     flags.set("opt_level", "speed").unwrap();
     // The verifier checks Cranelift's own invariants; keep it for debug builds.
-    if !cfg!(debug_assertions) && std::env::var_os("RTS_JIT_DEBUG").is_none() {
+    if !cfg!(debug_assertions) && !debug {
         flags.set("enable_verifier", "false").unwrap();
     }
     let Ok(isa) = cranelift_native::builder().and_then(|b| b.finish(settings::Flags::new(flags)).map_err(|_| "isa")) else {
@@ -3487,56 +3580,46 @@ pub fn compile(hir: &HProgram, prog: &mut Program, esc: &crate::escape::EscapeIn
     }
     let mut m = JITModule::new(jb);
     let ptr = m.target_config().pointer_type();
-
-    let sig = |m: &JITModule, params: &[types::Type], ret: Option<types::Type>| -> Signature {
-        let mut s = m.make_signature();
-        s.params.extend(params.iter().map(|t| AbiParam::new(*t)));
-        s.returns.extend(ret.map(AbiParam::new));
-        s
-    };
-    let sig_n = |m: &JITModule, params: &[types::Type], rets: &[types::Type]| -> Signature {
-        let mut s = m.make_signature();
-        s.params.extend(params.iter().map(|t| AbiParam::new(*t)));
-        s.returns.extend(rets.iter().map(|t| AbiParam::new(*t)));
-        s
-    };
-    let decl = |m: &mut JITModule, name: &str, s: Signature| m.declare_function(name, Linkage::Import, &s).unwrap();
     let h_ids: Vec<ClFuncId> = helpers
         .iter()
         .map(|(n, _, params, ret)| {
-            let s = sig(&m, params, *ret);
-            decl(&mut m, n, s)
+            let mut s = m.make_signature();
+            s.params.extend(params.iter().map(|t| AbiParam::new(*t)));
+            s.returns.extend(ret.map(AbiParam::new));
+            m.declare_function(n, Linkage::Import, &s).unwrap()
         })
         .collect();
+    let call_idx = helpers.iter().position(|(n, ..)| *n == "rts_call").unwrap();
 
-    // Declare every compiled function (typed) and its entry trampoline.
-    let mut ids: Vec<(FuncId, ClFuncId, ClFuncId)> = Vec::new();
-    let mut fsigs: FxHashMap<FuncId, Signature> = FxHashMap::default();
+    // Declare every eligible function (typed) and its entry trampoline.
+    let mut ids = FxHashMap::default();
+    let mut fdecls = FxHashMap::default();
     let mut order: Vec<FuncId> = el.set.iter().copied().collect();
     order.sort();
     for &f in &order {
         let hf = &hir.funcs[f as usize];
-        let mut params = vec![ptr];
+        let mut s = m.make_signature();
+        s.params.push(AbiParam::new(ptr));
         // A closure's cells come first, then the result arena.
         if !hf.free.is_empty() {
-            params.push(ptr);
+            s.params.push(AbiParam::new(ptr));
         }
         if takes_rarena.contains(&f) {
-            params.push(ptr);
+            s.params.push(AbiParam::new(ptr));
         }
-        params.extend(param_tys(&el, hf));
-        let s = sig_n(&m, &params, &cl_tys(ret_jk(hf).unwrap()));
+        s.params.extend(param_tys(&el, hf).into_iter().map(AbiParam::new));
+        s.returns.extend(cl_tys(ret_jk(hf).unwrap()).into_iter().map(AbiParam::new));
         let id = m.declare_function(&format!("f{f}"), Linkage::Local, &s).unwrap();
-        let eid = m.declare_function(&format!("e{f}"), Linkage::Local, &sig(&m, &[ptr, ptr], Some(types::I64))).unwrap();
-        fsigs.insert(f, s);
-        ids.push((f, id, eid));
+        let mut es = m.make_signature();
+        es.params.extend([AbiParam::new(ptr), AbiParam::new(ptr)]);
+        es.returns.push(AbiParam::new(types::I64));
+        let eid = m.declare_function(&format!("e{f}"), Linkage::Local, &es).unwrap();
+        fdecls.insert(f, (id, s));
+        ids.insert(f, (id, eid));
     }
-    // Calls through function values find a compiled callee here (filled
-    // in once the code is finalized; key 0 = not callable this way).
+    // Every function's entry (filled in as functions are defined).
     let entries: *mut NativeEntry = Box::leak(vec![NativeEntry::default(); hir.funcs.len()].into_boxed_slice()).as_mut_ptr();
-    let keys: RefCell<FxHashMap<(Vec<JV>, JV), u32>> = RefCell::default();
     let sig0 = m.make_signature();
-    let fdecls: FxHashMap<FuncId, (ClFuncId, Signature)> = ids.iter().map(|(f, id, _)| (*f, (*id, fsigs[f].clone()))).collect();
     // Each function's variables.
     let mut vars_of: FxHashMap<FuncId, Vec<VarId>> = FxHashMap::default();
     for (v, vi) in hir.vars.iter().enumerate() {
@@ -3546,7 +3629,6 @@ pub fn compile(hir: &HProgram, prog: &mut Program, esc: &crate::escape::EscapeIn
             vars_of.entry(o).or_default().push(v as VarId);
         }
     }
-
     // Global variables' indices, as codegen assigns them.
     let mut globals: FxHashMap<VarId, u32> = FxHashMap::default();
     let (mut n_gs, mut n_gv) = (0u32, 0u32);
@@ -3572,17 +3654,158 @@ pub fn compile(hir: &HProgram, prog: &mut Program, esc: &crate::escape::EscapeIn
             })
             .collect()
     });
-    let mut stats = RcStats::default();
-    let mut ctx = m.make_context();
-    let mut fbc = FunctionBuilderContext::new();
-    for &(f, id, eid) in &ids {
+    // The interpreter's view: each eligible function's `JitFn`, no code yet.
+    let mut jitfns = vec![std::ptr::null(); hir.funcs.len()];
+    for &f in &order {
+        let hf = &hir.funcs[f as usize];
+        if let Some(fc) = prog.funcs.get_mut(f as usize).and_then(std::rc::Rc::get_mut) {
+            let jf = Box::new(JitFn {
+                fid: f,
+                entry: std::cell::Cell::new(None),
+                calls: std::cell::Cell::new(0),
+                warm: if any_block(&hf.body, &mut |ss| ss.iter().any(|s| matches!(s, HStmt::Loop { .. } | HStmt::ForOf { .. } | HStmt::ForIn { .. }))) { 0 } else { WARM_CALLS },
+                this: hf.this_var.map(|v| var_jv(hir, v)),
+                env: !hf.free.is_empty(),
+                rarena: takes_rarena.contains(&f),
+                params: hf.params.iter().map(|p| var_jv(hir, p.var)).collect(),
+                ret: ret_jv(hf).unwrap(),
+            });
+            jitfns[f as usize] = &*jf as *const JitFn;
+            fc.jit = Some(jf);
+        }
+    }
+    let n = order.len();
+    let jit = Box::leak(Box::new(Jit {
+        hir,
+        esc,
+        el,
+        takes_rarena,
+        lay,
+        m,
+        h_ids,
+        call_idx,
+        ids,
+        fdecls,
+        entries,
+        keys: RefCell::default(),
+        sig0,
+        vars_of,
+        globals,
+        classes: prog.classes.clone(),
+        stats: RcStats::default(),
+        defined: FxHashSet::default(),
+        jitfns,
+        debug,
+        broken: false,
+    }));
+    unsafe {
+        ENTRIES = entries;
+        JIT = jit;
+    }
+    if std::env::var_os("RTS_JIT_EAGER").is_some() {
+        for f in order {
+            jit.define(f);
+        }
+    }
+    n
+}
+
+impl Jit {
+    /// Compile `f` (if not yet), with every function it calls directly.
+    fn define(&mut self, f: FuncId) {
+        if self.broken || self.defined.contains(&f) || !self.ids.contains_key(&f) {
+            return;
+        }
+        let mut batch = vec![f];
+        let mut queued: FxHashSet<FuncId> = [f].into_iter().collect();
+        let mut i = 0;
+        let mut adapters: Vec<(FuncId, ClFuncId, bool)> = Vec::new();
+        let mut ctx = self.m.make_context();
+        let mut fbc = FunctionBuilderContext::new();
+        while i < batch.len() {
+            let g = batch[i];
+            i += 1;
+            let called = RefCell::new(Vec::new());
+            match self.define_one(g, &mut ctx, &mut fbc, &called) {
+                Ok(a) => adapters.extend(a),
+                Err(e) => {
+                    eprintln!("rts: native code disabled ({} failed to compile: {e})", self.hir.funcs[g as usize].name);
+                    self.broken = true;
+                    return;
+                }
+            }
+            for c in called.into_inner() {
+                if !self.defined.contains(&c) && queued.insert(c) {
+                    batch.push(c);
+                }
+            }
+        }
+        if self.m.finalize_definitions().is_err() {
+            self.broken = true;
+            return;
+        }
+        let hir = self.hir;
+        for &(g, aid, method) in &adapters {
+            let e = unsafe { &mut *self.entries.add(g as usize) };
+            let p = self.m.get_finalized_function(aid) as u64;
+            if method {
+                e.madapter = p;
+            } else {
+                e.adapter = p;
+            }
+            e.arity = hir.funcs[g as usize].params.len() as u64;
+        }
+        for &g in &batch {
+            let (id, eid) = self.ids[&g];
+            let hf = &hir.funcs[g as usize];
+            let e = unsafe { &mut *self.entries.add(g as usize) };
+            e.entry = self.m.get_finalized_function(id) as u64;
+            e.flags = (!hf.free.is_empty()) as u32 | (self.takes_rarena.contains(&g) as u32) << 1;
+            if let Some(key) = value_key(hir, g) {
+                let n = self.keys.borrow().len() as u32 + 1;
+                e.key = *self.keys.borrow_mut().entry(key).or_insert(n);
+            }
+            let jf = self.jitfns[g as usize];
+            if !jf.is_null() {
+                let p = self.m.get_finalized_function(eid);
+                unsafe { (*jf).entry.set(Some(std::mem::transmute::<*const u8, Entry>(p))) };
+            }
+        }
+        if self.debug {
+            let names: Vec<String> = batch
+                .iter()
+                .map(|g| {
+                    let hf = &hir.funcs[*g as usize];
+                    match hf.class {
+                        Some(c) => format!("{}.{}", hir.classes[c as usize].name, if hf.is_ctor { "constructor" } else { &hf.name }),
+                        None => hf.name.to_string(),
+                    }
+                })
+                .collect();
+            eprintln!("rts jit: compiled {}: {}", names.len(), names.join(" "));
+            eprintln!(
+                "rts jit: count updates emitted so far: {} increments, {} decrements; {} borrowed uses needed none",
+                self.stats.incs, self.stats.decs, self.stats.borrowed
+            );
+        }
+    }
+
+    /// Define `f`, its entry trampoline and its adapter (not finalized).
+    /// The functions it calls directly are added to `called`.
+    fn define_one(&mut self, f: FuncId, ctx: &mut cranelift_codegen::Context, fbc: &mut FunctionBuilderContext, called: &RefCell<Vec<FuncId>>) -> Result<Vec<(FuncId, ClFuncId, bool)>, String> {
+        self.defined.insert(f);
+        let hir = self.hir;
+        let esc = self.esc;
+        let (id, eid) = self.ids[&f];
         let hf = &hir.funcs[f as usize];
         let rk = ret_jk(hf).unwrap();
+        let lay = &self.lay;
+        let ptr = self.m.target_config().pointer_type();
         // The function itself.
-        ctx.func.signature = fsigs[&f].clone();
+        ctx.func.signature = self.fdecls[&f].1.clone();
         {
-            let mut b = FunctionBuilder::new(&mut ctx.func, &mut fbc);
-            let hr: Vec<FuncRef> = h_ids.iter().map(|i| m.declare_func_in_func(*i, b.func)).collect();
+            let mut b = FunctionBuilder::new(&mut ctx.func, fbc);
+            let hr: Vec<FuncRef> = self.h_ids.iter().map(|i| self.m.declare_func_in_func(*i, b.func)).collect();
             let h = Helpers::new(&hr);
             let entry = b.create_block();
             b.append_block_params_for_function_params(entry);
@@ -3612,9 +3835,10 @@ pub fn compile(hir: &HProgram, prog: &mut Program, esc: &crate::escape::EscapeIn
             b.ins().return_(&z);
             b.switch_to_block(body);
             let unwind = b.create_block();
+            let el = &self.el;
             let mut lw = Lower {
                 hir,
-                el: &el,
+                el,
                 fid: f,
                 rk,
                 rjv: ret_jv(hf).unwrap(),
@@ -3624,11 +3848,11 @@ pub fn compile(hir: &HProgram, prog: &mut Program, esc: &crate::escape::EscapeIn
                 cells: FxHashMap::default(),
                 declared: FxHashSet::default(),
                 env: (!hf.free.is_empty()).then(|| params[1]),
-                rarena: takes_rarena.contains(&f).then(|| params[1 + !hf.free.is_empty() as usize]),
+                rarena: self.takes_rarena.contains(&f).then(|| params[1 + !hf.free.is_empty() as usize]),
                 esc,
                 regions: Vec::new(),
                 region_mark: None,
-                takes_rarena: &takes_rarena,
+                takes_rarena: &self.takes_rarena,
                 owned: vec![],
                 borrowed: FxHashSet::default(),
                 ctx: c,
@@ -3638,24 +3862,27 @@ pub fn compile(hir: &HProgram, prog: &mut Program, esc: &crate::escape::EscapeIn
                 loops: vec![],
                 iters: FxHashMap::default(),
                 funcs: FxHashMap::default(),
-                fdecls: &fdecls,
-                keys: &keys,
-                entries,
-                sig0: &sig0,
+                called,
+                defined: &self.defined,
+                fdecls: &self.fdecls,
+                keys: &self.keys,
+                entries: self.entries,
+                sig0: &self.sig0,
                 h,
-                lay: &lay,
-                classes: &prog.classes,
-                globals: &globals,
-                stats: &mut stats,
+                lay,
+                classes: &self.classes,
+                globals: &self.globals,
+                stats: &mut self.stats,
             };
             // Parameters (borrowed, unless assigned: then owned).
             let mut assigned = FxHashSet::default();
             assigned_vars(&hf.body, &mut assigned);
             let pvars: Vec<VarId> = hf.this_var.iter().chain(hf.params.iter().map(|p| &p.var)).copied().collect();
-            let all: Vec<VarId> = pvars.iter().chain(vars_of.get(&f).map(|v| v.as_slice()).unwrap_or(&[])).copied().collect();
+            let mine: &[VarId] = self.vars_of.get(&f).map(|v| v.as_slice()).unwrap_or(&[]);
+            let all: Vec<VarId> = pvars.iter().chain(mine).copied().collect();
             lw.borrowed = el.borrowed_vars(f, &all);
             // Captured variables: no cell yet (a block or `Init` makes it).
-            for &v in vars_of.get(&f).map(|v| v.as_slice()).unwrap_or(&[]) {
+            for &v in mine {
                 if hir.vars[v as usize].captured {
                     let x = lw.b.declare_var(types::I64);
                     let none = lw.b.ins().iconst(types::I64, 1);
@@ -3694,7 +3921,7 @@ pub fn compile(hir: &HProgram, prog: &mut Program, esc: &crate::escape::EscapeIn
                 }
             }
             // Locals: declared here, so every path sees them (undefined at first).
-            for &v in vars_of.get(&f).map(|v| v.as_slice()).unwrap_or(&[]) {
+            for &v in mine {
                 if !pvars.contains(&v) && !lw.cells.contains_key(&v) {
                     lw.var(v);
                     if lw.el.vjk(v).unwrap().counted() && !lw.borrowed.contains(&v) {
@@ -3717,22 +3944,19 @@ pub fn compile(hir: &HProgram, prog: &mut Program, esc: &crate::escape::EscapeIn
             }
             let z = lw.zero_rv(rk);
             lw.ret(z);
-            let _ = lw.fid;
-            lw.b.finalize(m.isa().frontend_config());
+            lw.b.finalize(self.m.isa().frontend_config());
         }
-        if let Err(e) = m.define_function(id, &mut ctx) {
-            // A code generator bug: say so rather than silently running
-            // the whole program in the interpreter.
-            eprintln!("rts: native code disabled ({} failed to compile: {e:?})", hf.name);
-            return 0;
-        }
-        m.clear_context(&mut ctx);
+        self.m.define_function(id, ctx).map_err(|e| format!("{e:?}"))?;
+        self.m.clear_context(ctx);
 
         // The entry trampoline: unpack argument bits, call, pack the result.
-        ctx.func.signature = sig(&m, &[ptr, ptr], Some(types::I64));
+        let mut es = self.m.make_signature();
+        es.params.extend([AbiParam::new(ptr), AbiParam::new(ptr)]);
+        es.returns.push(AbiParam::new(types::I64));
+        ctx.func.signature = es;
         {
-            let mut b = FunctionBuilder::new(&mut ctx.func, &mut fbc);
-            let fr = m.declare_func_in_func(id, b.func);
+            let mut b = FunctionBuilder::new(&mut ctx.func, fbc);
+            let fr = self.m.declare_func_in_func(id, b.func);
             let blk = b.create_block();
             b.append_block_params_for_function_params(blk);
             b.switch_to_block(blk);
@@ -3744,11 +3968,11 @@ pub fn compile(hir: &HProgram, prog: &mut Program, esc: &crate::escape::EscapeIn
                 args.push(b.ins().load(types::I64, mf(), argv, 0));
                 i = 1;
             }
-            if takes_rarena.contains(&f) {
+            if self.takes_rarena.contains(&f) {
                 args.push(b.ins().load(types::I64, mf(), argv, i * 8));
                 i += 1;
             }
-            for k in param_jks(&el, hf) {
+            for k in param_jks(&self.el, hf) {
                 for _ in 0..cl_tys(k).len() {
                     let bits = b.ins().load(types::I64, mf(), argv, (i * 8) as i32);
                     i += 1;
@@ -3771,108 +3995,42 @@ pub fn compile(hir: &HProgram, prog: &mut Program, esc: &crate::escape::EscapeIn
                 }
             };
             b.ins().return_(&[out]);
-            b.finalize(m.isa().frontend_config());
+            b.finalize(self.m.isa().frontend_config());
         }
-        m.define_function(eid, &mut ctx).unwrap();
-        m.clear_context(&mut ctx);
-    }
-    // Adapters: each function callable through a function value, taking
-    // values (for call sites whose kinds differ, such as generic callbacks).
-    let mut adapters: Vec<(FuncId, ClFuncId, bool)> = Vec::new();
-    if let Some(caps_off) = lay.clo_caps {
-        let call_idx = helpers.iter().position(|(n, ..)| *n == "rts_call").unwrap();
-        for &(f, id, _) in &ids {
-            let hf = &hir.funcs[f as usize];
-            let what = if value_key(hir, f).is_some() {
-                Adapted::Closure { env: !hf.free.is_empty(), caps_off }
-            } else if method_key(hir, f) {
-                Adapted::Method { fid: f, this: var_jv(hir, hf.this_var.unwrap()) }
-            } else {
-                continue;
-            };
-            let n = hf.params.len();
-            let mut sig = m.make_signature();
-            sig.params.push(AbiParam::new(ptr));
-            sig.params.push(AbiParam::new(types::I64));
-            if matches!(what, Adapted::Method { .. }) {
-                sig.params.push(AbiParam::new(types::I64));
-            }
-            for _ in 0..n {
-                sig.params.extend([AbiParam::new(types::I64), AbiParam::new(types::I64)]);
-            }
-            sig.returns.extend([AbiParam::new(types::I64), AbiParam::new(types::I64)]);
-            let aid = m.declare_function(&format!("a{f}"), Linkage::Local, &sig).unwrap();
-            ctx.func.signature = sig;
-            {
-                let b = FunctionBuilder::new(&mut ctx.func, &mut fbc);
-                let callee = m.declare_func_in_func(id, b.func);
-                let h_call = m.declare_func_in_func(h_ids[call_idx], b.func);
-                let pjs: Vec<JV> = hf.params.iter().map(|p| var_jv(hir, p.var)).collect();
-                build_adapter(b, &lay, callee, h_call, what, &pjs, ret_jv(hf).unwrap(), takes_rarena.contains(&f), m.isa().frontend_config());
-            }
-            if let Err(e) = m.define_function(aid, &mut ctx) {
-                eprintln!("rts: native code disabled (adapter for {} failed to compile: {e:?})", hf.name);
-                return 0;
-            }
-            m.clear_context(&mut ctx);
-            adapters.push((f, aid, matches!(what, Adapted::Method { .. })));
-        }
-    }
-    if m.finalize_definitions().is_err() {
-        return 0;
-    }
-    for &(f, aid, method) in &adapters {
-        let e = unsafe { &mut *entries.add(f as usize) };
-        let p = m.get_finalized_function(aid) as u64;
-        if method {
-            e.madapter = p;
+        self.m.define_function(eid, ctx).map_err(|e| format!("{e:?}"))?;
+        self.m.clear_context(ctx);
+
+        // The adapter taking values (calls through function values with
+        // other kinds, and by-name method calls).
+        let Some(caps_off) = lay.clo_caps else { return Ok(vec![]) };
+        let what = if value_key(hir, f).is_some() {
+            Adapted::Closure { env: !hf.free.is_empty(), caps_off }
+        } else if method_key(hir, f) {
+            Adapted::Method { fid: f, this: var_jv(hir, hf.this_var.unwrap()) }
         } else {
-            e.adapter = p;
+            return Ok(vec![]);
+        };
+        let mut sig = self.m.make_signature();
+        sig.params.push(AbiParam::new(ptr));
+        sig.params.push(AbiParam::new(types::I64));
+        if matches!(what, Adapted::Method { .. }) {
+            sig.params.push(AbiParam::new(types::I64));
         }
-        e.arity = hir.funcs[f as usize].params.len() as u64;
-    }
-    unsafe { ENTRIES = entries };
-    if debug {
-        let mut names: Vec<String> = order
-            .iter()
-            .map(|f| {
-                let hf = &hir.funcs[*f as usize];
-                match hf.class {
-                    Some(c) => format!("{}.{}", hir.classes[c as usize].name, if hf.is_ctor { "constructor" } else { &hf.name }),
-                    None => hf.name.to_string(),
-                }
-            })
-            .collect();
-        names.sort();
-        eprintln!("rts jit: {} functions compiled: {}", ids.len(), names.join(" "));
-        eprintln!("rts jit: count updates emitted: {} increments, {} decrements; {} borrowed uses needed none", stats.incs, stats.decs, stats.borrowed);
-    }
-    for &(f, id, _) in &ids {
-        if let Some(key) = value_key(hir, f) {
-            let n = keys.borrow().len() as u32 + 1;
-            let key = *keys.borrow_mut().entry(key).or_insert(n);
-            let hf = &hir.funcs[f as usize];
-            let e = unsafe { &mut *entries.add(f as usize) };
-            e.entry = m.get_finalized_function(id) as u64;
-            e.key = key;
-            e.flags = (!hf.free.is_empty()) as u32 | (takes_rarena.contains(&f) as u32) << 1;
+        for _ in 0..hf.params.len() {
+            sig.params.extend([AbiParam::new(types::I64), AbiParam::new(types::I64)]);
         }
-    }
-    for &(f, _, eid) in &ids {
-        let p = m.get_finalized_function(eid);
-        let hf = &hir.funcs[f as usize];
-        if let Some(fc) = prog.funcs.get_mut(f as usize).and_then(std::rc::Rc::get_mut) {
-            fc.jit = Some(Box::new(JitFn {
-                entry: unsafe { std::mem::transmute::<*const u8, Entry>(p) },
-                this: hf.this_var.map(|v| var_jv(hir, v)),
-                env: !hf.free.is_empty(),
-                rarena: takes_rarena.contains(&f),
-                params: hf.params.iter().map(|p| var_jv(hir, p.var)).collect(),
-                ret: ret_jv(hf).unwrap(),
-            }));
+        sig.returns.extend([AbiParam::new(types::I64), AbiParam::new(types::I64)]);
+        let aid = self.m.declare_function(&format!("a{f}"), Linkage::Local, &sig).unwrap();
+        ctx.func.signature = sig;
+        {
+            let b = FunctionBuilder::new(&mut ctx.func, fbc);
+            let callee = self.m.declare_func_in_func(id, b.func);
+            let h_call = self.m.declare_func_in_func(self.h_ids[self.call_idx], b.func);
+            let pjs: Vec<JV> = hf.params.iter().map(|p| var_jv(hir, p.var)).collect();
+            build_adapter(b, lay, callee, h_call, what, &pjs, ret_jv(hf).unwrap(), self.takes_rarena.contains(&f), self.m.isa().frontend_config());
         }
+        self.m.define_function(aid, ctx).map_err(|e| format!("adapter: {e:?}"))?;
+        self.m.clear_context(ctx);
+        Ok(vec![(f, aid, matches!(what, Adapted::Method { .. }))])
     }
-    // The code must outlive the program.
-    std::mem::forget(m);
-    ids.len()
 }

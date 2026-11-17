@@ -591,3 +591,15 @@ Not part of the brief, listed because they surfaced.
   fixed setting for Havlak and DeltaBlue (measured at 50K, 200K, 1M
   candidates), so the remaining cost is the tracing work itself; parts
   2–3 (fewer candidates, heap-size-aware trigger) remain open.
+- P3.4: native code is compiled lazily. Functions are declared at start
+  and defined on their second call (on the first if they contain a
+  loop), each with the functions it calls directly; virtual calls with
+  more than 4 implementations, calls through function values and
+  by-name calls go through the entry table, so their targets compile
+  when first called. `RTS_JIT_EAGER=1` compiles everything at start.
+  AWFY harness start 193 → 42 ms (266 ms before this work; Node 92 ms);
+  hello world 4.9 → 2.7 ms. Whole-process time with 3 iterations: typed
+  suite −5% to −55%, untyped −2% to −34%. Over 15 iterations,
+  compilation included, within +2.4% of eager compilation.
+  `async.ts`'s timer margins were widened: compile pauses mid-run could
+  flip millisecond races on a loaded machine.
