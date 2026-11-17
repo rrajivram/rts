@@ -250,6 +250,44 @@ pub struct JitFn {
 }
 
 impl JitFn {
+    /// Write the words before the arguments at `argv` (the closure's cells,
+    /// the result arena, `this`, as this function takes them): the index
+    /// of the first argument, or None if compiled code can't take them.
+    #[inline(always)]
+    pub fn write_prefix(&self, argv: *mut u64, closure: Option<&Gc<Closure>>, arena: u64, this: &Value) -> Option<usize> {
+        let mut i = 0;
+        if self.env {
+            // Borrowed: the caller holds the closure.
+            unsafe { argv.write(closure?.caps.as_ptr() as u64) };
+            i = 1;
+        }
+        if self.rarena {
+            unsafe { argv.add(i).write(arena) };
+            i += 1;
+        }
+        match self.this {
+            Some(k) => Self::write_arg(argv, i, k, this),
+            None => Some(i),
+        }
+    }
+
+    /// Write `v` as a `k` at `argv[i]` (a value takes two words, borrowed):
+    /// the next index, or None if compiled code can't take it.
+    #[inline(always)]
+    pub fn write_arg(argv: *mut u64, i: usize, k: JV, v: &Value) -> Option<usize> {
+        if k == JV::Val {
+            let [t, p] = Self::val_words(v);
+            unsafe {
+                argv.add(i).write(t);
+                argv.add(i + 1).write(p);
+            }
+            Some(i + 2)
+        } else {
+            unsafe { argv.add(i).write(Self::arg_bits(k, v)?) };
+            Some(i + 1)
+        }
+    }
+
     /// A value as an argument's bits, if compiled code can take it.
     #[inline]
     pub fn arg_bits(k: JV, v: &Value) -> Option<u64> {
@@ -2269,31 +2307,7 @@ impl Lower<'_, '_> {
     /// array, through a helper for other boxed kinds.
     #[track_caller]
     fn inc_val(&mut self, t: CV, p: CV) {
-        self.stats.incs += 1;
-        if cfg!(feature = "gc") {
-            return;
-        }
-        let loc = std::panic::Location::caller();
-        let boxed = self.b.ins().icmp_imm_u(IntCC::UnsignedGreaterThanOrEqual, t, self.lay.tag_first_gc);
-        let (tag_obj, tag_arr) = (self.lay.tag_obj, self.lay.tag_arr);
-        self.if_then(boxed, |s| {
-            s.count_site(loc, true);
-            let is_obj = s.b.ins().icmp_imm_u(IntCC::Equal, t, tag_obj);
-            let is_arr = s.b.ins().icmp_imm_u(IntCC::Equal, t, tag_arr);
-            let is_box = s.b.ins().bor(is_obj, is_arr);
-            let (ob, other, done) = (s.b.create_block(), s.b.create_block(), s.b.create_block());
-            s.b.ins().brif(is_box, ob, &[], other, &[]);
-            s.b.seal_block(ob);
-            s.b.seal_block(other);
-            s.b.switch_to_block(ob);
-            s.inc_box(p);
-            s.b.ins().jump(done, &[]);
-            s.b.switch_to_block(other);
-            s.b.ins().call(s.h.inc_val, &[t, p]);
-            s.b.ins().jump(done, &[]);
-            s.b.seal_block(done);
-            s.b.switch_to_block(done);
-        });
+        self.val_count(t, p, true);
     }
 
     /// Release a reference (`p` may be null or undefined).
@@ -2322,10 +2336,7 @@ impl Lower<'_, '_> {
     #[track_caller]
     fn dec_rv(&mut self, r: RV) {
         match r.t {
-            Some(t) => {
-                self.stats.decs += 1;
-                self.release_old(t, r.v)
-            }
+            Some(t) => self.release_old(t, r.v),
             None => self.dec(r.v),
         }
     }
@@ -3155,25 +3166,7 @@ impl Lower<'_, '_> {
                 self.throw_if(bad, ERR_UNBOX_BOOL, t, r.v);
                 RV::new(self.b.ins().ireduce(types::I8, r.v))
             }
-            (JK::Val, JK::Ref) => {
-                let t = r.t.unwrap();
-                let heap = match to {
-                    JV::Arr => l.tag_arr,
-                    JV::Obj => l.tag_obj,
-                    _ => -1,
-                };
-                let is_heap = self.b.ins().icmp_imm_u(IntCC::Equal, t, heap);
-                let is_null = self.b.ins().icmp_imm_u(IntCC::Equal, t, l.tag_null);
-                let is_undef = self.b.ins().icmp_imm_u(IntCC::Equal, t, l.tag_undef);
-                let any = self.b.ins().bor(is_heap, is_null);
-                let any = self.b.ins().bor(any, is_undef);
-                let bad = self.b.ins().bxor_imm_u(any, 1);
-                self.throw_if(bad, ERR_UNBOX_REF, t, r.v);
-                let zero = self.b.ins().iconst(types::I64, 0);
-                let one = self.b.ins().iconst(types::I64, 1);
-                let nullish = self.b.ins().select(is_null, zero, one);
-                RV { v: self.b.ins().select(is_heap, r.v, nullish), t: None, owned: r.owned }
-            }
+            (JK::Val, JK::Ref) => RV { v: self.unbox_ref(r.t.unwrap(), r.v, to, ERR_UNBOX_REF), t: None, owned: r.owned },
             _ => unreachable!("not coercible: {from:?} to {to:?}"),
         };
         self.repend(r, out);
@@ -3198,10 +3191,7 @@ impl Lower<'_, '_> {
     /// could free it.
     fn field_base(&mut self, obj: &HExpr, rest: Option<&HExpr>, code: u32) -> RV {
         let r = self.value_as(obj, JV::Obj);
-        let r = match rest {
-            Some(x) if !r.owned && (if is_var_read(self.hir, obj) { self.el.effects(x, true) } else { self.el.effects(x, false) }) => self.hold(r),
-            _ => r,
-        };
+        let r = self.hold_across(r, obj, rest.as_slice());
         self.check_obj(r.v, code);
         r
     }
@@ -3245,25 +3235,29 @@ impl Lower<'_, '_> {
                 self.throw_if(bad, codes[1], tag, payload);
                 RV::new(self.b.ins().load(types::I8, mf(), at, off + 8))
             }
-            _ => {
-                let heap = match want {
-                    JV::Arr => self.lay.tag_arr,
-                    JV::Obj => self.lay.tag_obj,
-                    _ => -1,
-                };
-                let is_heap = self.b.ins().icmp_imm_u(IntCC::Equal, tag, heap);
-                let is_null = self.b.ins().icmp_imm_u(IntCC::Equal, tag, self.lay.tag_null);
-                let is_undef = self.b.ins().icmp_imm_u(IntCC::Equal, tag, self.lay.tag_undef);
-                let any = self.b.ins().bor(is_heap, is_null);
-                let any = self.b.ins().bor(any, is_undef);
-                let bad = self.b.ins().bxor_imm_u(any, 1);
-                self.throw_if(bad, codes[2], tag, payload);
-                let zero = self.b.ins().iconst(types::I64, 0);
-                let one = self.b.ins().iconst(types::I64, 1);
-                let nullish = self.b.ins().select(is_null, zero, one);
-                RV::new(self.b.ins().select(is_heap, payload, nullish))
-            }
+            _ => RV::new(self.unbox_ref(tag, payload, want, codes[2])),
         }
+    }
+
+    /// A value's words as a reference to a `to` (an instance or array; 0
+    /// for null, 1 for undefined), throwing error `code` for anything else.
+    fn unbox_ref(&mut self, tag: CV, payload: CV, to: JV, code: u32) -> CV {
+        let heap = match to {
+            JV::Arr => self.lay.tag_arr,
+            JV::Obj => self.lay.tag_obj,
+            _ => -1,
+        };
+        let is_heap = self.b.ins().icmp_imm_u(IntCC::Equal, tag, heap);
+        let is_null = self.b.ins().icmp_imm_u(IntCC::Equal, tag, self.lay.tag_null);
+        let is_undef = self.b.ins().icmp_imm_u(IntCC::Equal, tag, self.lay.tag_undef);
+        let any = self.b.ins().bor(is_heap, is_null);
+        let any = self.b.ins().bor(any, is_undef);
+        let bad = self.b.ins().bxor_imm_u(any, 1);
+        self.throw_if(bad, code, tag, payload);
+        let zero = self.b.ins().iconst(types::I64, 0);
+        let one = self.b.ins().iconst(types::I64, 1);
+        let nullish = self.b.ins().select(is_null, zero, one);
+        self.b.ins().select(is_heap, payload, nullish)
     }
 
     /// Read field `slot` of the object `p` as `want` (borrowed).
@@ -3295,28 +3289,44 @@ impl Lower<'_, '_> {
     /// Release a value overwritten in a slot (its tag, widened, and payload).
     #[track_caller]
     fn release_old(&mut self, old_tag: CV, old: CV) {
-        // Nothing to do unless it may own a box.
+        self.val_count(old_tag, old, false);
+    }
+
+    /// Take (`inc`) or release a reference to a value given as words:
+    /// nothing unless it may own a box; inline for an object or array,
+    /// through a helper for other boxed kinds.
+    #[track_caller]
+    fn val_count(&mut self, t: CV, p: CV, inc: bool) {
+        if inc {
+            self.stats.incs += 1;
+        } else {
+            self.stats.decs += 1;
+        }
+        if cfg!(feature = "gc") {
+            return;
+        }
         let loc = std::panic::Location::caller();
-        let boxed = self.b.ins().icmp_imm_u(IntCC::UnsignedGreaterThanOrEqual, old_tag, self.lay.tag_first_gc);
+        let boxed = self.b.ins().icmp_imm_u(IntCC::UnsignedGreaterThanOrEqual, t, self.lay.tag_first_gc);
         let (tag_obj, tag_arr) = (self.lay.tag_obj, self.lay.tag_arr);
         self.if_then(boxed, |s| {
-            if cfg!(feature = "gc") {
-                return;
-            }
-            s.count_site(loc, false);
-            let is_obj = s.b.ins().icmp_imm_u(IntCC::Equal, old_tag, tag_obj);
-            let is_arr = s.b.ins().icmp_imm_u(IntCC::Equal, old_tag, tag_arr);
+            s.count_site(loc, inc);
+            let is_obj = s.b.ins().icmp_imm_u(IntCC::Equal, t, tag_obj);
+            let is_arr = s.b.ins().icmp_imm_u(IntCC::Equal, t, tag_arr);
             let is_box = s.b.ins().bor(is_obj, is_arr);
             let (ob, other, done) = (s.b.create_block(), s.b.create_block(), s.b.create_block());
             s.b.ins().brif(is_box, ob, &[], other, &[]);
             s.b.seal_block(ob);
             s.b.seal_block(other);
             s.b.switch_to_block(ob);
-            s.stats.decs += 1;
-            s.dec_box(old);
+            if inc {
+                s.inc_box(p);
+            } else {
+                s.dec_box(p);
+            }
             s.b.ins().jump(done, &[]);
             s.b.switch_to_block(other);
-            s.b.ins().call(s.h.drop_val, &[old_tag, old]);
+            let h = if inc { s.h.inc_val } else { s.h.drop_val };
+            s.b.ins().call(h, &[t, p]);
             s.b.ins().jump(done, &[]);
             s.b.seal_block(done);
             s.b.switch_to_block(done);
@@ -3329,8 +3339,15 @@ impl Lower<'_, '_> {
     /// before the access) could free it.
     fn arr_base(&mut self, obj: &HExpr, rest: &[&HExpr]) -> RV {
         let r = self.value_as(obj, JV::Arr);
-        let var = is_var_read(self.hir, obj);
-        if !r.owned && rest.iter().any(|x| self.el.effects(x, var)) { self.hold(r) } else { r }
+        self.hold_across(r, obj, rest)
+    }
+
+    /// `r` (the value of `src`), owned if running `later` could free or
+    /// change it before it is used. A variable read can only be changed by
+    /// an assignment; anything else by any code that runs.
+    fn hold_across(&mut self, r: RV, src: &HExpr, later: &[&HExpr]) -> RV {
+        let var = is_var_read(self.hir, src);
+        if !r.owned && later.iter().any(|x| self.el.effects(x, var)) { self.hold(r) } else { r }
     }
 
     /// `i` as an index into the array at `a` (a real array, `al` its
@@ -3615,7 +3632,7 @@ impl Lower<'_, '_> {
                         // Only identity is compared: a borrowed left side
                         // must stay alive (and unchanged) while the right runs.
                         let x = self.rexpr(a);
-                        let x = if !x.owned && self.el.effects(b, is_var_read(self.hir, a)) { self.hold(x) } else { x };
+                        let x = self.hold_across(x, a, &[b]);
                         let y = self.rexpr(b);
                         let same = self.b.ins().icmp(IntCC::Equal, x.v, y.v);
                         let same = if loose {
@@ -3635,7 +3652,7 @@ impl Lower<'_, '_> {
             }
             HK::Binary(HBin::StrCmp(op), a, b) => {
                 let x = self.value_as(a, JV::Val);
-                let x = if !x.owned && self.el.effects(b, is_var_read(self.hir, a)) { self.hold(x) } else { x };
+                let x = self.hold_across(x, a, &[b]);
                 let y = self.value_as(b, JV::Val);
                 let r = self.op(OP_STR_CMP + *op as u32, x.t.unwrap(), x.v, Some(y));
                 self.release(x);
@@ -3749,7 +3766,7 @@ impl Lower<'_, '_> {
     /// `a === b` / `a == b` (or `!==`, `!=`) on values.
     fn val_eq(&mut self, a: &HExpr, b: &HExpr, loose: bool, eq: bool) -> CV {
         let x = self.value_as(a, JV::Val);
-        let x = if !x.owned && self.el.effects(b, is_var_read(self.hir, a)) { self.hold(x) } else { x };
+        let x = self.hold_across(x, a, &[b]);
         let y = self.value_as(b, JV::Val);
         let r = if loose {
             let r = self.op(OP_LOOSE_EQ, x.t.unwrap(), x.v, Some(y));
@@ -3972,7 +3989,7 @@ impl Lower<'_, '_> {
             HK::Cond(c, a, b) => self.cond_expr(c, a, b, want),
             HK::Binary(HBin::Concat, a, b) => {
                 let x = self.value_as(a, JV::Val);
-                let x = if !x.owned && self.el.effects(b, is_var_read(self.hir, a)) { self.hold(x) } else { x };
+                let x = self.hold_across(x, a, &[b]);
                 let y = self.value_as(b, JV::Val);
                 let p = self.op(OP_CONCAT, x.t.unwrap(), x.v, Some(y));
                 let r = self.helper_val(p);

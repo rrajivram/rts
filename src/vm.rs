@@ -733,45 +733,23 @@ impl Vm {
         let mut argv = [std::mem::MaybeUninit::<u64>::uninit(); 34];
         let argv_ptr = argv.as_mut_ptr() as *mut u64;
         let put = |i: usize, w: u64| unsafe { argv_ptr.add(i).write(w) };
-        let mut i = 0;
-        if jf.env {
-            // Borrowed: the caller holds the closure.
-            put(0, closure?.caps.as_ptr() as u64);
-            i = 1;
-        }
-        if jf.rarena {
-            // The region this call site gives the callee's fresh result (0: the heap).
+        // The region this call site gives the callee's fresh result (0: the heap).
+        let arena = if jf.rarena {
             let caller = self.frames.len() - 1;
-            let a = ci.region.and_then(|up| self.alloc_region(caller, up)).map_or(0, |r| &*self.regions[r].arena as *const _ as u64);
-            put(i, a);
-            i += 1;
-        }
-        match jf.this {
-            Some(JV::Val) => {
-                let [t, p] = JitFn::val_words(this.unwrap_or(&Value::Undef));
-                put(i, t);
-                put(i + 1, p);
-                i += 2;
-            }
-            Some(k) => {
-                put(i, JitFn::arg_bits(k, this.unwrap_or(&Value::Undef))?);
-                i += 1;
-            }
-            None => {}
-        }
+            ci.region.and_then(|up| self.alloc_region(caller, up)).map_or(0, |r| &*self.regions[r].arena as *const _ as u64)
+        } else {
+            0
+        };
+        let mut i = jf.write_prefix(argv_ptr, closure, arena, this.unwrap_or(&Value::Undef))?;
         for (&(_, r), &k) in ci.args.iter().zip(&jf.params) {
-            match k {
-                JV::Num | JV::Bool => put(i, self.scalars[sb + r as usize]),
-                // Borrowed: the caller's slot keeps it alive.
-                JV::Val => {
-                    let [t, p] = JitFn::val_words(&self.values[vb + r as usize]);
-                    put(i, t);
-                    i += 1;
-                    put(i, p);
+            i = match k {
+                JV::Num | JV::Bool => {
+                    put(i, self.scalars[sb + r as usize]);
+                    i + 1
                 }
-                _ => put(i, JitFn::arg_bits(k, &self.values[vb + r as usize])?),
-            }
-            i += 1;
+                // Borrowed: the caller's slot keeps it alive.
+                _ => JitFn::write_arg(argv_ptr, i, k, &self.values[vb + r as usize])?,
+            };
         }
         let r = match self.enter_native_code(jf, argv_ptr) {
             Ok(r) => r,
@@ -827,7 +805,7 @@ impl Vm {
     /// Call compiled function `fid` with values, if it is compiled and the
     /// arguments are values it takes. None: use the interpreter.
     fn call_native_values(&mut self, fid: u32, closure: Option<&Gc<Closure>>, this: &Value, args: &[Value]) -> Option<Result<Value, Value>> {
-        use crate::jit::{JitFn, JV};
+        use crate::jit::JitFn;
         let func = self.code(fid);
         let jf = func.jit.as_deref()?;
         // Extra arguments (a callback's index and array, say) are dropped.
@@ -836,36 +814,9 @@ impl Vm {
         }
         let args = &args[..jf.params.len()];
         let mut argv = [0u64; 35];
-        let mut i = 0;
-        if jf.env {
-            argv[0] = closure?.caps.as_ptr() as u64;
-            i = 1;
-        }
-        if jf.rarena {
-            argv[i] = 0;
-            i += 1;
-        }
-        match jf.this {
-            Some(JV::Val) => {
-                [argv[i], argv[i + 1]] = JitFn::val_words(this);
-                i += 2;
-            }
-            Some(k) => {
-                argv[i] = JitFn::arg_bits(k, this)?;
-                i += 1;
-            }
-            None => {}
-        }
+        let mut i = jf.write_prefix(argv.as_mut_ptr(), closure, 0, this)?;
         for (a, &k) in args.iter().zip(&jf.params) {
-            if k == JV::Val {
-                let [t, p] = JitFn::val_words(a);
-                argv[i] = t;
-                argv[i + 1] = p;
-                i += 2;
-            } else {
-                argv[i] = JitFn::arg_bits(k, a)?;
-                i += 1;
-            }
+            i = JitFn::write_arg(argv.as_mut_ptr(), i, k, a)?;
         }
         Some(self.enter_native_code(jf, argv.as_ptr()).map(|r| jf.ret_value(r)))
     }
