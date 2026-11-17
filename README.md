@@ -355,10 +355,23 @@ count updates from 26.0M to 1.27M (`--profile` builds report the total and
 the updates per allocated box). Errors unwind to the interpreter and release
 everything compiled code held.
 
-Findings so far: compiled code without counts at all (the tracing-GC build)
-is only 3% faster on the suite; and compiled code doesn't use scope arenas
-yet, which shows: on a list-building loop, arenas cut peak heap 9× (the nodes
-die at scope exit instead of waiting for the cycle collector).
+Where reference counting loses to the tracing GC on compiled code (suite
+geometric mean 0.123 s against 0.105 s), from `--profile` builds (which
+report compiled code's count updates by source line) and sampling:
+
+- **Count updates on stack references.** Richards makes 153M updates for
+  5,482 objects; about 70% come from locals owning their values, `this` and
+  arguments held across calls, and returned values. Only ~20% are field
+  stores, which any reference counting must do.
+- **Freeing objects one at a time.** On Storage (a tree of arrays, no
+  cycles, almost no updates in compiled code) per-object `drop` and `free`
+  are the difference; the tracing GC frees in bulk.
+- **The cycle collector.** Turning it off saves Havlak 0.106 s of its
+  0.222 s gap and CD 0.043 s of 0.073 s: trial deletion traces large live
+  structures from each candidate.
+
+Scope arenas (the next experiment as first planned) bind few objects on this
+suite (CD aside), so on their own they can't close the gap.
 
 Next: the memory-mode comparison on compiled code (arenas in compiled code; stack maps so the tracing GC can
 collect while compiled code runs), then generators, async functions and
