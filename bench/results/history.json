@@ -46,5 +46,13 @@
   "rc_geomean_s": 0.1691,
   "gc_geomean_s": 0.1498,
   "jitless_geomean_s": 0.4509
+ },
+ {
+  "commit": "743a3c7",
+  "date": "2026-11-16",
+  "step": "Native code: closures and captured variables",
+  "rc_geomean_s": 0.1352,
+  "gc_geomean_s": 0.1162,
+  "jitless_geomean_s": 0.4391
  }
 ]
