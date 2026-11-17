@@ -216,7 +216,10 @@ pub(super) struct Lower<'a, 'b> {
     /// Each `for-of`'s array (keyed by the statement's address): owned,
     /// or 1 when the loop isn't running.
     iters: FxHashMap<usize, Variable>,
+    /// Compiled functions this one calls, imported on first use.
     funcs: FxHashMap<FuncId, FuncRef>,
+    /// Every compiled function's id and signature (for importing it).
+    fdecls: &'a FxHashMap<FuncId, (ClFuncId, Signature)>,
     h: Helpers,
     lay: &'a Layout,
     classes: &'a [std::rc::Rc<ClassRt>],
@@ -2126,6 +2129,14 @@ impl Lower<'_, '_> {
         let want = jv(&e.ty).unwrap();
         let borrowed = RV::new;
         match &e.kind {
+            // As a reference (0 and 1), or as a value when the expression
+            // is typed as one (an omitted argument the checker filled in).
+            HK::Null | HK::Undefined if want.jk() == JK::Val => {
+                let tag = if matches!(e.kind, HK::Null) { self.lay.tag_null } else { self.lay.tag_undef };
+                let t = self.b.ins().iconst(types::I64, tag);
+                let p = self.b.ins().iconst(types::I64, 0);
+                RV::val(t, p)
+            }
             HK::Null => borrowed(self.b.ins().iconst(types::I64, 0)),
             HK::Undefined => borrowed(self.b.ins().iconst(types::I64, 1)),
             HK::Str(s) => {
@@ -2169,10 +2180,14 @@ impl Lower<'_, '_> {
                 if self.takes_rarena.contains(&ctor) {
                     vals.push(self.b.ins().iconst(types::I64, 0));
                 }
-                vals.push(obj);
+                // `this` as the constructor takes it (an object, or a value
+                // when untyped code leaves its type open).
+                let tv = self.hir.funcs[ctor as usize].this_var.unwrap();
+                let this = self.coerce(RV::new(obj), JV::Obj, var_jv(self.hir, tv));
+                vals.extend(this.words());
                 let pjs = self.param_jvs(ctor, false);
                 let held = self.args(args, &pjs, &mut vals, false);
-                let fr = self.funcs[&ctor];
+                let fr = self.func_ref(ctor);
                 // The constructor's result (undefined) is not used.
                 self.b.ins().call(fr, &vals);
                 self.check_status();
@@ -2452,7 +2467,7 @@ impl Lower<'_, '_> {
         }
         let pjs = self.param_jvs(g, false);
         held.extend(self.args(&c.args, &pjs, &mut vals, pure));
-        let fr = self.funcs[&g];
+        let fr = self.func_ref(g);
         let call = self.b.ins().call(fr, &vals);
         let res = RV::of_words(&self.b.inst_results(call).to_vec());
         let rj = ret_jv(hg).unwrap();
@@ -2560,6 +2575,28 @@ impl Lower<'_, '_> {
     }
 }
 
+impl Lower<'_, '_> {
+    /// The compiled function `g`, imported into this function on first use
+    /// (importing every function into every function is quadratic).
+    fn func_ref(&mut self, g: FuncId) -> FuncRef {
+        if let Some(r) = self.funcs.get(&g) {
+            return *r;
+        }
+        let (id, sig) = &self.fdecls[&g];
+        let signature = self.b.func.import_signature(sig.clone());
+        let name = self.b.func.declare_imported_user_function(cranelift_codegen::ir::UserExternalName { namespace: 0, index: id.as_u32() });
+        let r = self.b.func.import_function(cranelift_codegen::ir::ExtFuncData {
+            name: cranelift_codegen::ir::ExternalName::user(name),
+            signature,
+            // Local functions in the same module.
+            colocated: true,
+            patchable: false,
+        });
+        self.funcs.insert(g, r);
+        r
+    }
+}
+
 pub(super) fn strip_cast(e: &HExpr) -> &HExpr {
     match &e.kind {
         HK::Cast(x) => strip_cast(x),
@@ -2619,6 +2656,10 @@ pub fn compile(hir: &HProgram, prog: &mut Program, esc: &crate::escape::EscapeIn
     let lay = Layout::new();
     let mut flags = settings::builder();
     flags.set("opt_level", "speed").unwrap();
+    // The verifier checks Cranelift's own invariants; keep it for debug builds.
+    if !cfg!(debug_assertions) && std::env::var_os("RTS_JIT_DEBUG").is_none() {
+        flags.set("enable_verifier", "false").unwrap();
+    }
     let Ok(isa) = cranelift_native::builder().and_then(|b| b.finish(settings::Flags::new(flags)).map_err(|_| "isa")) else {
         return 0;
     };
@@ -2673,7 +2714,7 @@ pub fn compile(hir: &HProgram, prog: &mut Program, esc: &crate::escape::EscapeIn
         fsigs.insert(f, s);
         ids.push((f, id, eid));
     }
-    let id_of: FxHashMap<FuncId, ClFuncId> = ids.iter().map(|(f, id, _)| (*f, *id)).collect();
+    let fdecls: FxHashMap<FuncId, (ClFuncId, Signature)> = ids.iter().map(|(f, id, _)| (*f, (*id, fsigs[f].clone()))).collect();
     // Each function's variables.
     let mut vars_of: FxHashMap<FuncId, Vec<VarId>> = FxHashMap::default();
     for (v, vi) in hir.vars.iter().enumerate() {
@@ -2719,10 +2760,6 @@ pub fn compile(hir: &HProgram, prog: &mut Program, esc: &crate::escape::EscapeIn
         ctx.func.signature = fsigs[&f].clone();
         {
             let mut b = FunctionBuilder::new(&mut ctx.func, &mut fbc);
-            let mut funcs = FxHashMap::default();
-            for (g, gid) in &id_of {
-                funcs.insert(*g, m.declare_func_in_func(*gid, b.func));
-            }
             let hr: Vec<FuncRef> = h_ids.iter().map(|i| m.declare_func_in_func(*i, b.func)).collect();
             let h = Helpers::new(&hr);
             let entry = b.create_block();
@@ -2778,7 +2815,8 @@ pub fn compile(hir: &HProgram, prog: &mut Program, esc: &crate::escape::EscapeIn
                 pending: vec![],
                 loops: vec![],
                 iters: FxHashMap::default(),
-                funcs,
+                funcs: FxHashMap::default(),
+                fdecls: &fdecls,
                 h,
                 lay: &lay,
                 classes: &prog.classes,
@@ -2858,9 +2896,9 @@ pub fn compile(hir: &HProgram, prog: &mut Program, esc: &crate::escape::EscapeIn
             lw.b.finalize(m.isa().frontend_config());
         }
         if let Err(e) = m.define_function(id, &mut ctx) {
-            if debug {
-                eprintln!("rts jit: {}: {e:?}", hf.name);
-            }
+            // A code generator bug: say so rather than silently running
+            // the whole program in the interpreter.
+            eprintln!("rts: native code disabled ({} failed to compile: {e:?})", hf.name);
             return 0;
         }
         m.clear_context(&mut ctx);

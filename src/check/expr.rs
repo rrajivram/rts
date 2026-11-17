@@ -1642,9 +1642,15 @@ impl Checker {
         let param_kinds = ft
             .as_ref()
             .map(|f| f.params.iter().take_while(|p| !p.rest).map(param_arrival).collect());
+        // A function stored in a class instance's field, on a receiver that
+        // is a variable (so reading it twice is safe): read the field by
+        // position and call the value, instead of looking the name up.
+        let field_fn = !opt
+            && matches!(&recv.kind, HK::Read(p) if matches!(**p, Place::Var(_)))
+            && matches!(&member.kind, HK::Read(p) if matches!(**p, Place::Field { opt: false, .. }));
         Ok(HExpr::new(
             HK::Call(Box::new(HCall {
-                callee: Callee::Prop(prop.clone()),
+                callee: if field_fn { Callee::Value(member) } else { Callee::Prop(prop.clone()) },
                 this: Some(recv),
                 args: hargs,
                 param_kinds,

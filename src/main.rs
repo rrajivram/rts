@@ -56,6 +56,10 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    if dump {
+        // `--dump` prints bytecode: no native code needed.
+        rts::jit::disable();
+    }
     let prog = match rts::compile_file(std::path::Path::new(&path), src, erase) {
         Ok(p) => p,
         Err(e) => {
