@@ -388,7 +388,7 @@ impl Vm {
         let obj = |keys: &[&str], vals: Vec<Value>| Value::Obj(Object::new(Shape::new(keys.iter().map(|k| Rc::from(*k)).collect()), vals, None));
         let stdout = obj(&["write", "isTTY", "columns"], vec![Value::Native(Native::StdoutWrite), Value::Bool(false), Value::Num(80.0)]);
         let stderr = obj(&["write", "isTTY"], vec![Value::Native(Native::StderrWrite), Value::Bool(false)]);
-        let env = call_native(self, Native::EnvObject, Value::Undef, vec![]).unwrap_or(Value::Undef);
+        let env = call_native(self, Native::EnvObject, Value::Undef, &[]).unwrap_or(Value::Undef);
         let versions = obj(&["node", "v8", "rts"], vec![Value::str("22.12.0"), Value::str("12.4.254.21-node.21"), Value::str(env!("CARGO_PKG_VERSION"))]);
         let hrtime = Value::Native(Native::Hrtime);
         let p = obj(
@@ -493,7 +493,7 @@ impl Vm {
 
     fn call_unblocked(&mut self, callee: &Value, this: Value, args: Vec<Value>) -> Result<Value, Value> {
         match callee {
-            Value::Native(n) => call_native(self, *n, this, args),
+            Value::Native(n) => call_native(self, *n, this, &args),
             Value::Bound(b) => {
                 let mut all = b.args.clone();
                 all.extend(args);
@@ -521,7 +521,7 @@ impl Vm {
         }
         let (func, closure) = match callee {
             Value::Func(c) => (self.prog.funcs[c.func as usize].clone(), Some(c.clone())),
-            Value::Native(n) => return call_native(self, *n, this, args.to_vec()),
+            Value::Native(n) => return call_native(self, *n, this, args),
             Value::Bound(_) => return self.call(callee, this, args.to_vec()),
             v => return Err(self.type_error(format!("{} is not a function", describe(v)))),
         };
@@ -656,7 +656,7 @@ impl Vm {
     /// A built-in, as `CallTarget::Native`.
     pub(crate) fn jit_call_native(&mut self, n: Native, this: Value, args: &[Value]) -> Result<Value, Value> {
         self.gc_block += 1;
-        let r = call_native(self, n, this, args.to_vec());
+        let r = call_native(self, n, this, args);
         self.gc_block -= 1;
         r
     }
@@ -1153,7 +1153,7 @@ impl Vm {
                     Value::Native(n) => return self.call_native_ci(n, ci, recv, sb, vb),
                     f @ Value::Bound(_) => {
                         let args = self.collect_args(ci, sb, vb)?;
-                        let r = self.call(&f, recv, args)?;
+                        let r = self.call(&f, recv, args.into_vec())?;
                         if let Some((k, d)) = ci.output {
                             self.store(k, d, sb, vb, r)?;
                         }
@@ -1188,7 +1188,7 @@ impl Vm {
         }
         if ci.has_spread || (func.rest && !ci.packed_rest) {
             let args = self.collect_args(ci, sb, vb)?;
-            self.bind_values(func, nsb, nvb, args)?;
+            self.bind_values(func, nsb, nvb, args.into_vec())?;
             self.lend_bound(func, nvb, 1);
         } else {
             // Fast path: copy arguments slot to slot, converting kinds only on mismatch.
@@ -1249,8 +1249,9 @@ impl Vm {
         Ok(true)
     }
 
-    fn collect_args(&mut self, ci: &CallSite, sb: usize, vb: usize) -> Result<Vec<Value>, Value> {
-        let mut out = Vec::with_capacity(ci.args.len());
+    /// A call site's arguments as values (inline for up to four).
+    fn collect_args(&mut self, ci: &CallSite, sb: usize, vb: usize) -> Result<smallvec::SmallVec<[Value; 4]>, Value> {
+        let mut out = smallvec::SmallVec::with_capacity(ci.args.len());
         for (i, &(k, r)) in ci.args.iter().enumerate() {
             let v = self.read_val(k, r, sb, vb);
             if ci.spread.get(i).copied().unwrap_or(false) {
@@ -1264,7 +1265,7 @@ impl Vm {
 
     fn call_native_ci(&mut self, n: Native, ci: &CallSite, this: Value, sb: usize, vb: usize) -> Result<bool, Value> {
         let args = self.collect_args(ci, sb, vb)?;
-        let r = call_native(self, n, this, args)?;
+        let r = call_native(self, n, this, &args)?;
         if let Some((k, d)) = ci.output {
             self.store(k, d, sb, vb, r)?;
         }

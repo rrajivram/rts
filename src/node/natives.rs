@@ -41,7 +41,7 @@ fn sys_error(vm: &mut Vm, e: std::io::Error, syscall: &str, path: &str) -> Value
     err
 }
 
-pub fn call(vm: &mut Vm, n: Native, _this: Value, args: Vec<Value>) -> Result<Value, Value> {
+pub fn call(vm: &mut Vm, n: Native, _this: Value, args: &[Value]) -> Result<Value, Value> {
     use Native::*;
     let path = || s(&arg(&args, 0));
     Ok(match n {
@@ -510,7 +510,7 @@ pub fn uri_decode(s: &str, reserved: &str) -> Option<String> {
     String::from_utf8(out).ok()
 }
 
-pub fn call_more(vm: &mut Vm, n: Native, args: Vec<Value>) -> Result<Value, Value> {
+pub fn call_more(vm: &mut Vm, n: Native, args: &[Value]) -> Result<Value, Value> {
     use Native::*;
     Ok(match n {
         DateNowMs => Value::Num(
@@ -549,7 +549,7 @@ pub fn call_more(vm: &mut Vm, n: Native, args: Vec<Value>) -> Result<Value, Valu
 }
 
 /// console.group indentation, counters and timers; Object helpers.
-pub fn call_console_object(vm: &mut Vm, n: Native, args: Vec<Value>) -> Result<Value, Value> {
+pub fn call_console_object(vm: &mut Vm, n: Native, args: &[Value]) -> Result<Value, Value> {
     use Native::*;
     let label = |args: &[Value]| match args.first() {
         None | Some(Value::Undef) => "default".to_string(),

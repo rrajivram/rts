@@ -580,3 +580,7 @@ Not part of the brief, listed because they surfaced.
   are shared (reference-counting build); compiled `===` decides strings
   inline when they are the same box, differ in length, or are one byte
   long. Json −22% typed, −12% untyped. New test `string_chars.ts`.
+- P6: built-ins take `&[Value]` (compiled code, callbacks and bound calls
+  no longer copy arguments into a vector); the interpreter collects call
+  arguments in a `SmallVec` (inline up to four). Json −15%, Storage −11%
+  typed; Json −8%, Storage −6% untyped.

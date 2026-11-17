@@ -853,7 +853,7 @@ pub fn iterate(vm: &mut Vm, v: &Value) -> Result<Vec<Value>, Value> {
     })
 }
 
-pub fn call_native(vm: &mut Vm, n: Native, this: Value, args: Vec<Value>) -> NResult {
+pub fn call_native(vm: &mut Vm, n: Native, this: Value, args: &[Value]) -> NResult {
     use Native::*;
     fn te<T>(vm: &mut Vm, m: String) -> Result<T, Value> {
         Err(vm.type_error(m))
@@ -927,7 +927,7 @@ pub fn call_native(vm: &mut Vm, n: Native, this: Value, args: Vec<Value>) -> NRe
                 let s: f64 = args.iter().map(|a| a.to_number().powi(2)).sum();
                 return Ok(Value::Num(s.sqrt()));
             }
-            for a in &args {
+            for a in args {
                 acc = math2(n, acc, a.to_number());
             }
             Value::Num(acc)
@@ -1222,7 +1222,7 @@ pub fn call_native(vm: &mut Vm, n: Native, this: Value, args: Vec<Value>) -> NRe
         }
         StrConcat => {
             let mut s = this_str(&this).s.to_string();
-            for a in &args {
+            for a in args {
                 s.push_str(&a.to_js_string().s);
             }
             Value::str(s)
@@ -1259,7 +1259,7 @@ pub fn call_native(vm: &mut Vm, n: Native, this: Value, args: Vec<Value>) -> NRe
         ArrPush => {
             let a = arr_of(&this).or_else(|m| te(vm, m))?;
             for x in args {
-                a.push(x);
+                a.push(x.clone());
             }
             Value::Num(a.len() as f64)
         }
@@ -1282,7 +1282,7 @@ pub fn call_native(vm: &mut Vm, n: Native, this: Value, args: Vec<Value>) -> NRe
         }
         ArrUnshift => {
             let a = arr_of(&this).or_else(|m| te(vm, m))?;
-            let mut vals = args;
+            let mut vals = args.to_vec();
             vals.extend(a.to_vec());
             replace_contents(&a, vals);
             Value::Num(a.len() as f64)
@@ -1308,7 +1308,7 @@ pub fn call_native(vm: &mut Vm, n: Native, this: Value, args: Vec<Value>) -> NRe
             } else {
                 (int_arg(&args, 1, 0.0).max(0.0) as usize).min(len - start)
             };
-            let inserted: Vec<Value> = args.into_iter().skip(2).collect();
+            let inserted: Vec<Value> = args.iter().skip(2).cloned().collect();
             let removed: Vec<Value> = vals.splice(start..start + del, inserted).collect();
             replace_contents(&a, vals);
             Value::Arr(Array::new_val(removed))
@@ -1316,7 +1316,7 @@ pub fn call_native(vm: &mut Vm, n: Native, this: Value, args: Vec<Value>) -> NRe
         ArrConcat => {
             let a = arr_of(&this).or_else(|m| te(vm, m))?;
             let mut vals = a.to_vec();
-            for x in args {
+            for x in args.iter().cloned() {
                 match x {
                     Value::Arr(ref b) => vals.extend(b.to_vec()),
                     x => vals.push(x),
@@ -1347,7 +1347,7 @@ pub fn call_native(vm: &mut Vm, n: Native, this: Value, args: Vec<Value>) -> NRe
             let copy = Value::Arr(make_array(a.to_vec()));
             match n {
                 ArrToSorted => call_native(vm, ArrSort, copy, args)?,
-                ArrToReversed => call_native(vm, ArrReverse, copy, vec![])?,
+                ArrToReversed => call_native(vm, ArrReverse, copy, &[])?,
                 _ => {
                     let len = a.len();
                     let i = int_arg(&args, 0, 0.0);
@@ -1580,15 +1580,15 @@ pub fn call_native(vm: &mut Vm, n: Native, this: Value, args: Vec<Value>) -> NRe
                 _ => Value::Arr(make_array(items)),
             }
         }
-        ArrOf => Value::Arr(make_array(args)),
-        ArrNew => match args.as_slice() {
+        ArrOf => Value::Arr(make_array(args.to_vec())),
+        ArrNew => match args {
             [Value::Num(n)] => {
                 if *n < 0.0 || n.fract() != 0.0 || *n > 4294967295.0 {
                     return Err(vm.range_error("Invalid array length".into()));
                 }
                 Value::Arr(Array::new_val(vec![Value::Undef; *n as usize]))
             }
-            _ => Value::Arr(make_array(args)),
+            _ => Value::Arr(make_array(args.to_vec())),
         },
 
         // ───── Object / JSON ─────
@@ -1628,12 +1628,12 @@ pub fn call_native(vm: &mut Vm, n: Native, this: Value, args: Vec<Value>) -> NRe
             let replacer = arg(&args, 1);
             let root = Value::Obj(Object::new(Shape::new(vec!["".into()]), vec![arg(&args, 0)], None));
             let v = json_prepare(vm, &root, Value::str(""), arg(&args, 0), &replacer, 0)?;
-            let mut rest = args.clone();
+            let mut rest = args.to_vec();
             rest[0] = v.unwrap_or(Value::Undef);
             if rest.len() > 1 {
                 rest[1] = Value::Undef;
             }
-            call_native(vm, JsonStringify, Value::Undef, rest)?
+            call_native(vm, JsonStringify, Value::Undef, &rest)?
         }
         JsonStringify => {
             let indent = match args.get(2) {

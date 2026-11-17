@@ -908,7 +908,7 @@ fn describe_short(v: &Value) -> String {
 }
 
 /// Natives for generators, promises, symbols and timers.
-pub fn call_task_native(vm: &mut Vm, n: Native, this: Value, args: Vec<Value>) -> Result<Value, Value> {
+pub fn call_task_native(vm: &mut Vm, n: Native, this: Value, args: &[Value]) -> Result<Value, Value> {
     use Native::*;
     let arg = |i: usize| args.get(i).cloned().unwrap_or(Value::Undef);
     Ok(match n {
@@ -1121,7 +1121,7 @@ impl Vm {
             Instruction::DefineAccessor { object, property, getter, setter } => {
                 let site = &func.property_sites[property as usize];
                 let args = vec![val(self, object), Value::Str(JsStr::new(&*site.name)), val(self, getter), val(self, setter)];
-                call_native(self, Native::ObjDefineAccessor, Value::Undef, args)?;
+                call_native(self, Native::ObjDefineAccessor, Value::Undef, &args)?;
             }
             Instruction::GetIterator { value, output } => {
                 let it = self.get_iterator(&val(self, value))?;
