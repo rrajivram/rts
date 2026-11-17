@@ -1732,34 +1732,59 @@ fn cl_tys(k: JK) -> Vec<types::Type> {
     if k.wide() { vec![types::I64, types::I64] } else { vec![cl_ty(k)] }
 }
 
-struct Helpers {
-    modf: FuncRef,
-    pow: FuncRef,
-    int32: FuncRef,
-    math1: FuncRef,
-    math2: FuncRef,
-    new: FuncRef,
-    dec: FuncRef,
-    drop_val: FuncRef,
-    throw: FuncRef,
-    arr_get: FuncRef,
-    arr_set: FuncRef,
-    arr_len: FuncRef,
-    arr_push: FuncRef,
-    arr_new: FuncRef,
-    throw_site: FuncRef,
-    inc_val: FuncRef,
-    call: FuncRef,
-    get_prop: FuncRef,
-    set_prop: FuncRef,
-    op: FuncRef,
-    new_cell: FuncRef,
-    closure: FuncRef,
-    throw_value: FuncRef,
-    iter_array: FuncRef,
-    region_enter: FuncRef,
-    region_exit: FuncRef,
-    region_unwind: FuncRef,
+/// The runtime functions compiled code calls, each declared once: the
+/// field compiled code uses, the Rust function, and its signature.
+macro_rules! helpers {
+    ($($field:ident = $func:ident($($p:ident),*) $(-> $r:ident)?;)*) => {
+        struct Helpers {
+            $($field: FuncRef,)*
+        }
+
+        impl Helpers {
+            /// (symbol, address, parameter types, result type) of each helper.
+            fn table() -> Vec<(&'static str, *const u8, Vec<types::Type>, Option<types::Type>)> {
+                vec![$((concat!("rts_", stringify!($field)), $func as *const u8, vec![$(types::$p),*], helpers!(@ret $($r)?)),)*]
+            }
+
+            /// The helpers as referenced from one function (`refs` in `table` order).
+            fn new(refs: &[FuncRef]) -> Helpers {
+                let mut it = refs.iter().copied();
+                Helpers { $($field: it.next().unwrap(),)* }
+            }
+        }
+    };
+    (@ret) => { None };
+    (@ret $r:ident) => { Some(types::$r) };
+}
+
+helpers! {
+    modf = h_mod(F64, F64) -> F64;
+    pow = h_pow(F64, F64) -> F64;
+    int32 = h_int32(F64) -> I32;
+    math1 = h_math1(I32, F64) -> F64;
+    math2 = h_math2(I32, F64, F64) -> F64;
+    new = h_new(I64, I64) -> I64;
+    dec = h_dec(I64);
+    drop_val = h_drop_val(I64, I64);
+    throw = h_throw(I32, I64, I64);
+    arr_get = h_arr_get(I64, F64, I32) -> I64;
+    arr_set = h_arr_set(I64, F64, I64, I64, I32);
+    arr_len = h_arr_len(I64) -> F64;
+    arr_push = h_arr_push(I64, I64, I64) -> F64;
+    arr_new = h_arr_new(I32, I64) -> I64;
+    throw_site = h_throw_site(I32);
+    inc_val = h_inc_val(I64, I64);
+    call = h_call(I32, I64, I64, I64, I64, I64, I32) -> I64;
+    get_prop = h_get_prop(I64, I64, I64) -> I64;
+    set_prop = h_set_prop(I64, I64, I64, I64, I64);
+    op = h_op(I32, I64, I64, I64, I64) -> I64;
+    new_cell = h_new_cell() -> I64;
+    closure = h_closure(I32, I64, I32) -> I64;
+    throw_value = h_throw_value(I64, I64);
+    iter_array = h_iter_array(I64, I64) -> I64;
+    region_enter = h_region_enter() -> I64;
+    region_exit = h_region_exit();
+    region_unwind = h_region_unwind(I64);
 }
 
 /// Layout facts compiled code relies on.
@@ -4362,37 +4387,9 @@ pub fn compile(hir: &HProgram, prog: &mut Program, esc: &crate::escape::EscapeIn
         return 0;
     };
     let mut jb = JITBuilder::with_isa(isa, cranelift_module::default_libcall_names());
-    let helpers: [(&str, *const u8); 27] = [
-        ("rts_mod", h_mod as *const u8),
-        ("rts_pow", h_pow as *const u8),
-        ("rts_int32", h_int32 as *const u8),
-        ("rts_math1", h_math1 as *const u8),
-        ("rts_math2", h_math2 as *const u8),
-        ("rts_new", h_new as *const u8),
-        ("rts_dec", h_dec as *const u8),
-        ("rts_drop_val", h_drop_val as *const u8),
-        ("rts_throw", h_throw as *const u8),
-        ("rts_arr_get", h_arr_get as *const u8),
-        ("rts_arr_set", h_arr_set as *const u8),
-        ("rts_arr_len", h_arr_len as *const u8),
-        ("rts_arr_push", h_arr_push as *const u8),
-        ("rts_arr_new", h_arr_new as *const u8),
-        ("rts_throw_site", h_throw_site as *const u8),
-        ("rts_inc_val", h_inc_val as *const u8),
-        ("rts_call", h_call as *const u8),
-        ("rts_get_prop", h_get_prop as *const u8),
-        ("rts_set_prop", h_set_prop as *const u8),
-        ("rts_op", h_op as *const u8),
-        ("rts_new_cell", h_new_cell as *const u8),
-        ("rts_closure", h_closure as *const u8),
-        ("rts_throw_value", h_throw_value as *const u8),
-        ("rts_iter_array", h_iter_array as *const u8),
-        ("rts_region_enter", h_region_enter as *const u8),
-        ("rts_region_exit", h_region_exit as *const u8),
-        ("rts_region_unwind", h_region_unwind as *const u8),
-    ];
-    for (n, p) in helpers {
-        jb.symbol(n, p);
+    let helpers = Helpers::table();
+    for (n, p, _, _) in &helpers {
+        jb.symbol(*n, *p);
     }
     let mut m = JITModule::new(jb);
     let ptr = m.target_config().pointer_type();
@@ -4409,37 +4406,14 @@ pub fn compile(hir: &HProgram, prog: &mut Program, esc: &crate::escape::EscapeIn
         s.returns.extend(rets.iter().map(|t| AbiParam::new(*t)));
         s
     };
-    let (f64t, i64t, i32t) = (types::F64, types::I64, types::I32);
     let decl = |m: &mut JITModule, name: &str, s: Signature| m.declare_function(name, Linkage::Import, &s).unwrap();
-    let h_ids = [
-        { let s = sig(&m, &[f64t, f64t], Some(f64t)); decl(&mut m, "rts_mod", s) },
-        { let s = sig(&m, &[f64t, f64t], Some(f64t)); decl(&mut m, "rts_pow", s) },
-        { let s = sig(&m, &[f64t], Some(i32t)); decl(&mut m, "rts_int32", s) },
-        { let s = sig(&m, &[i32t, f64t], Some(f64t)); decl(&mut m, "rts_math1", s) },
-        { let s = sig(&m, &[i32t, f64t, f64t], Some(f64t)); decl(&mut m, "rts_math2", s) },
-        { let s = sig(&m, &[i64t, i64t], Some(i64t)); decl(&mut m, "rts_new", s) },
-        { let s = sig(&m, &[i64t], None); decl(&mut m, "rts_dec", s) },
-        { let s = sig(&m, &[i64t, i64t], None); decl(&mut m, "rts_drop_val", s) },
-        { let s = sig(&m, &[i32t, i64t, i64t], None); decl(&mut m, "rts_throw", s) },
-        { let s = sig(&m, &[i64t, f64t, i32t], Some(i64t)); decl(&mut m, "rts_arr_get", s) },
-        { let s = sig(&m, &[i64t, f64t, i64t, i64t, i32t], None); decl(&mut m, "rts_arr_set", s) },
-        { let s = sig(&m, &[i64t], Some(f64t)); decl(&mut m, "rts_arr_len", s) },
-        { let s = sig(&m, &[i64t, i64t, i64t], Some(f64t)); decl(&mut m, "rts_arr_push", s) },
-        { let s = sig(&m, &[i32t, i64t], Some(i64t)); decl(&mut m, "rts_arr_new", s) },
-        { let s = sig(&m, &[i32t], None); decl(&mut m, "rts_throw_site", s) },
-        { let s = sig(&m, &[i64t, i64t], None); decl(&mut m, "rts_inc_val", s) },
-        { let s = sig(&m, &[i32t, i64t, i64t, i64t, i64t, i64t, i32t], Some(i64t)); decl(&mut m, "rts_call", s) },
-        { let s = sig(&m, &[i64t, i64t, i64t], Some(i64t)); decl(&mut m, "rts_get_prop", s) },
-        { let s = sig(&m, &[i64t, i64t, i64t, i64t, i64t], None); decl(&mut m, "rts_set_prop", s) },
-        { let s = sig(&m, &[i32t, i64t, i64t, i64t, i64t], Some(i64t)); decl(&mut m, "rts_op", s) },
-        { let s = sig(&m, &[], Some(i64t)); decl(&mut m, "rts_new_cell", s) },
-        { let s = sig(&m, &[i32t, i64t, i32t], Some(i64t)); decl(&mut m, "rts_closure", s) },
-        { let s = sig(&m, &[i64t, i64t], None); decl(&mut m, "rts_throw_value", s) },
-        { let s = sig(&m, &[i64t, i64t], Some(i64t)); decl(&mut m, "rts_iter_array", s) },
-        { let s = sig(&m, &[], Some(i64t)); decl(&mut m, "rts_region_enter", s) },
-        { let s = sig(&m, &[], None); decl(&mut m, "rts_region_exit", s) },
-        { let s = sig(&m, &[i64t], None); decl(&mut m, "rts_region_unwind", s) },
-    ];
+    let h_ids: Vec<ClFuncId> = helpers
+        .iter()
+        .map(|(n, _, params, ret)| {
+            let s = sig(&m, params, *ret);
+            decl(&mut m, n, s)
+        })
+        .collect();
 
     // Declare every compiled function (typed) and its entry trampoline.
     let mut ids: Vec<(FuncId, ClFuncId, ClFuncId)> = Vec::new();
@@ -4514,35 +4488,7 @@ pub fn compile(hir: &HProgram, prog: &mut Program, esc: &crate::escape::EscapeIn
                 funcs.insert(*g, m.declare_func_in_func(*gid, b.func));
             }
             let hr: Vec<FuncRef> = h_ids.iter().map(|i| m.declare_func_in_func(*i, b.func)).collect();
-            let h = Helpers {
-                modf: hr[0],
-                pow: hr[1],
-                int32: hr[2],
-                math1: hr[3],
-                math2: hr[4],
-                new: hr[5],
-                dec: hr[6],
-                drop_val: hr[7],
-                throw: hr[8],
-                arr_get: hr[9],
-                arr_set: hr[10],
-                arr_len: hr[11],
-                arr_push: hr[12],
-                arr_new: hr[13],
-                throw_site: hr[14],
-                inc_val: hr[15],
-                call: hr[16],
-                get_prop: hr[17],
-                set_prop: hr[18],
-                op: hr[19],
-                new_cell: hr[20],
-                closure: hr[21],
-                throw_value: hr[22],
-                iter_array: hr[23],
-                region_enter: hr[24],
-                region_exit: hr[25],
-                region_unwind: hr[26],
-            };
+            let h = Helpers::new(&hr);
             let entry = b.create_block();
             b.append_block_params_for_function_params(entry);
             b.switch_to_block(entry);
