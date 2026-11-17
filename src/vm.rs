@@ -261,15 +261,7 @@ fn dyn_compare(op: CmpOp, a: &Value, b: &Value) -> bool {
 
 /// `%` with an integer fast path (fmod is slow); same results as JS, including -0.
 fn fast_mod(x: f64, y: f64) -> f64 {
-    let (xi, yi) = (x as i64, y as i64);
-    if xi as f64 == x && yi as f64 == y && yi != 0 && xi != i64::MIN {
-        let r = xi % yi;
-        if r == 0 && x < 0.0 {
-            return -0.0;
-        }
-        return r as f64;
-    }
-    x % y
+    js_mod(x, y)
 }
 
 #[inline(always)]

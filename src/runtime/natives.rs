@@ -209,7 +209,18 @@ pub fn js_pow(a: f64, b: f64) -> f64 {
     }
 }
 
+/// `a % b`: integer remainder when both are integers (fmod is slow), with
+/// the sign of `a` (`-4 % 2` and `-0 % 3` are `-0`); else fmod.
+#[inline]
 pub fn js_mod(a: f64, b: f64) -> f64 {
+    let (ai, bi) = (a as i64, b as i64);
+    if ai as f64 == a && bi as f64 == b && bi != 0 && ai != i64::MIN {
+        let r = ai % bi;
+        if r == 0 && a.is_sign_negative() {
+            return -0.0;
+        }
+        return r as f64;
+    }
     a % b
 }
 

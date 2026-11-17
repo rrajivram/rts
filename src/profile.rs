@@ -135,6 +135,7 @@ impl Profile {
             "reference-count updates: {rc_total} ({:.2} per allocated box, {objects} boxes; compiled code's are counted under Call)",
             rc_total as f64 / objects.max(1) as f64
         );
+        crate::jit::rc_sites_report();
         if let Some(path) = std::env::var_os("RTS_PROFILE_JSON") {
             let body: Vec<String> = rows
                 .iter()

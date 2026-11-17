@@ -1382,6 +1382,62 @@ fn throw_site(e: &HExpr) -> Option<(u32, Vec<std::rc::Rc<str>>)> {
     Some((*class, strs))
 }
 
+/// Profile builds: (function, jit.rs line, increment) of each count-update
+/// site in compiled code, and how often each ran.
+#[cfg(feature = "profile")]
+const RC_SITE_MAX: usize = 1 << 16;
+#[cfg(feature = "profile")]
+static mut RC_SITE_COUNTS: [u64; RC_SITE_MAX] = [0; RC_SITE_MAX];
+#[cfg(feature = "profile")]
+thread_local! {
+    static RC_SITES: RefCell<Vec<(FuncId, u32, bool)>> = const { RefCell::new(Vec::new()) };
+    static FN_NAMES: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Profile builds: the compiled-code count updates that ran most, by
+/// function and by the jit.rs line that emitted them.
+#[cfg(feature = "profile")]
+pub fn rc_sites_report() {
+    let rows: Vec<(u64, String, u32, bool)> = RC_SITES.with(|t| {
+        FN_NAMES.with(|names| {
+            let names = names.borrow();
+            t.borrow()
+                .iter()
+                .enumerate()
+                .take(RC_SITE_MAX)
+                .map(|(i, (f, line, inc))| (unsafe { (&raw const RC_SITE_COUNTS).cast::<u64>().add(i).read() }, names.get(*f as usize).cloned().unwrap_or_default(), *line, *inc))
+                .filter(|r| r.0 > 0)
+                .collect()
+        })
+    });
+    let total: u64 = rows.iter().map(|r| r.0).sum();
+    if total == 0 {
+        return;
+    }
+    let mut by_line: FxHashMap<(u32, bool), u64> = FxHashMap::default();
+    let mut by_fn: FxHashMap<String, u64> = FxHashMap::default();
+    for (n, f, line, inc) in &rows {
+        *by_line.entry((*line, *inc)).or_default() += n;
+        *by_fn.entry(f.clone()).or_default() += n;
+    }
+    eprintln!("compiled code count updates: {total}");
+    let mut v: Vec<_> = by_line.into_iter().collect();
+    v.sort_by_key(|x| std::cmp::Reverse(x.1));
+    for ((line, inc), n) in v.iter().take(15) {
+        eprintln!("  {:5.1}%  {} jit.rs:{line}", 100.0 * *n as f64 / total as f64, if *inc { "inc" } else { "dec" });
+    }
+    let mut v: Vec<_> = by_fn.into_iter().collect();
+    v.sort_by_key(|x| std::cmp::Reverse(x.1));
+    for (f, n) in v.iter().take(12) {
+        eprintln!("  {:5.1}%  in {f}", 100.0 * *n as f64 / total as f64);
+    }
+    let mut r = rows;
+    r.sort_by_key(|x| std::cmp::Reverse(x.0));
+    for (n, f, line, inc) in r.iter().take(15) {
+        eprintln!("  {:5.1}%  {} jit.rs:{line} in {f}", 100.0 * *n as f64 / total as f64, if *inc { "inc" } else { "dec" });
+    }
+}
+
 thread_local! {
     static WHY_FN: RefCell<String> = const { RefCell::new(String::new()) };
 }
@@ -1826,6 +1882,7 @@ impl Lower<'_, '_> {
     }
 
     /// Store into a global variable (`r` owned, if counted), releasing the old value.
+    #[track_caller]
     fn global_set(&mut self, v: VarId, r: RV) {
         let i = self.globals[&v] as i32;
         let vj = var_jv(self.hir, v);
@@ -1876,6 +1933,7 @@ impl Lower<'_, '_> {
     }
 
     /// Store into a global or captured variable (`r` owned, if counted), releasing the old value.
+    #[track_caller]
     fn mem_set(&mut self, v: VarId, r: RV) {
         if self.is_global(v) {
             self.global_set(v, r);
@@ -1888,6 +1946,7 @@ impl Lower<'_, '_> {
 
     /// Give captured variable `v` (one this function declares) a new cell,
     /// holding undefined, releasing the old one.
+    #[track_caller]
     fn new_cell(&mut self, v: VarId) {
         let x = self.cells[&v];
         let old = self.b.use_var(x);
@@ -1979,7 +2038,34 @@ impl Lower<'_, '_> {
     #[cfg(not(feature = "profile"))]
     fn count_rc(&mut self) {}
 
+    /// Profile builds: count a count update at the jit.rs line that asked
+    /// for it (see `rc_sites_report`).
+    #[cfg(feature = "profile")]
+    fn count_site(&mut self, loc: &'static std::panic::Location<'static>, inc: bool) {
+        let i = RC_SITES.with(|t| {
+            let mut t = t.borrow_mut();
+            let key = (self.fid, loc.line(), inc);
+            match t.iter().position(|k| *k == key) {
+                Some(i) => i,
+                None => {
+                    t.push(key);
+                    t.len() - 1
+                }
+            }
+        });
+        if i >= RC_SITE_MAX {
+            return;
+        }
+        let a = self.b.ins().iconst(types::I64, (&raw mut RC_SITE_COUNTS) as *mut u64 as i64 + 8 * i as i64);
+        let n = self.b.ins().load(types::I64, mf(), a, 0);
+        let n1 = self.b.ins().iadd_imm_s(n, 1);
+        self.b.ins().store(mf(), n1, a, 0);
+    }
+    #[cfg(not(feature = "profile"))]
+    fn count_site(&mut self, _loc: &'static std::panic::Location<'static>, _inc: bool) {}
+
     /// Increment a box's count, inline.
+    #[track_caller]
     fn inc_box(&mut self, p: CV) {
         let rc = self.b.ins().load(types::I32, mf(), p, 0);
         let rc1 = self.b.ins().iadd_imm_s(rc, 1);
@@ -1988,25 +2074,33 @@ impl Lower<'_, '_> {
     }
 
     /// Take a reference (`p` may be null or undefined).
+    #[track_caller]
     fn inc(&mut self, p: CV) {
         self.stats.incs += 1;
         if cfg!(feature = "gc") {
             return;
         }
+        let loc = std::panic::Location::caller();
         let real = self.b.ins().icmp_imm_u(IntCC::UnsignedGreaterThanOrEqual, p, 2);
-        self.if_then(real, |s| s.inc_box(p));
+        self.if_then(real, |s| {
+            s.count_site(loc, true);
+            s.inc_box(p)
+        });
     }
 
     /// Take a reference to a value given as words: inline for an object or
     /// array, through a helper for other boxed kinds.
+    #[track_caller]
     fn inc_val(&mut self, t: CV, p: CV) {
         self.stats.incs += 1;
         if cfg!(feature = "gc") {
             return;
         }
+        let loc = std::panic::Location::caller();
         let boxed = self.b.ins().icmp_imm_u(IntCC::UnsignedGreaterThanOrEqual, t, self.lay.tag_first_gc);
         let (tag_obj, tag_arr) = (self.lay.tag_obj, self.lay.tag_arr);
         self.if_then(boxed, |s| {
+            s.count_site(loc, true);
             let is_obj = s.b.ins().icmp_imm_u(IntCC::Equal, t, tag_obj);
             let is_arr = s.b.ins().icmp_imm_u(IntCC::Equal, t, tag_arr);
             let is_box = s.b.ins().bor(is_obj, is_arr);
@@ -2026,15 +2120,21 @@ impl Lower<'_, '_> {
     }
 
     /// Release a reference (`p` may be null or undefined).
+    #[track_caller]
     fn dec(&mut self, p: CV) {
         self.stats.decs += 1;
         if cfg!(feature = "gc") {
             return;
         }
+        let loc = std::panic::Location::caller();
         let real = self.b.ins().icmp_imm_u(IntCC::UnsignedGreaterThanOrEqual, p, 2);
-        self.if_then(real, |s| s.dec_box(p));
+        self.if_then(real, |s| {
+            s.count_site(loc, false);
+            s.dec_box(p)
+        });
     }
 
+    #[track_caller]
     fn inc_rv(&mut self, r: RV) {
         match r.t {
             Some(t) => self.inc_val(t, r.v),
@@ -2042,6 +2142,7 @@ impl Lower<'_, '_> {
         }
     }
 
+    #[track_caller]
     fn dec_rv(&mut self, r: RV) {
         match r.t {
             Some(t) => {
@@ -2054,6 +2155,7 @@ impl Lower<'_, '_> {
 
     /// Release a reference to a box: inline unless the count may reach zero
     /// or the box may become a cycle candidate.
+    #[track_caller]
     fn dec_box(&mut self, p: CV) {
         let rc = self.b.ins().load(types::I32, mf(), p, 0);
         let fl = self.b.ins().load(types::I32, mf(), p, 4);
@@ -2104,6 +2206,7 @@ impl Lower<'_, '_> {
     }
 
     /// An owned copy of `r`, handed to the caller (who stores it at once).
+    #[track_caller]
     fn own(&mut self, r: RV) -> RV {
         if r.owned {
             self.unpend(r);
@@ -2114,6 +2217,7 @@ impl Lower<'_, '_> {
     }
 
     /// `r`, owned while other code runs.
+    #[track_caller]
     fn hold(&mut self, r: RV) -> RV {
         if r.owned {
             return r;
@@ -2123,6 +2227,7 @@ impl Lower<'_, '_> {
     }
 
     /// Done with `r`.
+    #[track_caller]
     fn release(&mut self, r: RV) {
         if r.owned {
             self.unpend(r);
@@ -2133,6 +2238,7 @@ impl Lower<'_, '_> {
     }
 
     /// Leave for the unwind block, releasing the pending temporaries.
+    #[track_caller]
     fn bail(&mut self) {
         for (v, t) in self.pending.clone() {
             self.dec_rv(RV { v, t, owned: true });
@@ -2141,6 +2247,7 @@ impl Lower<'_, '_> {
     }
 
     /// Release every owned variable (except `keep`) and cell.
+    #[track_caller]
     fn release_vars(&mut self, keep: Option<VarId>) {
         for v in self.owned.clone() {
             if Some(v) != keep {
@@ -2592,6 +2699,7 @@ impl Lower<'_, '_> {
     }
 
     /// Store a value (owned, if counted) into a variable, releasing the old one.
+    #[track_caller]
     fn set_var(&mut self, v: VarId, val: RV) {
         if self.el.vjk(v).unwrap().counted() && !self.borrowed.contains(&v) {
             let old = self.use_var(v);
@@ -2723,8 +2831,40 @@ impl Lower<'_, '_> {
             NumOp::Sub => ins.fsub(a, b),
             NumOp::Mul => ins.fmul(a, b),
             NumOp::Div => ins.fdiv(a, b),
-            NumOp::Mod | NumOp::Exp => {
-                let h = if op == NumOp::Mod { self.h.modf } else { self.h.pow };
+            NumOp::Mod => {
+                // Positive integers (exactly representable): integer
+                // remainder; anything else (signs, zero, fractions, NaN):
+                // fmod, as the interpreter.
+                let ai = self.b.ins().fcvt_to_sint_sat(types::I64, a);
+                let bi = self.b.ins().fcvt_to_sint_sat(types::I64, b);
+                let af = self.b.ins().fcvt_from_sint(types::F64, ai);
+                let bf = self.b.ins().fcvt_from_sint(types::F64, bi);
+                let ea = self.b.ins().fcmp(FloatCC::Equal, af, a);
+                let eb = self.b.ins().fcmp(FloatCC::Equal, bf, b);
+                let pa = self.b.ins().icmp_imm_s(IntCC::SignedGreaterThan, ai, 0);
+                let pb = self.b.ins().icmp_imm_s(IntCC::SignedGreaterThan, bi, 0);
+                let ok = self.b.ins().band(ea, eb);
+                let ok = self.b.ins().band(ok, pa);
+                let ok = self.b.ins().band(ok, pb);
+                let (fast, slow, done) = (self.b.create_block(), self.b.create_block(), self.b.create_block());
+                self.b.append_block_param(done, types::F64);
+                self.b.ins().brif(ok, fast, &[], slow, &[]);
+                self.b.seal_block(fast);
+                self.b.seal_block(slow);
+                self.b.switch_to_block(fast);
+                let r = self.b.ins().srem(ai, bi);
+                let r = self.b.ins().fcvt_from_sint(types::F64, r);
+                self.b.ins().jump(done, &[r.into()]);
+                self.b.switch_to_block(slow);
+                let c = self.b.ins().call(self.h.modf, &[a, b]);
+                let r = self.b.inst_results(c)[0];
+                self.b.ins().jump(done, &[r.into()]);
+                self.b.seal_block(done);
+                self.b.switch_to_block(done);
+                self.b.block_params(done)[0]
+            }
+            NumOp::Exp => {
+                let h = self.h.pow;
                 let c = self.b.ins().call(h, &[a, b]);
                 self.b.inst_results(c)[0]
             }
@@ -2893,6 +3033,7 @@ impl Lower<'_, '_> {
 
     /// Store `r` (a `vj`, owned if counted) into the slot at `at + off`,
     /// then release the old value.
+    #[track_caller]
     fn store_slot(&mut self, at: CV, off: i32, vj: JV, r: RV) {
         let old_tag = self.b.ins().load(types::I8, mf(), at, off);
         let old_tag = self.b.ins().uextend(types::I64, old_tag);
@@ -2904,20 +3045,24 @@ impl Lower<'_, '_> {
     }
 
     /// Store `r` (a `vj`, owned if counted) into field `slot` of `p`.
+    #[track_caller]
     fn store_field(&mut self, p: CV, slot: u32, vj: JV, r: RV) {
         let off = Object::field_offset(slot as usize) as i32;
         self.store_slot(p, off, vj, r);
     }
 
     /// Release a value overwritten in a slot (its tag, widened, and payload).
+    #[track_caller]
     fn release_old(&mut self, old_tag: CV, old: CV) {
         // Nothing to do unless it may own a box.
+        let loc = std::panic::Location::caller();
         let boxed = self.b.ins().icmp_imm_u(IntCC::UnsignedGreaterThanOrEqual, old_tag, self.lay.tag_first_gc);
         let (tag_obj, tag_arr) = (self.lay.tag_obj, self.lay.tag_arr);
         self.if_then(boxed, |s| {
             if cfg!(feature = "gc") {
                 return;
             }
+            s.count_site(loc, false);
             let is_obj = s.b.ins().icmp_imm_u(IntCC::Equal, old_tag, tag_obj);
             let is_arr = s.b.ins().icmp_imm_u(IntCC::Equal, old_tag, tag_arr);
             let is_box = s.b.ins().bor(is_obj, is_arr);
@@ -3073,6 +3218,7 @@ impl Lower<'_, '_> {
     /// `a[i] = r` (`r` a `vj`, owned if counted): inline for an in-bounds
     /// integer index (numbers into number storage, anything into value
     /// storage), else through the helper.
+    #[track_caller]
     fn arr_set(&mut self, a: CV, i: CV, vj: JV, r: RV) {
         let Some(al) = self.lay.arr else { return self.arr_set_slow(a, i, vj, r) };
         let (fast, slow, done) = (self.b.create_block(), self.b.create_block(), self.b.create_block());
@@ -4098,6 +4244,17 @@ pub fn compile(hir: &HProgram, prog: &mut Program) -> usize {
             }
         }
     }
+    #[cfg(feature = "profile")]
+    FN_NAMES.with(|n| {
+        *n.borrow_mut() = hir
+            .funcs
+            .iter()
+            .map(|hf| match hf.class {
+                Some(c) => format!("{}.{}", hir.classes[c as usize].name, hf.name),
+                None => hf.name.to_string(),
+            })
+            .collect()
+    });
     let mut stats = RcStats::default();
     let mut ctx = m.make_context();
     let mut fbc = FunctionBuilderContext::new();
