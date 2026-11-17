@@ -325,25 +325,46 @@ the next experiments (see [Next steps](#next-steps)).
 
 ## Native code (in progress)
 
-Functions are compiled to machine code at start-up with
-[Cranelift](https://cranelift.dev) (`src/jit/`). Numbers, booleans and
-class instances or arrays are held unboxed; any other value (`T`, strings,
-unions, `any`) as its two words (tag, payload). Bodies may use arithmetic,
-comparisons, control flow, `Math.*`, field and element access, properties by
-name, strings, global variables, closures and captured variables (in cells,
-as the interpreter keeps them), `new`, array literals and `push`,
-`throw new C('…')`, and calls: direct to other compiled functions (methods
-too, when the class hierarchy shows a single target), otherwise through the
-interpreter, which enters compiled callees (closures included) directly.
-`--no-jit` turns it off, and `RTS_JIT_DEBUG=1` / `RTS_JIT_WHY=<function>|*`
-say what compiled and why not. `switch`, `for-of` (arrays directly, other
-iterables through a copy of their values) and `throw` of any value compile
-too. Not compiled yet: `try`, object literals, string indexing, generators
-and async functions.
+Functions are compiled to machine code with [Cranelift](https://cranelift.dev)
+(`src/jit/`), lazily: on a function's second call (its first, if it contains
+a loop), together with the functions it calls directly. `RTS_JIT_EAGER=1`
+compiles everything at start; `--no-jit` turns it off; `RTS_JIT_DEBUG=1`
+lists what was compiled and which call sites still go through the
+interpreter, and `RTS_JIT_WHY=<function>|*` says why a function wasn't
+compiled. The AWFY harness starts in 42 ms (Node: 92 ms).
 
-Typed suite geometric mean: 0.494 s → 0.237 s (`node --jitless`: 0.452 s).
-List runs 8× faster than in the interpreter, Towers 8.6×, Queens 9.9×,
-Permute 9.2×, Bounce 2.3×; Mandelbrot is within 20% of Node's optimizing JIT.
+Numbers, booleans and class instances or arrays are held unboxed; any other
+value (`T`, strings, unions, `any`) as its two words (tag, payload). Bodies
+may use arithmetic, comparisons, control flow, `Math.*`, fields, elements,
+properties by name, `obj[key]`, strings, globals, closures and captured
+variables (in cells, as the interpreter keeps them), `new`, array literals
+and `push`, `switch`, `for-of`, `throw` of any value, and untyped operators
+(`+`, arithmetic and comparisons on `any`: numbers inline, the rest through
+the interpreter's implementation), so untyped JavaScript compiles too. Not
+compiled yet: `try`, object literals, generators and async functions.
+
+Calls between compiled functions stay in compiled code:
+
+- **Direct** calls, and methods whose class hierarchy shows one target.
+- **Virtual** calls with several implementations compare the receiver's
+  class and call the implementation (directly, or through a table of
+  entry points when it is compiled later).
+- **Function values**: a closure whose function is compiled with the kinds
+  the call site passes is called directly (found by function id in the
+  table); other kinds (generic callbacks) go through a per-function
+  *adapter* that checks and unboxes value arguments inline.
+- **By name** (interfaces, generics, untyped code): an inline cache per call
+  site, keyed on the receiver's shape and class, calls the method's adapter.
+
+Anything else (bound functions, built-ins, a mismatch) goes through the
+interpreter, which enters compiled callees directly.
+
+Typed suite geometric mean (one iteration, steady state): 0.108 s with
+reference counting, 0.088 s with the tracing GC (`node --jitless`: 0.441 s).
+The untyped JavaScript suite also runs compiled: 14% (NBody) to 58%
+(Mandelbrot) faster than the interpreter, then 18–39% faster again with the
+by-name call caches. See `docs/codebase-review.md` for the measurements
+behind each step.
 
 **Reference counts in compiled code** are maintained inline, with elision
 rules: parameters borrow; a borrowed value used at once (a field read's base,
@@ -380,9 +401,11 @@ faster than `--no-arena`. They save the `free` but not the count updates:
 on CD only 3% of compiled code's count updates touch arena objects. So on
 this suite arenas can't close the gap to the tracing GC.
 
-Next: the memory-mode comparison on compiled code (arenas in compiled code; stack maps so the tracing GC can
-collect while compiled code runs), then generators, async functions and
-exceptions. LLVM is planned as a later, more optimizing tier.
+Next: stack maps so the tracing GC can collect while compiled code runs,
+fewer cycle-collector candidates, smaller objects (see
+`docs/codebase-review.md` for the full list), then generators, async
+functions and exceptions in compiled code. LLVM is planned as a later, more
+optimizing tier.
 
 ## Supported TypeScript and Node
 

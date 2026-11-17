@@ -72,7 +72,10 @@ def programs():
 
 
 def run(cmd, cwd):
-    p = subprocess.run(["/usr/bin/time", "-l"] + cmd, cwd=cwd, capture_output=True, text=True)
+    # rts compiles native code lazily, during the first iteration; compile it
+    # all up front so the harness's time is the benchmark's steady state.
+    env = dict(os.environ, RTS_JIT_EAGER="1")
+    p = subprocess.run(["/usr/bin/time", "-l"] + cmd, cwd=cwd, capture_output=True, text=True, env=env)
     if p.returncode != 0:
         raise RuntimeError(f"{' '.join(cmd)} failed:\n{p.stderr[-2000:]}")
     err = p.stderr

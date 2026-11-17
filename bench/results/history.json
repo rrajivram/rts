@@ -78,5 +78,13 @@
   "rc_geomean_s": 0.1164,
   "gc_geomean_s": 0.0969,
   "jitless_geomean_s": 0.4374
+ },
+ {
+  "commit": "9b0466f",
+  "date": "2026-11-17",
+  "step": "Session: native-code calls, untyped code, strings, built-in slices, collector, lazy compile (steady state: RTS_JIT_EAGER), simplifications",
+  "rc_geomean_s": 0.1077,
+  "gc_geomean_s": 0.0876,
+  "jitless_geomean_s": 0.4407
  }
 ]
