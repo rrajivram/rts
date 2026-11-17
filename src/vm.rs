@@ -749,7 +749,8 @@ impl Vm {
         } else {
             0
         };
-        let mut i = jf.write_prefix(argv_ptr, closure, arena, this.unwrap_or(&Value::Undef))?;
+        // SAFETY: `argv` has two words per argument, 15 arguments at most.
+        let mut i = unsafe { jf.write_prefix(argv_ptr, closure, arena, this.unwrap_or(&Value::Undef)) }?;
         for (&(_, r), &k) in ci.args.iter().zip(&jf.params) {
             i = match k {
                 JV::Num | JV::Bool => {
@@ -757,7 +758,7 @@ impl Vm {
                     i + 1
                 }
                 // Borrowed: the caller's slot keeps it alive.
-                _ => JitFn::write_arg(argv_ptr, i, k, &self.values[vb + r as usize])?,
+                _ => unsafe { JitFn::write_arg(argv_ptr, i, k, &self.values[vb + r as usize]) }?,
             };
         }
         let r = match self.enter_native_code(jf, argv_ptr) {
@@ -823,9 +824,10 @@ impl Vm {
         }
         let args = &args[..jf.params.len()];
         let mut argv = [0u64; 35];
-        let mut i = jf.write_prefix(argv.as_mut_ptr(), closure, 0, this)?;
+        // SAFETY: `argv` has two words per argument, 15 arguments at most.
+        let mut i = unsafe { jf.write_prefix(argv.as_mut_ptr(), closure, 0, this) }?;
         for (a, &k) in args.iter().zip(&jf.params) {
-            i = JitFn::write_arg(argv.as_mut_ptr(), i, k, a)?;
+            i = unsafe { JitFn::write_arg(argv.as_mut_ptr(), i, k, a) }?;
         }
         Some(self.enter_native_code(jf, argv.as_ptr()).map(|r| jf.ret_value(r)))
     }

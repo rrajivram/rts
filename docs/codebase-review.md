@@ -538,3 +538,21 @@ Not part of the brief, listed because they surfaced.
 - Benchmarks without polymorphic calls (Bounce, List, Towers, Permute)
   spend 94–100% of their time in compiled code.
 - Every memory mode and stress setting passes the test programs.
+
+---
+
+## Progress log
+
+- `3f6562b` (P3 parts 1–3, P3.6, P2): callees imported on first use and
+  the verifier off in release builds (AWFY harness start 252 → 166 ms;
+  8,000 functions 7.9 s → 1.2 s, now linear); `--dump` skips native code;
+  a Cranelift failure is reported. `this.f(...)` on a field holding a
+  function reads it by position (typed Richards −30%). Fixed on the way:
+  constructors with an untyped `this` got a one-word `this`, a verifier
+  error that had silently kept the untyped JS suite fully interpreted.
+- `119d143`: untyped operators (`+`, arithmetic, comparisons, `-x`, `~x`,
+  ToNumber), `obj[key]` reads and writes and compound assignment on
+  properties compile (numbers inline, the rest through helpers sharing
+  new `Vm` methods with the interpreter); `set_prop` tries its cache
+  first. Untyped JS suite vs. the interpreter: every benchmark faster,
+  −14% (NBody) to −58% (Mandelbrot), CD −33%, Havlak −18%.

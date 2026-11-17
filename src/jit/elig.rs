@@ -502,6 +502,44 @@ impl Elig<'_> {
             })
     }
 
+    /// A method call with several implementations, all compiled and taking
+    /// the same kinds: each receiver class (the static class and its
+    /// subclasses) and the function it calls. Compiled code dispatches on
+    /// the receiver's class and calls the implementation directly.
+    pub(super) fn virt_targets(&self, f: FuncId, c: &HCall) -> Option<Vec<(u32, FuncId)>> {
+        let Callee::Method { class, vslot } = c.callee else { return None };
+        let t = c.this.as_ref()?;
+        if c.opt || self.devirt(class, vslot).is_some() {
+            return None;
+        }
+        let sig = |g: FuncId| -> Option<(Vec<Option<JK>>, Option<JV>)> {
+            let hg = &self.hir.funcs[g as usize];
+            if !self.set.contains(&g) || !hg.free.is_empty() || hg.params.len() != c.args.len() {
+                return None;
+            }
+            let tv = hg.this_var?;
+            if var_jv(self.hir, tv) != JV::Obj {
+                return None;
+            }
+            let kinds = std::iter::once(tv).chain(hg.params.iter().map(|p| p.var)).map(|v| self.vjk(v)).collect();
+            Some((kinds, ret_jv(hg)))
+        };
+        let mut out = Vec::new();
+        let mut first = None;
+        for &k in &self.subclasses[class as usize] {
+            let g = self.hir.classes[k as usize].vtable.get(vslot as usize)?.1;
+            let s = sig(g)?;
+            match &first {
+                None => first = Some(s),
+                Some(f0) if *f0 == s => {}
+                Some(_) => return None,
+            }
+            out.push((k, g));
+        }
+        let g0 = out.first()?.1;
+        (self.fits(f, t, JK::Ref) && self.args(f, g0, &c.args)).then_some(out)
+    }
+
     /// The compiled function a call goes to directly, if any.
     pub(super) fn direct_target(&self, c: &HCall) -> Option<FuncId> {
         let g = match &c.callee {
@@ -538,6 +576,9 @@ impl Elig<'_> {
             let hg = &self.hir.funcs[g as usize];
             let this_ok = c.this.as_ref().is_none_or(|t| hg.this_var.is_some_and(|tv| self.fits(f, t, self.vjk(tv).unwrap())));
             return this_ok && coercible(ret_jk(hg).unwrap(), k) && self.args(f, g, &c.args);
+        }
+        if let Some(t) = self.virt_targets(f, c) {
+            return coercible(ret_jk(&self.hir.funcs[t[0].1 as usize]).unwrap(), k);
         }
         let this_ok = c.this.as_ref().is_none_or(|t| self.fits(f, t, JK::Val));
         match &c.callee {

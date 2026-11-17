@@ -279,8 +279,11 @@ impl JitFn {
     /// Write the words before the arguments at `argv` (the closure's cells,
     /// the result arena, `this`, as this function takes them): the index
     /// of the first argument, or None if compiled code can't take them.
+    ///
+    /// # Safety
+    /// `argv` must have room for the words written (two per argument).
     #[inline(always)]
-    pub fn write_prefix(&self, argv: *mut u64, closure: Option<&Gc<Closure>>, arena: u64, this: &Value) -> Option<usize> {
+    pub(crate) unsafe fn write_prefix(&self, argv: *mut u64, closure: Option<&Gc<Closure>>, arena: u64, this: &Value) -> Option<usize> {
         let mut i = 0;
         if self.env {
             // Borrowed: the caller holds the closure.
@@ -292,15 +295,18 @@ impl JitFn {
             i += 1;
         }
         match self.this {
-            Some(k) => Self::write_arg(argv, i, k, this),
+            Some(k) => unsafe { Self::write_arg(argv, i, k, this) },
             None => Some(i),
         }
     }
 
     /// Write `v` as a `k` at `argv[i]` (a value takes two words, borrowed):
     /// the next index, or None if compiled code can't take it.
+    ///
+    /// # Safety
+    /// `argv` must have room for the words written at `i`.
     #[inline(always)]
-    pub fn write_arg(argv: *mut u64, i: usize, k: JV, v: &Value) -> Option<usize> {
+    pub(crate) unsafe fn write_arg(argv: *mut u64, i: usize, k: JV, v: &Value) -> Option<usize> {
         if k == JV::Val {
             let [t, p] = Self::val_words(v);
             unsafe {

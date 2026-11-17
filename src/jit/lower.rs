@@ -2565,6 +2565,9 @@ impl Lower<'_, '_> {
         if let Some(g) = self.el.direct_target(c) {
             return self.call_compiled(e, c, g, want);
         }
+        if let Some(t) = self.el.virt_targets(self.fid, c) {
+            return self.call_virtual(e, c, &t, want);
+        }
         match &c.callee {
             Callee::Native(Native::ArrPush) if self.el.inline_push(self.fid, c, want.jk()) => {
                 let (t, [HElem::Expr(x)]) = (c.this.as_ref().unwrap(), &c.args[..]) else { unreachable!() };
@@ -2629,8 +2632,130 @@ impl Lower<'_, '_> {
         self.coerce(res, rj, want)
     }
 
+    /// A method call with several compiled implementations (`targets`:
+    /// receiver class and function): compare the receiver's class with each
+    /// and call the implementation directly. Any other receiver (possible
+    /// only through unchecked casts) goes through the interpreter, as before.
+    fn call_virtual(&mut self, e: &HExpr, c: &HCall, targets: &[(u32, FuncId)], want: JV) -> RV {
+        let Callee::Method { vslot, .. } = c.callee else { unreachable!() };
+        let g0 = targets[0].1;
+        let pure = targets.iter().all(|(_, g)| self.el.pure.contains(g));
+        // The receiver and arguments, once, in the kinds every implementation takes.
+        let t = c.this.as_ref().unwrap();
+        let this = self.value_as(t, JV::Obj);
+        let this = if self.must_hold(&this, t, &c.args, pure) { self.hold(this) } else { this };
+        self.check_obj(this.v, ERR_METHOD);
+        let mut held = vec![this];
+        let pjs = self.param_jvs(g0, false);
+        let mut args: Vec<(JV, RV)> = Vec::new();
+        for (i, a) in c.args.iter().enumerate() {
+            let HElem::Expr(x) = a else { unreachable!() };
+            let r = self.value_as(x, pjs[i]);
+            let r = if pjs[i].jk().counted() && self.must_hold(&r, x, &c.args[i + 1..], pure) { self.hold(r) } else { r };
+            if pjs[i].jk().counted() {
+                held.push(r);
+            }
+            args.push((pjs[i], r));
+        }
+        let arena = if targets.iter().any(|(_, g)| self.takes_rarena.contains(g)) {
+            Some(self.arena_for(e as *const HExpr as usize).unwrap_or_else(|| self.b.ins().iconst(types::I64, 0)))
+        } else {
+            None
+        };
+        // The receiver's class (an `Rc<ClassRt>`'s bits in the object).
+        let off = (Gc::<Object>::VALUE_OFFSET + std::mem::offset_of!(Object, class)) as i32;
+        let cls = self.b.ins().load(types::I64, mf(), this.v, off);
+        let merge = self.b.create_block();
+        self.b.append_block_param(merge, types::I64);
+        self.b.append_block_param(merge, types::I64);
+        let mut impls: Vec<FuncId> = targets.iter().map(|(_, g)| *g).collect();
+        impls.dedup();
+        impls.sort();
+        impls.dedup();
+        for g in impls {
+            let mut hit: Option<CV> = None;
+            for (k, _) in targets.iter().filter(|(_, h)| *h == g) {
+                let bits = class_bits(&self.classes[*k as usize]);
+                let eq = self.b.ins().icmp_imm_u(IntCC::Equal, cls, bits);
+                hit = Some(match hit {
+                    Some(h) => self.b.ins().bor(h, eq),
+                    None => eq,
+                });
+            }
+            let (call_b, next) = (self.b.create_block(), self.b.create_block());
+            self.b.ins().brif(hit.unwrap(), call_b, &[], next, &[]);
+            self.b.seal_block(call_b);
+            self.b.seal_block(next);
+            self.b.switch_to_block(call_b);
+            let mut vals = vec![self.ctx];
+            if self.takes_rarena.contains(&g) {
+                vals.push(arena.unwrap());
+            }
+            vals.push(this.v);
+            for (pj, r) in &args {
+                if pj.jk().counted() {
+                    vals.extend(r.words());
+                } else {
+                    vals.push(r.v);
+                }
+            }
+            let fr = self.func_ref(g);
+            let call = self.b.ins().call(fr, &vals);
+            let res = RV::of_words(&self.b.inst_results(call).to_vec());
+            let (rt, rp) = self.value_words(ret_jv(&self.hir.funcs[g as usize]).unwrap(), res);
+            self.b.ins().jump(merge, &[rt.into(), rp.into()]);
+            self.b.switch_to_block(next);
+        }
+        // Any other receiver: through the interpreter, with the values.
+        {
+            use cranelift_codegen::ir::{StackSlotData, StackSlotKind};
+            let n = args.len();
+            let argv = if n > 0 {
+                let slot = self.b.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, (16 * n) as u32, 4));
+                self.b.ins().stack_addr(types::I64, slot, 0)
+            } else {
+                self.b.ins().iconst(types::I64, 0)
+            };
+            for (i, (pj, r)) in args.clone().into_iter().enumerate() {
+                let (wt, wp) = self.value_words(pj, r);
+                self.b.ins().store(mf(), wt, argv, (16 * i) as i32);
+                self.b.ins().store(mf(), wp, argv, (16 * i + 8) as i32);
+            }
+            let (tt, tp) = self.value_words(JV::Obj, this);
+            let kind = self.b.ins().iconst(types::I32, CALL_VSLOT as i64);
+            let a = self.b.ins().iconst(types::I64, vslot as i64);
+            let z = self.b.ins().iconst(types::I64, 0);
+            let argc = self.b.ins().iconst(types::I32, n as i64);
+            let call = self.b.ins().call(self.h.call, &[kind, a, z, tt, tp, argv, argc]);
+            let p = self.b.inst_results(call)[0];
+            let t = self.b.ins().load(types::I64, mf(), self.ctx, CTX_RET_TAG);
+            self.b.ins().jump(merge, &[t.into(), p.into()]);
+        }
+        self.b.seal_block(merge);
+        self.b.switch_to_block(merge);
+        let ps = self.b.block_params(merge).to_vec();
+        // Owned (a compiled result, or the interpreter's); numbers carry no count.
+        let r = self.fresh(RV::val(ps[0], ps[1]));
+        self.check_status();
+        for h in held {
+            self.release(h);
+        }
+        self.coerce(r, JV::Val, want)
+    }
+
     /// A call through the interpreter (`h_call`): an owned value.
     fn call_interp(&mut self, c: &HCall) -> RV {
+        if std::env::var_os("RTS_JIT_DEBUG").is_some() {
+            let name = |g: FuncId| self.hir.funcs[g as usize].name.to_string();
+            let what = match &c.callee {
+                Callee::Direct { func, .. } => format!("function {}", name(*func)),
+                Callee::Method { class, vslot } => format!("method {}.{}", self.hir.classes[*class as usize].name, self.hir.classes[*class as usize].vtable[*vslot as usize].0),
+                Callee::Prop(p) => format!("property {p}"),
+                Callee::Value(_) => "a function value".into(),
+                Callee::Native(n) => format!("built-in {}", n.name()),
+            };
+            eprintln!("rts jit: {} calls {what} through the interpreter", name(self.fid));
+        }
         let mut held = Vec::new();
         // The receiver, then the function, then the arguments.
         let this = match &c.this {
@@ -2745,6 +2870,14 @@ impl Lower<'_, '_> {
         self.funcs.insert(g, r);
         r
     }
+}
+
+/// The bits of a class's `Rc` as an object stores them in its `class`
+/// field (`Option<Rc<ClassRt>>`, a non-null pointer when set).
+fn class_bits(c: &std::rc::Rc<ClassRt>) -> i64 {
+    const _: () = assert!(std::mem::size_of::<Option<std::rc::Rc<ClassRt>>>() == 8);
+    // SAFETY: an `Rc` is one pointer; reading its bits takes no count.
+    unsafe { std::mem::transmute_copy::<std::rc::Rc<ClassRt>, i64>(c) }
 }
 
 pub(super) fn strip_cast(e: &HExpr) -> &HExpr {
