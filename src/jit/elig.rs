@@ -136,7 +136,7 @@ impl Elig<'_> {
             HK::Call(c) => !assigns_only && !self.pure_call(c),
             // These may run any code (a getter, `toString`, a constructor).
             HK::New { .. } | HK::Array(_) | HK::NewBuiltin(..) | HK::Unary(HUnary::ToStr, _) | HK::Binary(HBin::DynAdd, ..) => !assigns_only,
-            HK::Read(p) => !assigns_only && matches!(**p, Place::Prop { .. }),
+            HK::Read(p) => !assigns_only && matches!(**p, Place::Prop { .. } | Place::DynIndex { .. }),
             _ => false,
         };
         top || children(e).into_iter().any(|x| self.effects(x, assigns_only))
@@ -182,7 +182,7 @@ impl Elig<'_> {
                 matches!(**p, Place::Var(v) if self.hir.vars[v as usize].owner.is_some() && !self.hir.vars[v as usize].captured)
             }
             HK::New { .. } | HK::Array(_) | HK::NewBuiltin(..) | HK::Unary(HUnary::ToStr, _) | HK::Binary(HBin::DynAdd, ..) => false,
-            HK::Read(p) => !matches!(**p, Place::Prop { .. }),
+            HK::Read(p) => !matches!(**p, Place::Prop { .. } | Place::DynIndex { .. }),
             HK::Call(c) => self.pure_call(c),
             _ => true,
         };
@@ -413,7 +413,13 @@ impl Elig<'_> {
             HK::Assign(p, x) => self.assign_ok(f, p, x, k),
             HK::Compound(p, HBin::Num(_), x) => k == JK::Num && self.num_place(f, p) && is(x, JK::Num),
             HK::Update { place, .. } => k == JK::Num && self.num_place(f, place),
-            HK::Compound(p, HBin::Concat, x) => concat_assign(p, x, &e.ty).is_some_and(|a| self.expr(f, &a) == Some(k)),
+            HK::Compound(p, op, x) => compound_assign(self.hir, p, *op, x, &e.ty).is_some_and(|a| self.expr(f, &a) == Some(k)),
+            // Untyped operators: through the interpreter's implementation.
+            HK::Binary(HBin::DynAdd | HBin::DynNumeric(_), a, b) => k == JK::Val && fits(a, JK::Val) && fits(b, JK::Val),
+            HK::Binary(HBin::DynNum(_), a, b) => k == JK::Num && fits(a, JK::Val) && fits(b, JK::Val),
+            HK::Binary(HBin::DynCmp(_), a, b) => k == JK::Bool && fits(a, JK::Val) && fits(b, JK::Val),
+            HK::Unary(HUnary::NegDyn | HUnary::BitNotDyn, x) => k == JK::Val && fits(x, JK::Val),
+            HK::Unary(HUnary::ToNum, x) => k == JK::Num && fits(x, JK::Val),
             HK::Cast(x) => fits(x, k),
             HK::Seq(xs) => !xs.is_empty() && xs.iter().all(|x| self.expr(f, x).is_some()) && fits(xs.last().unwrap(), k),
             HK::Call(c) => self.call(f, c, k),
@@ -459,6 +465,7 @@ impl Elig<'_> {
             Place::Field { obj, opt: false, .. } => self.expr(f, obj) == Some(JK::Ref) && jv(&obj.ty) == Some(JV::Obj),
             Place::Index { obj, index, opt: false } => self.is_array(f, obj) && self.expr(f, index) == Some(JK::Num),
             Place::Prop { obj, opt: false, .. } => self.fits(f, obj, JK::Val),
+            Place::DynIndex { obj, key, opt: false } => self.fits(f, obj, JK::Val) && self.fits(f, key, JK::Val),
             _ => false,
         }
     }
@@ -554,8 +561,11 @@ impl Elig<'_> {
 
 /// `p += x` on strings as `p = p + x`, when evaluating `p`'s object twice
 /// is the same as once (a variable, or fields of one).
-pub(super) fn concat_assign(p: &Place, x: &HExpr, ty: &Type) -> Option<HExpr> {
-    pub(super) fn plain(e: &HExpr) -> bool {
+/// `p op= x` as `p = p op x`, for a string `+=` or an untyped operator,
+/// when evaluating the place twice is safe (its object and key are
+/// variables, fields of variables, or literals).
+pub(super) fn compound_assign(hir: &HProgram, p: &Place, op: HBin, x: &HExpr, ty: &Type) -> Option<HExpr> {
+    fn plain(e: &HExpr) -> bool {
         match &e.kind {
             HK::Read(p) => match &**p {
                 Place::Var(_) => true,
@@ -563,19 +573,27 @@ pub(super) fn concat_assign(p: &Place, x: &HExpr, ty: &Type) -> Option<HExpr> {
                 _ => false,
             },
             HK::Cast(y) => plain(y),
+            HK::Num(_) | HK::Str(_) => true,
             _ => false,
         }
     }
-    let ok = match p {
-        Place::Var(_) => true,
-        Place::Field { obj, opt: false, .. } => plain(obj),
-        _ => false,
+    // The current value's type: the variable's, or the dynamic place's (any).
+    let cur_ty = match (op, p) {
+        (HBin::Concat, Place::Var(_)) => ty.clone(),
+        (HBin::Concat, Place::Field { obj, opt: false, .. }) if plain(obj) => ty.clone(),
+        (HBin::DynAdd | HBin::DynNum(_) | HBin::DynNumeric(_), Place::Var(v)) => hir.vars[*v as usize].ty.clone(),
+        (HBin::DynAdd | HBin::DynNum(_) | HBin::DynNumeric(_), Place::Prop { obj, opt: false, .. }) if plain(obj) => Type::Any,
+        (HBin::DynAdd | HBin::DynNum(_) | HBin::DynNumeric(_), Place::DynIndex { obj, key, opt: false }) if plain(obj) && plain(key) => Type::Any,
+        _ => return None,
     };
-    ok.then(|| {
-        let cur = HExpr { kind: HK::Read(Box::new(p.clone())), ty: ty.clone() };
-        let sum = HExpr { kind: HK::Binary(HBin::Concat, Box::new(cur), Box::new(x.clone())), ty: ty.clone() };
-        HExpr { kind: HK::Assign(Box::new(p.clone()), Box::new(sum)), ty: ty.clone() }
-    })
+    let res_ty = match op {
+        HBin::Concat => ty.clone(),
+        HBin::DynNum(_) => Type::Number,
+        _ => Type::Any,
+    };
+    let cur = HExpr { kind: HK::Read(Box::new(p.clone())), ty: cur_ty };
+    let res = HExpr { kind: HK::Binary(op, Box::new(cur), Box::new(x.clone())), ty: res_ty };
+    Some(HExpr { kind: HK::Assign(Box::new(p.clone()), Box::new(res)), ty: ty.clone() })
 }
 
 /// `throw new C("…", …)` with string literal arguments: the class and arguments.

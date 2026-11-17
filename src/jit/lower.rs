@@ -63,6 +63,9 @@ helpers! {
     get_prop = h_get_prop(I64, I64, I64) -> I64;
     set_prop = h_set_prop(I64, I64, I64, I64, I64);
     op = h_op(I32, I64, I64, I64, I64) -> I64;
+    dyn_op = h_dyn(I32, I64, I64, I64, I64) -> I64;
+    get_dyn = h_get_dyn(I64, I64, I64, I64) -> I64;
+    set_dyn = h_set_dyn(I64, I64, I64, I64, I64, I64);
     new_cell = h_new_cell() -> I64;
     closure = h_closure(I32, I64, I32) -> I64;
     throw_value = h_throw_value(I64, I64);
@@ -1307,6 +1310,105 @@ impl Lower<'_, '_> {
         self.b.inst_results(c)[0]
     }
 
+    /// An untyped operator (`h_dyn`) on `a` (and `b`), its result a `k`.
+    /// A value operand that isn't a variable's is held: user code
+    /// (`toString`) may run.
+    fn dyn_op(&mut self, op: u32, a: &HExpr, b: Option<&HExpr>, k: JK) -> RV {
+        let x = self.value_as(a, JV::Val);
+        let x = if x.owned || is_var_read(self.hir, a) { x } else { self.hold(x) };
+        let y = b.map(|b| {
+            let y = self.value_as(b, JV::Val);
+            if y.owned || is_var_read(self.hir, b) { y } else { self.hold(y) }
+        });
+        let o = self.b.ins().iconst(types::I32, op as i64);
+        let (bt, bp) = match y {
+            Some(r) => (r.t.unwrap(), r.v),
+            None => (self.b.ins().iconst(types::I64, self.lay.tag_undef), self.b.ins().iconst(types::I64, 0)),
+        };
+        // Numbers (the common case) inline, as the interpreter does; the
+        // rest through the helper.
+        let fast: Option<Box<dyn Fn(&mut FunctionBuilder, CV, CV) -> CV>> = match op {
+            _ if op == DYN_ADD || op == DYN_NUM || op == DYN_NUMERIC => Some(Box::new(|b, x, y| b.ins().fadd(x, y))),
+            _ if op == DYN_NUM + 1 || op == DYN_NUMERIC + 1 => Some(Box::new(|b, x, y| b.ins().fsub(x, y))),
+            _ if op == DYN_NUM + 2 || op == DYN_NUMERIC + 2 => Some(Box::new(|b, x, y| b.ins().fmul(x, y))),
+            _ if op == DYN_NUM + 3 || op == DYN_NUMERIC + 3 => Some(Box::new(|b, x, y| b.ins().fdiv(x, y))),
+            _ if op == DYN_TO_NUM => Some(Box::new(|_, x, _| x)),
+            _ if (DYN_CMP..DYN_CMP + 6).contains(&op) => {
+                let cc = [FloatCC::LessThan, FloatCC::LessThanOrEqual, FloatCC::GreaterThan, FloatCC::GreaterThanOrEqual, FloatCC::Equal, FloatCC::NotEqual]
+                    [(op - DYN_CMP) as usize];
+                Some(Box::new(move |b, x, y| b.ins().fcmp(cc, x, y)))
+            }
+            _ => None,
+        };
+        let tys: &[types::Type] = match k {
+            JK::Val => &[types::I64, types::I64],
+            JK::Num => &[types::F64],
+            _ => &[types::I8],
+        };
+        let merge = self.b.create_block();
+        for t in tys {
+            self.b.append_block_param(merge, *t);
+        }
+        let slow = self.b.create_block();
+        if let Some(f) = &fast {
+            let tn = self.lay.tag_num;
+            let xn = self.b.ins().icmp_imm_u(IntCC::Equal, x.t.unwrap(), tn);
+            let yn = if y.is_some() { self.b.ins().icmp_imm_u(IntCC::Equal, bt, tn) } else { self.b.ins().iconst(types::I8, 1) };
+            let both = self.b.ins().band(xn, yn);
+            let fb = self.b.create_block();
+            self.b.ins().brif(both, fb, &[], slow, &[]);
+            self.b.seal_block(fb);
+            self.b.switch_to_block(fb);
+            let fx = self.b.ins().bitcast(types::F64, MemFlagsData::new(), x.v);
+            let fy = self.b.ins().bitcast(types::F64, MemFlagsData::new(), bp);
+            let r = f(&mut self.b, fx, fy);
+            let args: Vec<cranelift_codegen::ir::BlockArg> = match k {
+                JK::Val => {
+                    let t = self.b.ins().iconst(types::I64, tn);
+                    let p = self.b.ins().bitcast(types::I64, MemFlagsData::new(), r);
+                    vec![t.into(), p.into()]
+                }
+                _ => vec![r.into()],
+            };
+            self.b.ins().jump(merge, &args);
+        } else {
+            self.b.ins().jump(slow, &[]);
+        }
+        self.b.seal_block(slow);
+        self.b.switch_to_block(slow);
+        let c = self.b.ins().call(self.h.dyn_op, &[o, x.t.unwrap(), x.v, bt, bp]);
+        let p = self.b.inst_results(c)[0];
+        let args: Vec<cranelift_codegen::ir::BlockArg> = match k {
+            JK::Val => {
+                let t = self.b.ins().load(types::I64, mf(), self.ctx, CTX_RET_TAG);
+                vec![t.into(), p.into()]
+            }
+            JK::Num => vec![self.b.ins().bitcast(types::F64, MemFlagsData::new(), p).into()],
+            _ => vec![self.b.ins().ireduce(types::I8, p).into()],
+        };
+        self.b.ins().jump(merge, &args);
+        self.b.seal_block(merge);
+        self.b.switch_to_block(merge);
+        let ps = self.b.block_params(merge).to_vec();
+        let r = match k {
+            JK::Val => {
+                let r = self.fresh(RV::val(ps[0], ps[1]));
+                self.check_status();
+                r
+            }
+            JK::Num => {
+                self.check_status();
+                RV::new(ps[0])
+            }
+            _ => RV::new(ps[0]),
+        };
+        self.release(x);
+        if let Some(y) = y {
+            self.release(y);
+        }
+        r
+    }
+
     /// A value result of a helper (its payload `p`, its tag in the context): owned.
     fn helper_val(&mut self, p: CV) -> RV {
         let t = self.b.ins().load(types::I64, mf(), self.ctx, CTX_RET_TAG);
@@ -1918,6 +2020,13 @@ impl Lower<'_, '_> {
                 self.b.ins().bxor_imm_u(v, 1)
             }
             HK::Unary(HUnary::Truthy, x) => self.truthy(x),
+            HK::Binary(HBin::DynNum(op), a, b) => self.dyn_op(DYN_NUM + *op as u32, a, Some(b), JK::Num).v,
+            HK::Binary(HBin::DynCmp(op), a, b) => self.dyn_op(DYN_CMP + *op as u32, a, Some(b), JK::Bool).v,
+            HK::Unary(HUnary::ToNum, x) => self.dyn_op(DYN_TO_NUM, x, None, JK::Num).v,
+            HK::Compound(p, op @ HBin::DynNum(_), x) => {
+                let a = compound_assign(self.hir, p, *op, x, &e.ty).unwrap();
+                self.expr(&a)
+            }
             HK::Logical(op, a, b) => self.logical(*op, a, b, want).v,
             HK::Cond(c, a, b) => self.cond_expr(c, a, b, want).v,
             HK::Assign(p, x) => self.assign(p, x, want).v,
@@ -2151,9 +2260,22 @@ impl Lower<'_, '_> {
                 self.coerce(r, JV::Val, want)
             }
             HK::Assign(p, x) => self.assign(p, x, want),
-            HK::Compound(p, HBin::Concat, x) => {
-                let a = concat_assign(p, x, &e.ty).unwrap();
+            HK::Compound(p, op, x) => {
+                let a = compound_assign(self.hir, p, *op, x, &e.ty).unwrap();
                 self.rexpr(&a)
+            }
+            HK::Binary(HBin::DynAdd, a, b) => {
+                let r = self.dyn_op(DYN_ADD, a, Some(b), JK::Val);
+                self.coerce(r, JV::Val, want)
+            }
+            HK::Binary(HBin::DynNumeric(op), a, b) => {
+                let r = self.dyn_op(DYN_NUMERIC + *op as u32, a, Some(b), JK::Val);
+                self.coerce(r, JV::Val, want)
+            }
+            HK::Unary(op @ (HUnary::NegDyn | HUnary::BitNotDyn), x) => {
+                let code = if matches!(op, HUnary::NegDyn) { DYN_NEG } else { DYN_BITNOT };
+                let r = self.dyn_op(code, x, None, JK::Val);
+                self.coerce(r, JV::Val, want)
             }
             HK::Cast(x) => self.value_as(x, want),
             HK::Seq(xs) => {
@@ -2309,6 +2431,19 @@ impl Lower<'_, '_> {
                 self.release(o);
                 self.coerce(r, JV::Val, want)
             }
+            Place::DynIndex { obj, key, .. } => {
+                // A getter may run: the object and key must stay alive.
+                let o = self.value_as(obj, JV::Val);
+                let o = if o.owned || is_var_read(self.hir, obj) { o } else { self.hold(o) };
+                let k = self.value_as(key, JV::Val);
+                let k = if k.owned || is_var_read(self.hir, key) { k } else { self.hold(k) };
+                let call = self.b.ins().call(self.h.get_dyn, &[o.t.unwrap(), o.v, k.t.unwrap(), k.v]);
+                let p = self.b.inst_results(call)[0];
+                let r = self.helper_val(p);
+                self.release(o);
+                self.release(k);
+                self.coerce(r, JV::Val, want)
+            }
             _ => unreachable!(),
         }
     }
@@ -2360,6 +2495,21 @@ impl Lower<'_, '_> {
                 self.b.ins().call(self.h.set_prop, &[s, o.t.unwrap(), o.v, r.t.unwrap(), r.v]);
                 self.check_status();
                 self.release(o);
+                self.coerce(r, JV::Val, want)
+            }
+            Place::DynIndex { obj, key, .. } => {
+                let o = self.value_as(obj, JV::Val);
+                let o = if !o.owned && (!is_var_read(self.hir, obj) || self.el.effects(x, true) || self.el.effects(key, true)) { self.hold(o) } else { o };
+                let k = self.value_as(key, JV::Val);
+                let k = if !k.owned && (!is_var_read(self.hir, key) || self.el.effects(x, true)) { self.hold(k) } else { k };
+                let r = self.value_as(x, JV::Val);
+                // One count for the element, one for the result.
+                let r = self.hold(r);
+                self.inc_rv(r);
+                self.b.ins().call(self.h.set_dyn, &[o.t.unwrap(), o.v, k.t.unwrap(), k.v, r.t.unwrap(), r.v]);
+                self.check_status();
+                self.release(o);
+                self.release(k);
                 self.coerce(r, JV::Val, want)
             }
             _ => unreachable!(),

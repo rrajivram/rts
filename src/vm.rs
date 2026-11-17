@@ -217,7 +217,7 @@ fn num_op(op: NumOp, x: f64, y: f64) -> f64 {
 
 /// Arithmetic on two dynamic values (numbers first).
 #[inline(always)]
-fn dyn_num(op: NumOp, a: &Value, b: &Value) -> f64 {
+pub(crate) fn dyn_num(op: NumOp, a: &Value, b: &Value) -> f64 {
     let (x, y) = match (a, b) {
         (Value::Num(x), Value::Num(y)) => (*x, *y),
         (a, b) => (a.to_number(), b.to_number()),
@@ -227,11 +227,19 @@ fn dyn_num(op: NumOp, a: &Value, b: &Value) -> f64 {
 
 /// `left op right` on two dynamic values, as a Value: numbers, or BigInts
 /// when both are BigInts (a BigInt and anything else is a TypeError).
-fn dyn_numeric(op: NumOp, a: &Value, b: &Value) -> Result<Value, bigint::BigIntError> {
+pub(crate) fn dyn_numeric(op: NumOp, a: &Value, b: &Value) -> Result<Value, bigint::BigIntError> {
     match (a, b) {
         (Value::BigInt(x), Value::BigInt(y)) => bigint::arithmetic(op, **x, **y).map(Value::bigint),
         (Value::BigInt(_), _) | (_, Value::BigInt(_)) => Err(bigint::MIX),
         (a, b) => Ok(Value::Num(dyn_num(op, a, b))),
+    }
+}
+
+/// `~v` on an untyped value (a BigInt stays a BigInt).
+pub(crate) fn dyn_bitnot(v: &Value) -> Value {
+    match v {
+        Value::BigInt(n) => Value::bigint(!**n),
+        v => Value::Num(!to_int32(v.to_number()) as f64),
     }
 }
 
@@ -249,7 +257,7 @@ fn holds(op: CmpOp, o: std::cmp::Ordering) -> bool {
 
 /// `left op right` (`<` etc.) on two dynamic values. BigInts compare exactly
 /// with numbers and with numeric strings; NaN makes it false.
-fn dyn_compare(op: CmpOp, a: &Value, b: &Value) -> bool {
+pub(crate) fn dyn_compare(op: CmpOp, a: &Value, b: &Value) -> bool {
     match (a, b) {
         (Value::Str(x), Value::Str(y)) => str_cmp(op, &x.s, &y.s),
         (Value::BigInt(x), Value::BigInt(y)) => bigint::compare(op, **x, **y),
@@ -663,7 +671,8 @@ impl Vm {
                     _ => None,
                 };
                 match hit {
-                    Some(x) => self.read_accessor(x, recv),
+                    Some(x @ Value::Accessor(_)) => self.read_accessor(x, recv),
+                    Some(x) => Ok(x),
                     None => self.get_prop_slow(recv, site),
                 }
             }
@@ -1362,6 +1371,20 @@ impl Vm {
 
     #[inline(never)]
     fn set_prop(&mut self, recv: &Value, site: &PropertySite, val: Value) -> Result<(), Value> {
+        // Inline cache hit: an existing plain field of this shape.
+        if let Value::Obj(o) = recv {
+            let hit = match &*site.cache.entry.borrow() {
+                Some((sh, slot)) if o.has_shape(sh) && !o.slot_is_accessor(*slot as usize) => Some(*slot),
+                _ => None,
+            };
+            if let Some(slot) = hit {
+                if val.is_container() {
+                    o.header().clear(crate::runtime::heap::flag::ACYCLIC);
+                }
+                o.set_slot(slot as usize, val);
+                return Ok(());
+            }
+        }
         match recv {
             Value::Obj(o) if o.lookup(&site.name).is_none() && Self::accessor(o, "set", &site.name).is_some() => {
                 let s = Self::accessor(o, "set", &site.name).unwrap();
@@ -1541,6 +1564,75 @@ impl Vm {
                 return Err(err);
             }
         }
+    }
+
+    // ───────────── dynamic operations (shared with compiled code) ─────────────
+
+    /// `x + y` when the types aren't known: adds numbers or concatenates
+    /// strings (calling a user `toString` on objects).
+    pub(crate) fn dyn_add(&mut self, x: &Value, y: &Value) -> Result<Value, Value> {
+        Ok(match (x, y) {
+            (Value::Num(x), Value::Num(y)) => Value::Num(x + y),
+            (Value::BigInt(x), Value::BigInt(y)) => match bigint::arithmetic(NumOp::Add, **x, **y) {
+                Ok(n) => Value::bigint(n),
+                Err(e) => return Err(self.bigint_error(e)),
+            },
+            (x @ Value::Str(_), y) | (x, y @ Value::Str(_)) => Value::str(format!("{}{}", x.to_js_string().s, y.to_js_string().s)),
+            (x @ (Value::Arr(_) | Value::Obj(_)), y) | (x, y @ (Value::Arr(_) | Value::Obj(_))) => {
+                let a = self.to_string_value(x)?;
+                let b = self.to_string_value(y)?;
+                Value::str(format!("{}{}", a.s, b.s))
+            }
+            (Value::BigInt(_), _) | (_, Value::BigInt(_)) => return Err(self.bigint_error(bigint::MIX)),
+            (x, y) => Value::Num(x.to_number() + y.to_number()),
+        })
+    }
+
+    /// `-v` on an untyped value (a BigInt stays a BigInt).
+    pub(crate) fn dyn_negate(&mut self, v: &Value) -> Result<Value, Value> {
+        match v {
+            Value::BigInt(n) => bigint::negate(**n).map(Value::bigint).map_err(|e| self.bigint_error(e)),
+            v => Ok(Value::Num(-v.to_number())),
+        }
+    }
+
+    /// `obj[key]` when the key's type isn't known.
+    pub(crate) fn read_dynamic(&mut self, o: &Value, k: &Value) -> Result<Value, Value> {
+        if let (Value::Arr(a), Value::Num(i)) = (o, k)
+            && *i >= 0.0
+            && (*i as usize) as f64 == *i
+        {
+            return Ok(a.get(*i as usize));
+        }
+        match o {
+            Value::Undef | Value::Null => Err(self.type_error(format!("Cannot read properties of {} (reading '{}')", o.to_display(), k.to_display()))),
+            Value::Obj(ob) => {
+                let key = k.to_js_string();
+                match ob.get(&key.s) {
+                    Some(x @ Value::Accessor(_)) => self.read_accessor(x, o),
+                    Some(x) => Ok(x),
+                    None => self.lookup_method(o, &key.s),
+                }
+            }
+            other => {
+                let r = get_dyn(other, k);
+                Ok(if matches!(r, Value::Undef)
+                    && let Value::Str(name) = k
+                {
+                    method_by_name(other, &name.s).map_or(Value::Undef, Value::Native)
+                } else {
+                    r
+                })
+            }
+        }
+    }
+
+    /// `obj[key] = v` when the key's type isn't known.
+    pub(crate) fn write_dynamic(&mut self, o: &Value, k: &Value, v: Value) -> Result<(), Value> {
+        if !set_dyn(o, k, v) {
+            return Err(self.type_error(format!("Cannot set properties of {} (setting '{}')", o.to_display(), k.to_display())));
+        }
+        Ok(())
     }
 
     // ───────────── the interpreter loop ─────────────
@@ -1796,23 +1888,11 @@ impl Vm {
                     Instruction::DynamicAdd { output, left, right } => {
                         let r = match (&value!(left), &value!(right)) {
                             (Value::Num(x), Value::Num(y)) => Value::Num(x + y),
-                            (Value::BigInt(x), Value::BigInt(y)) => match bigint::arithmetic(NumOp::Add, **x, **y) {
-                                Ok(n) => Value::bigint(n),
-                                Err(e) => break self.bigint_error(e),
-                            },
-                            (x @ Value::Str(_), y) | (x, y @ Value::Str(_)) => {
-                                Value::str(format!("{}{}", x.to_js_string().s, y.to_js_string().s))
-                            }
-                            (x @ (Value::Arr(_) | Value::Obj(_)), y) | (x, y @ (Value::Arr(_) | Value::Obj(_))) => {
+                            (x, y) => {
                                 let (x, y) = (x.clone(), y.clone());
                                 self.frames[fi].pc = pc;
-                                let a = self.to_string_value(&x);
-                                let b = a.and_then(|a| self.to_string_value(&y).map(|b| (a, b)));
-                                                                let (a, b) = tri!(b);
-                                Value::str(format!("{}{}", a.s, b.s))
+                                tri!(self.dyn_add(&x, &y))
                             }
-                            (Value::BigInt(_), _) | (_, Value::BigInt(_)) => break self.bigint_error(bigint::MIX),
-                            (x, y) => Value::Num(x.to_number() + y.to_number()),
                         };
                         value!(output) = r
                     }
@@ -1839,22 +1919,10 @@ impl Vm {
                     }
                     Instruction::DynamicCompare { op, output, left, right } => scalar!(output) = dyn_compare(op, &value!(left), &value!(right)) as u64,
                     Instruction::DynamicNegate { output, value } => {
-                        let r = match &value!(value) {
-                            Value::BigInt(n) => match bigint::negate(**n) {
-                                Ok(n) => Value::bigint(n),
-                                Err(e) => break self.bigint_error(e),
-                            },
-                            v => Value::Num(-v.to_number()),
-                        };
+                        let r = tri!(self.dyn_negate(&value!(value)));
                         value!(output) = r
                     }
-                    Instruction::DynamicBitNot { output, value } => {
-                        let r = match &value!(value) {
-                            Value::BigInt(n) => Value::bigint(!**n),
-                            v => Value::Num(!to_int32(v.to_number()) as f64),
-                        };
-                        value!(output) = r
-                    }
+                    Instruction::DynamicBitNot { output, value } => value!(output) = dyn_bitnot(&value!(value)),
                     Instruction::TypeOf { output, value } => value!(output) = Value::str(value!(value).type_of()),
                     Instruction::In { output: d, key: k, object: o } => {
                         let r = match &value!(o) {
@@ -2113,51 +2181,15 @@ impl Vm {
                             value!(d) = x;
                             continue;
                         }
-                        let x = match &value!(o) {
-                            other @ (Value::Undef | Value::Null) => {
-                                let m = format!(
-                                    "Cannot read properties of {} (reading '{}')",
-                                    other.to_display(),
-                                    value!(k).to_display()
-                                );
-                                break self.type_error(m);
-                            }
-                            Value::Obj(ob) => {
-                                let key = value!(k).to_js_string();
-                                match ob.get(&key.s) {
-                                    Some(Value::Accessor(ref a)) => {
-                                        let recv = value!(o).clone();
-                                        self.frames[fi].pc = pc;
-                                        let r = self.read_accessor(Value::Accessor(a.clone()), &recv);
-                                                                                tri!(r)
-                                    }
-                                    Some(x) => x,
-                                    None => tri!(self.lookup_method(&value!(o).clone(), &key.s.clone())),
-                                }
-                            }
-                            other => {
-                                let r = get_dyn(other, &value!(k));
-                                if matches!(r, Value::Undef)
-                                    && let Value::Str(name) = &value!(k)
-                                {
-                                    method_by_name(other, &name.s).map_or(Value::Undef, Value::Native)
-                                } else {
-                                    r
-                                }
-                            }
-                        };
+                        let (ov, kv) = (value!(o).clone(), value!(k).clone());
+                        self.frames[fi].pc = pc;
+                        let x = tri!(self.read_dynamic(&ov, &kv));
                         value!(d) = x
                     }
                     Instruction::WriteDynamic { object, key, value } => {
                         let x = value!(value).clone();
-                        if !set_dyn(&value!(object), &value!(key), x) {
-                            let m = format!(
-                                "Cannot set properties of {} (setting '{}')",
-                                value!(object).to_display(),
-                                value!(key).to_display()
-                            );
-                            break self.type_error(m);
-                        }
+                        let (ov, kv) = (value!(object).clone(), value!(key).clone());
+                        tri!(self.write_dynamic(&ov, &kv, x));
                     }
                     Instruction::DeleteDynamic { object: o, key: k } => {
                         if let Value::Obj(ob) = &value!(o) {

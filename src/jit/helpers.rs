@@ -504,6 +504,67 @@ pub(super) extern "C" fn h_op(op: u32, at: u64, ap: u64, bt: u64, bp: u64) -> u6
     }
 }
 
+/// Untyped operations (`h_dyn`): the interpreter's `Dynamic*` instructions.
+/// Owned value results.
+pub(super) const DYN_ADD: u32 = 0;
+pub(super) const DYN_NEG: u32 = 1;
+pub(super) const DYN_BITNOT: u32 = 2;
+/// `DYN_NUMERIC + NumOp`: a number, or a BigInt for two BigInts.
+pub(super) const DYN_NUMERIC: u32 = 16;
+/// Number results (f64 bits): `DYN_NUM + NumOp`, and ToNumber.
+pub(super) const DYN_NUM: u32 = 32;
+pub(super) const DYN_TO_NUM: u32 = 48;
+/// Boolean results: `DYN_CMP + CmpOp`.
+pub(super) const DYN_CMP: u32 = 64;
+
+const NUM_OPS: [NumOp; 12] = [
+    NumOp::Add, NumOp::Sub, NumOp::Mul, NumOp::Div, NumOp::Mod, NumOp::Exp,
+    NumOp::BitAnd, NumOp::BitOr, NumOp::BitXor, NumOp::Shl, NumOp::Shr, NumOp::UShr,
+];
+const CMP_OPS: [CmpOp; 6] = [CmpOp::Lt, CmpOp::Le, CmpOp::Gt, CmpOp::Ge, CmpOp::Eq, CmpOp::Ne];
+
+/// An untyped operation on borrowed values (`DYN_*` says which and what
+/// it returns). Errors start unwinding.
+pub(super) extern "C" fn h_dyn(op: u32, at: u64, ap: u64, bt: u64, bp: u64) -> u64 {
+    let (a, b) = (peek_value(at, ap), peek_value(bt, bp));
+    let num = |r: Result<f64, Value>| match r {
+        Ok(x) => x.to_bits(),
+        Err(e) => {
+            raise(e);
+            f64::NAN.to_bits()
+        }
+    };
+    match op {
+        DYN_ADD => give_result(nested(|vm| vm.dyn_add(&a, &b))),
+        DYN_NEG => give_result(nested(|vm| vm.dyn_negate(&a))),
+        DYN_BITNOT => give(crate::vm::dyn_bitnot(&a)),
+        DYN_TO_NUM => num(match &*a {
+            Value::BigInt(_) => Err(nested(|vm| vm.bigint_error(crate::runtime::bigint::TO_NUMBER))),
+            v => Ok(v.to_number()),
+        }),
+        _ if op >= DYN_CMP => crate::vm::dyn_compare(CMP_OPS[(op - DYN_CMP) as usize], &a, &b) as u64,
+        _ if op >= DYN_NUM => num(if matches!(*a, Value::BigInt(_)) || matches!(*b, Value::BigInt(_)) {
+            Err(nested(|vm| vm.bigint_error(crate::runtime::bigint::TO_NUMBER)))
+        } else {
+            Ok(crate::vm::dyn_num(NUM_OPS[(op - DYN_NUM) as usize], &a, &b))
+        }),
+        _ => give_result(crate::vm::dyn_numeric(NUM_OPS[(op - DYN_NUMERIC) as usize], &a, &b).map_err(|e| nested(|vm| vm.bigint_error(e)))),
+    }
+}
+
+/// `obj[key]` (both borrowed), as an owned value.
+pub(super) extern "C" fn h_get_dyn(ot: u64, op: u64, kt: u64, kp: u64) -> u64 {
+    give_result(nested(|vm| vm.read_dynamic(&peek_value(ot, op), &peek_value(kt, kp))))
+}
+
+/// `obj[key] = v`, taking over `v`'s count.
+pub(super) extern "C" fn h_set_dyn(ot: u64, op: u64, kt: u64, kp: u64, vt: u64, vp: u64) {
+    let v = std::mem::ManuallyDrop::into_inner(peek_value(vt, vp));
+    if let Err(e) = nested(|vm| vm.write_dynamic(&peek_value(ot, op), &peek_value(kt, kp), v)) {
+        raise(e);
+    }
+}
+
 pub(super) const ERR_READ: u32 = 0;
 pub(super) const ERR_WRITE: u32 = 1;
 pub(super) const ERR_METHOD: u32 = 2;
