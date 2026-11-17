@@ -144,3 +144,29 @@ console.log(
     throw new Error("no " + x);
   }),
 );
+
+// Generic callbacks: the call site passes values, the callee takes
+// numbers or objects.
+class Box<T> {
+  items: T[] = [];
+  add(x: T): Box<T> {
+    this.items.push(x);
+    return this;
+  }
+  each(f: (x: T) => void): void {
+    for (let i = 0; i < this.items.length; i++) f(this.items[i]);
+  }
+  fold<R>(init: R, f: (acc: R, x: T) => R): R {
+    let r = init;
+    for (const x of this.items) r = f(r, x);
+    return r;
+  }
+}
+const nums = new Box<number>().add(1).add(2).add(3);
+let sum = 0;
+for (let i = 0; i < 100; i++) nums.each((x: number) => (sum += x));
+console.log(sum, nums.fold(0, (a: number, x: number) => a + x * x));
+const sq = new Box<Square>().add(new Square(1)).add(new Square(2));
+console.log(sq.fold("", (a: string, s: Square) => a + s.area() + " "));
+const nulls = new Box<Square | null>().add(null).add(new Square(5));
+console.log(nulls.fold(0, (a: number, s: Square | null) => a + (s === null ? -1 : s.side)));

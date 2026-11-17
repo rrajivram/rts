@@ -2816,9 +2816,39 @@ impl Lower<'_, '_> {
         let k = self.b.ins().load(types::I32, mf(), ent, std::mem::offset_of!(NativeEntry, key) as i32);
         let ok = self.b.ins().icmp_imm_u(IntCC::Equal, k, id as i64);
         let fast = self.b.create_block();
-        self.b.ins().brif(ok, fast, &[], slow, &[]);
-        self.b.seal_block(fast);
+        let adapt = self.b.create_block();
+        self.b.ins().brif(ok, fast, &[], adapt, &[]);
+        // Other kinds (a generic callback, say): the callee's adapter, if
+        // it takes this many arguments.
+        self.b.seal_block(adapt);
+        self.b.switch_to_block(adapt);
+        let arity = self.b.ins().load(types::I64, mf(), ent, std::mem::offset_of!(NativeEntry, arity) as i32);
+        let has = self.b.ins().icmp_imm_u(IntCC::Equal, arity, args.len() as i64);
+        let aptr = self.b.ins().load(types::I64, mf(), ent, std::mem::offset_of!(NativeEntry, adapter) as i32);
+        let nonzero = self.b.ins().icmp_imm_u(IntCC::NotEqual, aptr, 0);
+        let use_adapter = self.b.ins().band(has, nonzero);
+        let via = self.b.create_block();
+        self.b.ins().brif(use_adapter, via, &[], slow, &[]);
+        self.b.seal_block(via);
+        self.b.switch_to_block(via);
+        {
+            let mut sig = self.sig0.clone();
+            sig.params.push(AbiParam::new(types::I64));
+            sig.params.push(AbiParam::new(types::I64));
+            let mut vals = vec![self.ctx, f.v];
+            for (pj, r) in args.clone() {
+                let (wt, wp) = self.value_words(pj, r);
+                vals.extend([wt, wp]);
+                sig.params.extend([AbiParam::new(types::I64), AbiParam::new(types::I64)]);
+            }
+            sig.returns.extend([AbiParam::new(types::I64), AbiParam::new(types::I64)]);
+            let sref = self.b.import_signature(sig);
+            let call = self.b.ins().call_indirect(sref, aptr, &vals);
+            let rs = self.b.inst_results(call).to_vec();
+            self.b.ins().jump(merge, &[rs[0].into(), rs[1].into()]);
+        }
         self.b.switch_to_block(fast);
+        self.b.seal_block(fast);
         let ptr = self.b.ins().load(types::I64, mf(), ent, std::mem::offset_of!(NativeEntry, entry) as i32);
         let flags = self.b.ins().load(types::I32, mf(), ent, std::mem::offset_of!(NativeEntry, flags) as i32);
         let env = self.b.ins().load(types::I64, mf(), f.v, self.lay.clo_caps.unwrap());
@@ -3042,6 +3072,122 @@ pub(super) struct NativeEntry {
     entry: u64,
     key: u32,
     flags: u32,
+    /// The adapter taking every argument as a value (see `build_adapter`)
+    /// and its parameter count (0 address: none).
+    adapter: u64,
+    arity: u64,
+}
+
+/// An adapter for compiled function `callee` taking every argument as a
+/// value: `(ctx, closure box, (tag, payload)…) -> (tag, payload)`. Each
+/// argument is checked and converted to the kind the function takes (as
+/// `JitFn::write_arg` does); any mismatch calls the closure through the
+/// interpreter instead (`h_call`). The result is owned.
+#[allow(clippy::too_many_arguments)]
+fn build_adapter(mut b: FunctionBuilder, lay: &Layout, callee: FuncRef, h_call: FuncRef, pjs: &[JV], rj: JV, no_env: bool, caps_off: i32, rarena: bool, fc: cranelift_codegen::isa::TargetFrontendConfig) {
+    use cranelift_codegen::ir::{StackSlotData, StackSlotKind};
+    let entry = b.create_block();
+    b.append_block_params_for_function_params(entry);
+    b.switch_to_block(entry);
+    b.seal_block(entry);
+    let ps = b.block_params(entry).to_vec();
+    let (c, clo) = (ps[0], ps[1]);
+    let words: Vec<(CV, CV)> = (0..pjs.len()).map(|i| (ps[2 + 2 * i], ps[3 + 2 * i])).collect();
+    let slow = b.create_block();
+    let mut vals = vec![c];
+    if !no_env {
+        vals.push(b.ins().load(types::I64, mf(), clo, caps_off));
+    }
+    if rarena {
+        vals.push(b.ins().iconst(types::I64, 0));
+    }
+    for (&pj, &(t, p)) in pjs.iter().zip(&words) {
+        let is = |b: &mut FunctionBuilder, tag: i64| b.ins().icmp_imm_u(IntCC::Equal, t, tag);
+        // Branch to `slow` unless `ok`.
+        let need = |b: &mut FunctionBuilder, ok: CV| {
+            let next = b.create_block();
+            b.ins().brif(ok, next, &[], slow, &[]);
+            b.seal_block(next);
+            b.switch_to_block(next);
+        };
+        match pj {
+            JV::Val => vals.extend([t, p]),
+            JV::Num => {
+                let ok = is(&mut b, lay.tag_num);
+                need(&mut b, ok);
+                vals.push(b.ins().bitcast(types::F64, MemFlagsData::new(), p));
+            }
+            JV::Bool => {
+                let ok = is(&mut b, lay.tag_bool);
+                need(&mut b, ok);
+                vals.push(b.ins().ireduce(types::I8, p));
+            }
+            // A reference: the box, or 0 for null and 1 for undefined.
+            JV::Obj | JV::Arr | JV::Nil => {
+                let null = is(&mut b, lay.tag_null);
+                let undef = is(&mut b, lay.tag_undef);
+                let nil = b.ins().bor(null, undef);
+                let ok = match pj {
+                    JV::Obj => {
+                        let o = is(&mut b, lay.tag_obj);
+                        b.ins().bor(nil, o)
+                    }
+                    JV::Arr => {
+                        let a = is(&mut b, lay.tag_arr);
+                        b.ins().bor(nil, a)
+                    }
+                    _ => nil,
+                };
+                need(&mut b, ok);
+                let one = b.ins().iconst(types::I64, 1);
+                let zero = b.ins().iconst(types::I64, 0);
+                let nv = b.ins().select(undef, one, zero);
+                vals.push(b.ins().select(nil, nv, p));
+            }
+        }
+    }
+    let call = b.ins().call(callee, &vals);
+    let rs = b.inst_results(call).to_vec();
+    let (rt, rp) = match rj {
+        JV::Val => (rs[0], rs[1]),
+        JV::Num => (b.ins().iconst(types::I64, lay.tag_num), b.ins().bitcast(types::I64, MemFlagsData::new(), rs[0])),
+        JV::Bool => (b.ins().iconst(types::I64, lay.tag_bool), b.ins().uextend(types::I64, rs[0])),
+        _ => {
+            let v = rs[0];
+            let heap = b.ins().iconst(types::I64, if rj == JV::Arr { lay.tag_arr } else { lay.tag_obj });
+            let null = b.ins().iconst(types::I64, lay.tag_null);
+            let undef = b.ins().iconst(types::I64, lay.tag_undef);
+            let is_null = b.ins().icmp_imm_u(IntCC::Equal, v, 0);
+            let is_undef = b.ins().icmp_imm_u(IntCC::Equal, v, 1);
+            let t = b.ins().select(is_undef, undef, heap);
+            (b.ins().select(is_null, null, t), v)
+        }
+    };
+    b.ins().return_(&[rt, rp]);
+    // A mismatch: call the closure through the interpreter, with the values.
+    b.seal_block(slow);
+    b.switch_to_block(slow);
+    let n = words.len();
+    let argv = if n > 0 {
+        let slot = b.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, (16 * n) as u32, 4));
+        b.ins().stack_addr(types::I64, slot, 0)
+    } else {
+        b.ins().iconst(types::I64, 0)
+    };
+    for (i, &(t, p)) in words.iter().enumerate() {
+        b.ins().store(mf(), t, argv, (16 * i) as i32);
+        b.ins().store(mf(), p, argv, (16 * i + 8) as i32);
+    }
+    let kind = b.ins().iconst(types::I32, CALL_VALUE as i64);
+    let ft = b.ins().iconst(types::I64, lay.tag_func);
+    let ut = b.ins().iconst(types::I64, lay.tag_undef);
+    let z = b.ins().iconst(types::I64, 0);
+    let argc = b.ins().iconst(types::I32, n as i64);
+    let call = b.ins().call(h_call, &[kind, ft, clo, ut, z, argv, argc]);
+    let p = b.inst_results(call)[0];
+    let t = b.ins().load(types::I64, mf(), c, CTX_RET_TAG);
+    b.ins().return_(&[t, p]);
+    b.finalize(fc);
 }
 
 /// The kinds a function without `this` takes and returns, as a call
@@ -3424,8 +3570,50 @@ pub fn compile(hir: &HProgram, prog: &mut Program, esc: &crate::escape::EscapeIn
         m.define_function(eid, &mut ctx).unwrap();
         m.clear_context(&mut ctx);
     }
+    // Adapters: each function callable through a function value, taking
+    // values (for call sites whose kinds differ, such as generic callbacks).
+    let mut adapters: Vec<(FuncId, ClFuncId)> = Vec::new();
+    if let Some(caps_off) = lay.clo_caps {
+        let call_idx = helpers.iter().position(|(n, ..)| *n == "rts_call").unwrap();
+        for &(f, id, _) in &ids {
+            if value_key(hir, f).is_none() {
+                continue;
+            }
+            let hf = &hir.funcs[f as usize];
+            let n = hf.params.len();
+            let mut sig = m.make_signature();
+            sig.params.push(AbiParam::new(ptr));
+            sig.params.push(AbiParam::new(types::I64));
+            for _ in 0..n {
+                sig.params.extend([AbiParam::new(types::I64), AbiParam::new(types::I64)]);
+            }
+            sig.returns.extend([AbiParam::new(types::I64), AbiParam::new(types::I64)]);
+            let aid = m.declare_function(&format!("a{f}"), Linkage::Local, &sig).unwrap();
+            ctx.func.signature = sig;
+            {
+                let b = FunctionBuilder::new(&mut ctx.func, &mut fbc);
+                let callee = m.declare_func_in_func(id, b.func);
+                let h_call = m.declare_func_in_func(h_ids[call_idx], b.func);
+                let pjs: Vec<JV> = hf.params.iter().map(|p| var_jv(hir, p.var)).collect();
+                build_adapter(b, &lay, callee, h_call, &pjs, ret_jv(hf).unwrap(), hf.free.is_empty(), caps_off, takes_rarena.contains(&f), m.isa().frontend_config());
+            }
+            if let Err(e) = m.define_function(aid, &mut ctx) {
+                eprintln!("rts: native code disabled (adapter for {} failed to compile: {e:?})", hf.name);
+                return 0;
+            }
+            m.clear_context(&mut ctx);
+            adapters.push((f, aid));
+        }
+    }
     if m.finalize_definitions().is_err() {
         return 0;
+    }
+    for &(f, aid) in &adapters {
+        unsafe {
+            let e = &mut *entries.add(f as usize);
+            e.adapter = m.get_finalized_function(aid) as u64;
+            e.arity = hir.funcs[f as usize].params.len() as u64;
+        }
     }
     if debug {
         let mut names: Vec<String> = order
@@ -3447,13 +3635,10 @@ pub fn compile(hir: &HProgram, prog: &mut Program, esc: &crate::escape::EscapeIn
             let n = keys.borrow().len() as u32 + 1;
             let key = *keys.borrow_mut().entry(key).or_insert(n);
             let hf = &hir.funcs[f as usize];
-            unsafe {
-                *entries.add(f as usize) = NativeEntry {
-                    entry: m.get_finalized_function(id) as u64,
-                    key,
-                    flags: (!hf.free.is_empty()) as u32 | (takes_rarena.contains(&f) as u32) << 1,
-                }
-            };
+            let e = unsafe { &mut *entries.add(f as usize) };
+            e.entry = m.get_finalized_function(id) as u64;
+            e.key = key;
+            e.flags = (!hf.free.is_empty()) as u32 | (takes_rarena.contains(&f) as u32) << 1;
         }
     }
     for &(f, _, eid) in &ids {
