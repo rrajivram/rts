@@ -169,3 +169,31 @@ o();
 console.log(o(), o());
 console.log(throwsInside([1, 2, 3]), throwsInside([1, -2, 3]));
 console.log(filterMap([1, 5, 2, 8, 3], 3).join(" "));
+
+// Local functions that call themselves (captured in their own cells).
+function outer(n: number): number {
+  function down(k: number): number {
+    return k <= 0 ? 0 : 1 + down(k - 1);
+  }
+  return down(n);
+}
+function outerBlock(n: number): number {
+  if (n > 0) {
+    function down2(k: number): number {
+      return k <= 0 ? 0 : 1 + down2(k - 1);
+    }
+    return down2(n);
+  }
+  return -1;
+}
+function inLoop(n: number): number {
+  let s = 0;
+  for (let i = 0; i < n; i++) {
+    function rec(k: number): number { return k <= 0 ? i : rec(k - 1); }
+    s += rec(3);
+  }
+  return s;
+}
+let selfRef = 0;
+for (let i = 0; i < 200; i++) selfRef += outer(10) + outerBlock(5) + inLoop(4);
+console.log(selfRef);

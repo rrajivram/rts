@@ -1978,6 +1978,13 @@ struct Lower<'a, 'b> {
     stats: &'a mut RcStats,
 }
 
+/// The place of a numeric `+=` or `++` (see `Lower::num_place`).
+enum NumPlace {
+    Var(VarId),
+    Field(RV, u32),
+    Index(RV, CV),
+}
+
 /// A `break` / `continue` target.
 #[derive(Clone)]
 struct LoopT {
@@ -2135,6 +2142,13 @@ impl Lower<'_, '_> {
         } else {
             self.use_var(v)
         }
+    }
+
+    /// Store into a variable wherever it lives (`r` owned, if counted and
+    /// the variable counts), releasing the old value.
+    #[track_caller]
+    fn write_var(&mut self, v: VarId, r: RV) {
+        if self.in_mem(v) { self.mem_set(v, r) } else { self.set_var(v, r) }
     }
 
     /// Store into a global or captured variable (`r` owned, if counted), releasing the old value.
@@ -2513,35 +2527,11 @@ impl Lower<'_, '_> {
     fn stmt(&mut self, s: &HStmt) {
         match s {
             HStmt::Expr(e) => self.discard(e),
-            HStmt::Init(v, e) if self.cells.contains_key(v) => {
-                // A cell unless the enclosing block made one (as codegen does).
-                if !self.declared.contains(v) {
+            HStmt::Init(v, e) => {
+                // A captured variable gets its cell here unless its block made one (as codegen does).
+                if self.cells.contains_key(v) && !self.declared.contains(v) {
                     self.new_cell(*v);
                 }
-                let vj = var_jv(self.hir, *v);
-                let val = match e {
-                    Some(e) => {
-                        let r = self.value_as(e, vj);
-                        if vj.jk().counted() { self.own(r) } else { r }
-                    }
-                    None => self.zero_rv(vj.jk()),
-                };
-                self.mem_set(*v, val);
-            }
-            HStmt::MakeClosure(v, g) => {
-                let r = self.make_closure(*g);
-                if self.cells.contains_key(v) {
-                    if !self.declared.contains(v) {
-                        self.new_cell(*v);
-                    }
-                    self.unpend(r);
-                    self.mem_set(*v, RV { owned: true, ..r });
-                } else {
-                    self.unpend(r);
-                    self.set_var(*v, RV { owned: true, ..r });
-                }
-            }
-            HStmt::Init(v, e) => {
                 let vj = var_jv(self.hir, *v);
                 let val = match e {
                     Some(e) if self.borrowed.contains(v) => {
@@ -2557,7 +2547,16 @@ impl Lower<'_, '_> {
                     Some(e) => self.value_as(e, vj),
                     None => self.zero_rv(vj.jk()),
                 };
-                self.set_var(*v, val);
+                self.write_var(*v, val);
+            }
+            HStmt::MakeClosure(v, g) => {
+                // The cell first: the closure may capture its own variable.
+                if self.cells.contains_key(v) && !self.declared.contains(v) {
+                    self.new_cell(*v);
+                }
+                let r = self.make_closure(*g);
+                self.unpend(r);
+                self.write_var(*v, RV { owned: true, ..r });
             }
             HStmt::Block(ss, vars) => {
                 for v in vars {
@@ -2843,17 +2842,12 @@ impl Lower<'_, '_> {
         self.b.switch_to_block(bb);
         let ej = var_jv(self.hir, *elem);
         let r = self.arr_get(a, i, ej);
+        // A new binding each time round (a new cell, if captured).
         if self.cells.contains_key(elem) {
-            // A new binding each time round.
             self.new_cell(*elem);
-            let r = if ej.jk().counted() { self.own(r) } else { r };
-            self.mem_set(*elem, r);
-        } else if ej.jk().counted() && !self.borrowed.contains(elem) {
-            let r = self.own(r);
-            self.set_var(*elem, r);
-        } else {
-            self.set_var(*elem, r);
         }
+        let r = if ej.jk().counted() && !self.borrowed.contains(elem) { self.own(r) } else { r };
+        self.write_var(*elem, r);
         self.loops.push(LoopT { label, brk: xb, cont: Some(ub), switch: false, regions: self.regions.len() });
         self.stmts(body);
         self.loops.pop();
@@ -3677,79 +3671,21 @@ impl Lower<'_, '_> {
             HK::Logical(op, a, b) => self.logical(*op, a, b, want).v,
             HK::Cond(c, a, b) => self.cond_expr(c, a, b, want).v,
             HK::Assign(p, x) => self.assign(p, x, want).v,
-            HK::Compound(p, HBin::Num(op), x) => match &**p {
-                Place::Var(v) if self.in_mem(*v) => {
-                    let cur = self.read_var(*v).v;
-                    let y = self.expr(x);
-                    let r = self.num_op(*op, cur, y);
-                    self.mem_set(*v, RV::new(r));
-                    r
-                }
-                Place::Var(v) => {
-                    let var = self.var(*v);
-                    let cur = self.b.use_var(var);
-                    let y = self.expr(x);
-                    let r = self.num_op(*op, cur, y);
-                    self.b.def_var(var, r);
-                    r
-                }
-                Place::Field { obj, slot, .. } => {
-                    let o = self.field_base(obj, Some(x), ERR_READ);
-                    let cur = self.load_field(o.v, *slot, JV::Num).v;
-                    let y = self.expr(x);
-                    let r = self.num_op(*op, cur, y);
-                    self.store_field(o.v, *slot, JV::Num, RV::new(r));
-                    self.release(o);
-                    r
-                }
-                Place::Index { obj, index, .. } => {
-                    let a = self.arr_base(obj, &[index, x]);
-                    let i = self.expr(index);
-                    let cur = self.arr_get(a.v, i, JV::Num).v;
-                    let y = self.expr(x);
-                    let r = self.num_op(*op, cur, y);
-                    self.arr_set(a.v, i, JV::Num, RV::new(r));
-                    self.release(a);
-                    r
-                }
-                _ => unreachable!(),
-            },
+            HK::Compound(p, HBin::Num(op), x) => {
+                let h = self.num_place(p, Some(x));
+                let cur = self.num_load(&h);
+                let y = self.expr(x);
+                let r = self.num_op(*op, cur, y);
+                self.num_store(h, r);
+                r
+            }
             HK::Update { place, inc, prefix } => {
+                let h = self.num_place(place, None);
+                let cur = self.num_load(&h);
                 let one = self.b.ins().f64const(1.0);
-                let step = |s: &mut Self, cur: CV| if *inc { s.b.ins().fadd(cur, one) } else { s.b.ins().fsub(cur, one) };
-                match &**place {
-                    Place::Var(v) if self.in_mem(*v) => {
-                        let cur = self.read_var(*v).v;
-                        let r = step(self, cur);
-                        self.mem_set(*v, RV::new(r));
-                        if *prefix { r } else { cur }
-                    }
-                    Place::Var(v) => {
-                        let var = self.var(*v);
-                        let cur = self.b.use_var(var);
-                        let r = step(self, cur);
-                        self.b.def_var(var, r);
-                        if *prefix { r } else { cur }
-                    }
-                    Place::Field { obj, slot, .. } => {
-                        let o = self.field_base(obj, None, ERR_READ);
-                        let cur = self.load_field(o.v, *slot, JV::Num).v;
-                        let r = step(self, cur);
-                        self.store_field(o.v, *slot, JV::Num, RV::new(r));
-                        self.release(o);
-                        if *prefix { r } else { cur }
-                    }
-                    Place::Index { obj, index, .. } => {
-                        let a = self.arr_base(obj, &[index]);
-                        let i = self.expr(index);
-                        let cur = self.arr_get(a.v, i, JV::Num).v;
-                        let r = step(self, cur);
-                        self.arr_set(a.v, i, JV::Num, RV::new(r));
-                        self.release(a);
-                        if *prefix { r } else { cur }
-                    }
-                    _ => unreachable!(),
-                }
+                let r = if *inc { self.b.ins().fadd(cur, one) } else { self.b.ins().fsub(cur, one) };
+                self.num_store(h, r);
+                if *prefix { r } else { cur }
             }
             HK::Cast(x) => self.value_as(x, want).v,
             HK::Seq(xs) => {
@@ -3760,6 +3696,46 @@ impl Lower<'_, '_> {
             }
             HK::Call(c) => self.call(e, c, want).v,
             _ => unreachable!("checked by Elig"),
+        }
+    }
+
+    /// The place of a numeric `+=` or `++`, its object evaluated (and held
+    /// across `rest`, the right-hand side, if that could free it).
+    fn num_place(&mut self, p: &Place, rest: Option<&HExpr>) -> NumPlace {
+        match p {
+            Place::Var(v) => NumPlace::Var(*v),
+            Place::Field { obj, slot, .. } => NumPlace::Field(self.field_base(obj, rest, ERR_READ), *slot),
+            Place::Index { obj, index, .. } => {
+                let mut later = vec![index];
+                later.extend(rest);
+                let a = self.arr_base(obj, &later);
+                let i = self.expr(index);
+                NumPlace::Index(a, i)
+            }
+            _ => unreachable!("checked by Elig"),
+        }
+    }
+
+    fn num_load(&mut self, h: &NumPlace) -> CV {
+        match *h {
+            NumPlace::Var(v) => self.read_var(v).v,
+            NumPlace::Field(o, slot) => self.load_field(o.v, slot, JV::Num).v,
+            NumPlace::Index(a, i) => self.arr_get(a.v, i, JV::Num).v,
+        }
+    }
+
+    /// Store into the place, then release its object.
+    fn num_store(&mut self, h: NumPlace, r: CV) {
+        match h {
+            NumPlace::Var(v) => self.write_var(v, RV::new(r)),
+            NumPlace::Field(o, slot) => {
+                self.store_field(o.v, slot, JV::Num, RV::new(r));
+                self.release(o);
+            }
+            NumPlace::Index(a, i) => {
+                self.arr_set(a.v, i, JV::Num, RV::new(r));
+                self.release(a);
+            }
         }
     }
 
@@ -4091,11 +4067,7 @@ impl Lower<'_, '_> {
                 let vj = var_jv(self.hir, *v);
                 let r = self.value_as(x, vj);
                 let r = if vj.jk().counted() { self.own(r) } else { r };
-                if self.in_mem(*v) {
-                    self.mem_set(*v, r);
-                } else {
-                    self.set_var(*v, r);
-                }
+                self.write_var(*v, r);
                 self.coerce(RV { owned: false, ..r }, vj, want)
             }
             Place::Field { obj, slot, .. } => {
