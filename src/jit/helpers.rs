@@ -436,6 +436,61 @@ pub(super) extern "C" fn h_call(kind: u32, a: u64, b: u64, this_t: u64, this_p: 
     give_result(r)
 }
 
+/// A by-name method call site's cache in compiled code: the receiver's
+/// shape and class (as their `Rc`s' bits) and the method's adapter. The
+/// `Rc`s are kept, so a freed shape's address can't produce a false hit.
+#[repr(C)]
+#[derive(Default)]
+pub(super) struct NamedCache {
+    pub(super) shape: u64,
+    pub(super) class: u64,
+    pub(super) adapter: u64,
+    keep: Option<(std::rc::Rc<crate::runtime::Shape>, std::rc::Rc<crate::runtime::ClassRt>)>,
+}
+
+/// `recv.name(…)` missing its cache (`NamedCache`): the call as `h_call`
+/// makes it, after filling the cache when the name is a compiled method
+/// of the receiver's class (with an adapter for this many arguments).
+pub(super) extern "C" fn h_call_named(site: *const crate::bytecode::PropertySite, cache: *mut NamedCache, this_t: u64, this_p: u64, argv: *const Value, argc: u32) -> u64 {
+    if unsafe { (*ctx()).depth } >= MAX_DEPTH {
+        unsafe { (*ctx()).status = STATUS_OVERFLOW };
+        return give(Value::Undef);
+    }
+    let site = unsafe { &*site };
+    let args: &[Value] = if argc == 0 { &[] } else { unsafe { std::slice::from_raw_parts(argv, argc as usize) } };
+    let this = (*peek_value(this_t, this_p)).clone();
+    // A method of the receiver's class (not shadowed by an own property):
+    // cache it if it has an adapter, and call it without a second lookup.
+    if let Value::Obj(o) = &this
+        && let Some(cls) = &o.class
+        && o.lookup(&site.name).is_none()
+    {
+        let mut k = Some(cls.clone());
+        let mut found = None;
+        while let Some(c) = k {
+            if let Some(fi) = c.methods.get(&*site.name) {
+                found = Some(*fi);
+                break;
+            }
+            k = c.parent.clone();
+        }
+        if let Some(fi) = found {
+            let ad = super::lower::NativeEntry::method(fi, args.len());
+            if ad != 0 {
+                let shape = o.shape();
+                let c = unsafe { &mut *cache };
+                c.shape = unsafe { std::mem::transmute_copy::<_, u64>(&shape) };
+                c.class = unsafe { std::mem::transmute_copy::<_, u64>(cls) };
+                c.adapter = ad;
+                c.keep = Some((shape, cls.clone()));
+            }
+            return give_result(nested(|vm| vm.jit_call_func(fi, this, args)));
+        }
+    }
+    let r = nested(|vm| vm.jit_call_named(site, this, args));
+    give_result(r)
+}
+
 /// `obj.name` (the site's), as an owned value.
 pub(super) extern "C" fn h_get_prop(site: *const crate::bytecode::PropertySite, t: u64, p: u64) -> u64 {
     let r = nested(|vm| vm.jit_get_prop(unsafe { &*site }, &peek_value(t, p)));

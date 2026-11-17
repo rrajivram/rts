@@ -324,6 +324,8 @@ impl Object {
             )
         }
     }
+    /// Where the shape (an `Rc<Shape>`) is, from the start of the object's box.
+    pub const SHAPE_OFFSET: usize = Gc::<Object>::VALUE_OFFSET + std::mem::offset_of!(Object, shape);
     /// Byte offset of inline field `i` from the start of the object's box.
     pub fn field_offset(i: usize) -> usize {
         Gc::<Object>::VALUE_OFFSET + size_of::<Object>() + i * size_of::<Value>()

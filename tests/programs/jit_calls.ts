@@ -170,3 +170,51 @@ const sq = new Box<Square>().add(new Square(1)).add(new Square(2));
 console.log(sq.fold("", (a: string, s: Square) => a + s.area() + " "));
 const nulls = new Box<Square | null>().add(null).add(new Square(5));
 console.log(nulls.fold(0, (a: number, s: Square | null) => a + (s === null ? -1 : s.side)));
+
+// Calls by name through an interface: several classes at one site, a
+// plain object, an own property shadowing a method.
+interface Comparable<T> {
+  compareTo(other: T): number;
+}
+class Num implements Comparable<Num> {
+  constructor(public v: number) {}
+  compareTo(o: Num): number {
+    return this.v - o.v;
+  }
+}
+class Rev extends Num {
+  compareTo(o: Num): number {
+    return o.v - this.v;
+  }
+}
+function maxOf<T extends Comparable<T>>(xs: T[]): T {
+  let best = xs[0];
+  for (let i = 1; i < xs.length; i++) if (xs[i].compareTo(best) > 0) best = xs[i];
+  return best;
+}
+let picks = "";
+for (let r = 0; r < 50; r++) {
+  const a = maxOf([new Num(3), new Num(9), new Num(4)]);
+  const b = maxOf([new Rev(3), new Rev(9), new Rev(4)]);
+  if (r === 49) picks = a.v + " " + b.v;
+}
+console.log(picks);
+const plain = { v: 5, compareTo: (o: { v: number }) => 100 - o.v };
+const shadow = new Num(1);
+(shadow as any).compareTo = (o: Num) => -1000;
+// The site cached Num: an instance with an own compareTo has another shape.
+console.log(maxOf([plain, { v: 2, compareTo: plain.compareTo }]).v, maxOf([new Num(0), shadow]).v, maxOf([new Num(7), new Num(8)]).v);
+interface Speaker {
+  speak(times: number): string;
+}
+class Dog implements Speaker {
+  speak(times: number): string {
+    return "woof".repeat(times);
+  }
+}
+function talk(s: Speaker, n: any): string {
+  return s.speak(n);
+}
+let said = "";
+for (let i = 0; i < 20; i++) said = talk(new Dog(), 2);
+console.log(said);

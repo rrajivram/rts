@@ -60,6 +60,7 @@ helpers! {
     throw_site = h_throw_site(I32);
     inc_val = h_inc_val(I64, I64);
     call = h_call(I32, I64, I64, I64, I64, I64, I32) -> I64;
+    call_named = h_call_named(I64, I64, I64, I64, I64, I32) -> I64;
     get_prop = h_get_prop(I64, I64, I64) -> I64;
     set_prop = h_set_prop(I64, I64, I64, I64, I64);
     op = h_op(I32, I64, I64, I64, I64) -> I64;
@@ -2591,6 +2592,12 @@ impl Lower<'_, '_> {
         {
             return self.call_value(c, k, want);
         }
+        if let Callee::Prop(name) = &c.callee
+            && c.this.is_some()
+        {
+            let r = self.call_named(c, name);
+            return self.coerce(r, JV::Val, want);
+        }
         match &c.callee {
             Callee::Native(Native::ArrPush) if self.el.inline_push(self.fid, c, want.jk()) => {
                 let (t, [HElem::Expr(x)]) = (c.this.as_ref().unwrap(), &c.args[..]) else { unreachable!() };
@@ -2934,6 +2941,93 @@ impl Lower<'_, '_> {
         self.coerce(r, JV::Val, want)
     }
 
+    /// `recv.name(…)` looked up by name: an inline cache keyed on the
+    /// receiver's shape and class calls the method's adapter directly; a
+    /// miss calls through the interpreter and fills the cache (`h_call_named`).
+    fn call_named(&mut self, c: &HCall, name: &Name) -> RV {
+        let t = c.this.as_ref().unwrap();
+        let this = self.value_as(t, JV::Val);
+        let this = if self.must_hold(&this, t, &c.args, false) { self.hold(this) } else { this };
+        let mut held = vec![this];
+        let mut args = Vec::new();
+        for (i, a) in c.args.iter().enumerate() {
+            let HElem::Expr(x) = a else { unreachable!() };
+            let r = self.value_as(x, JV::Val);
+            let r = if self.must_hold(&r, x, &c.args[i + 1..], false) { self.hold(r) } else { r };
+            held.push(r);
+            args.push(r);
+        }
+        let cache: *mut NamedCache = Box::leak(Box::default());
+        let cache_v = self.b.ins().iconst(types::I64, cache as i64);
+        let merge = self.b.create_block();
+        self.b.append_block_param(merge, types::I64);
+        self.b.append_block_param(merge, types::I64);
+        let slow = self.b.create_block();
+        let is_obj = self.b.ins().icmp_imm_u(IntCC::Equal, this.t.unwrap(), self.lay.tag_obj);
+        let check = self.b.create_block();
+        self.b.ins().brif(is_obj, check, &[], slow, &[]);
+        self.b.seal_block(check);
+        self.b.switch_to_block(check);
+        let shape = self.b.ins().load(types::I64, mf(), this.v, Object::SHAPE_OFFSET as i32);
+        let class_off = (Gc::<Object>::VALUE_OFFSET + std::mem::offset_of!(Object, class)) as i32;
+        let cls = self.b.ins().load(types::I64, mf(), this.v, class_off);
+        let cs = self.b.ins().load(types::I64, mf(), cache_v, std::mem::offset_of!(NamedCache, shape) as i32);
+        let cc = self.b.ins().load(types::I64, mf(), cache_v, std::mem::offset_of!(NamedCache, class) as i32);
+        let s_ok = self.b.ins().icmp(IntCC::Equal, shape, cs);
+        let c_ok = self.b.ins().icmp(IntCC::Equal, cls, cc);
+        let hit = self.b.ins().band(s_ok, c_ok);
+        let fast = self.b.create_block();
+        self.b.ins().brif(hit, fast, &[], slow, &[]);
+        self.b.seal_block(fast);
+        self.b.switch_to_block(fast);
+        {
+            let ad = self.b.ins().load(types::I64, mf(), cache_v, std::mem::offset_of!(NamedCache, adapter) as i32);
+            let mut sig = self.sig0.clone();
+            let mut vals = vec![self.ctx, this.t.unwrap(), this.v];
+            sig.params.extend([AbiParam::new(types::I64), AbiParam::new(types::I64), AbiParam::new(types::I64)]);
+            for r in &args {
+                vals.extend([r.t.unwrap(), r.v]);
+                sig.params.extend([AbiParam::new(types::I64), AbiParam::new(types::I64)]);
+            }
+            sig.returns.extend([AbiParam::new(types::I64), AbiParam::new(types::I64)]);
+            let sref = self.b.import_signature(sig);
+            let call = self.b.ins().call_indirect(sref, ad, &vals);
+            let rs = self.b.inst_results(call).to_vec();
+            self.b.ins().jump(merge, &[rs[0].into(), rs[1].into()]);
+        }
+        self.b.seal_block(slow);
+        self.b.switch_to_block(slow);
+        {
+            use cranelift_codegen::ir::{StackSlotData, StackSlotKind};
+            let n = args.len();
+            let argv = if n > 0 {
+                let slot = self.b.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, (16 * n) as u32, 4));
+                self.b.ins().stack_addr(types::I64, slot, 0)
+            } else {
+                self.b.ins().iconst(types::I64, 0)
+            };
+            for (i, r) in args.iter().enumerate() {
+                self.b.ins().store(mf(), r.t.unwrap(), argv, (16 * i) as i32);
+                self.b.ins().store(mf(), r.v, argv, (16 * i + 8) as i32);
+            }
+            let s = self.b.ins().iconst(types::I64, site(name) as *const _ as i64);
+            let argc = self.b.ins().iconst(types::I32, n as i64);
+            let call = self.b.ins().call(self.h.call_named, &[s, cache_v, this.t.unwrap(), this.v, argv, argc]);
+            let p = self.b.inst_results(call)[0];
+            let t = self.b.ins().load(types::I64, mf(), self.ctx, CTX_RET_TAG);
+            self.b.ins().jump(merge, &[t.into(), p.into()]);
+        }
+        self.b.seal_block(merge);
+        self.b.switch_to_block(merge);
+        let ps = self.b.block_params(merge).to_vec();
+        let r = self.fresh(RV::val(ps[0], ps[1]));
+        self.check_status();
+        for h in held {
+            self.release(h);
+        }
+        r
+    }
+
     /// A call through the interpreter (`h_call`): an owned value.
     fn call_interp(&mut self, c: &HCall) -> RV {
         if std::env::var_os("RTS_JIT_DEBUG").is_some() {
@@ -3076,34 +3170,64 @@ pub(super) struct NativeEntry {
     /// and its parameter count (0 address: none).
     adapter: u64,
     arity: u64,
+    /// For a method: its adapter taking `this` and every argument as values.
+    pub(super) madapter: u64,
+}
+
+/// The entry table, for helpers (see `h_call_named`).
+pub(super) static mut ENTRIES: *const NativeEntry = std::ptr::null();
+
+impl NativeEntry {
+    pub(super) fn method(fid: u32, argc: usize) -> u64 {
+        let e = unsafe { ENTRIES };
+        if e.is_null() {
+            return 0;
+        }
+        let e = unsafe { &*e.add(fid as usize) };
+        if e.madapter != 0 && e.arity == argc as u64 { e.madapter } else { 0 }
+    }
+}
+
+/// Whether method `f` gets an adapter (an instance method taking an
+/// object or any value, no rest or default parameters).
+fn method_key(hir: &HProgram, f: FuncId) -> bool {
+    let hf = &hir.funcs[f as usize];
+    hf.class.is_some() && !hf.is_ctor && hf.free.is_empty()
+        && hf.this_var.is_some_and(|tv| matches!(var_jv(hir, tv), JV::Obj | JV::Val))
+        && !hf.params.iter().any(|p| p.rest || p.default.is_some())
+        && ret_jv(hf).is_some()
+}
+
+/// What an adapter adapts (see `build_adapter`).
+#[derive(Clone, Copy)]
+enum Adapted {
+    /// A function called through a closure: `(ctx, closure box, args…)`;
+    /// the closure's cells are at `caps_off` in its box, if it takes them.
+    Closure { env: bool, caps_off: i32 },
+    /// Method `fid`, taking `this` as a `this`: `(ctx, this tag, this payload, args…)`.
+    Method { fid: FuncId, this: JV },
 }
 
 /// An adapter for compiled function `callee` taking every argument as a
-/// value: `(ctx, closure box, (tag, payload)…) -> (tag, payload)`. Each
-/// argument is checked and converted to the kind the function takes (as
-/// `JitFn::write_arg` does); any mismatch calls the closure through the
-/// interpreter instead (`h_call`). The result is owned.
+/// value, returning `(tag, payload)`, owned. Each argument is checked and
+/// converted to the kind the function takes (as `JitFn::write_arg` does);
+/// any mismatch makes the call through the interpreter instead (`h_call`).
 #[allow(clippy::too_many_arguments)]
-fn build_adapter(mut b: FunctionBuilder, lay: &Layout, callee: FuncRef, h_call: FuncRef, pjs: &[JV], rj: JV, no_env: bool, caps_off: i32, rarena: bool, fc: cranelift_codegen::isa::TargetFrontendConfig) {
+fn build_adapter(mut b: FunctionBuilder, lay: &Layout, callee: FuncRef, h_call: FuncRef, what: Adapted, pjs: &[JV], rj: JV, rarena: bool, fc: cranelift_codegen::isa::TargetFrontendConfig) {
     use cranelift_codegen::ir::{StackSlotData, StackSlotKind};
     let entry = b.create_block();
     b.append_block_params_for_function_params(entry);
     b.switch_to_block(entry);
     b.seal_block(entry);
     let ps = b.block_params(entry).to_vec();
-    let (c, clo) = (ps[0], ps[1]);
-    let words: Vec<(CV, CV)> = (0..pjs.len()).map(|i| (ps[2 + 2 * i], ps[3 + 2 * i])).collect();
+    let c = ps[0];
+    let first = if matches!(what, Adapted::Method { .. }) { 3 } else { 2 };
+    let words: Vec<(CV, CV)> = (0..pjs.len()).map(|i| (ps[first + 2 * i], ps[first + 1 + 2 * i])).collect();
     let slow = b.create_block();
     let mut vals = vec![c];
-    if !no_env {
-        vals.push(b.ins().load(types::I64, mf(), clo, caps_off));
-    }
-    if rarena {
-        vals.push(b.ins().iconst(types::I64, 0));
-    }
-    for (&pj, &(t, p)) in pjs.iter().zip(&words) {
+    // Convert (t, p) to a `pj`, or go to `slow`.
+    let convert = |b: &mut FunctionBuilder, pj: JV, t: CV, p: CV, vals: &mut Vec<CV>| {
         let is = |b: &mut FunctionBuilder, tag: i64| b.ins().icmp_imm_u(IntCC::Equal, t, tag);
-        // Branch to `slow` unless `ok`.
         let need = |b: &mut FunctionBuilder, ok: CV| {
             let next = b.create_block();
             b.ins().brif(ok, next, &[], slow, &[]);
@@ -3113,38 +3237,57 @@ fn build_adapter(mut b: FunctionBuilder, lay: &Layout, callee: FuncRef, h_call: 
         match pj {
             JV::Val => vals.extend([t, p]),
             JV::Num => {
-                let ok = is(&mut b, lay.tag_num);
-                need(&mut b, ok);
+                let ok = is(b, lay.tag_num);
+                need(b, ok);
                 vals.push(b.ins().bitcast(types::F64, MemFlagsData::new(), p));
             }
             JV::Bool => {
-                let ok = is(&mut b, lay.tag_bool);
-                need(&mut b, ok);
+                let ok = is(b, lay.tag_bool);
+                need(b, ok);
                 vals.push(b.ins().ireduce(types::I8, p));
             }
             // A reference: the box, or 0 for null and 1 for undefined.
             JV::Obj | JV::Arr | JV::Nil => {
-                let null = is(&mut b, lay.tag_null);
-                let undef = is(&mut b, lay.tag_undef);
+                let null = is(b, lay.tag_null);
+                let undef = is(b, lay.tag_undef);
                 let nil = b.ins().bor(null, undef);
                 let ok = match pj {
                     JV::Obj => {
-                        let o = is(&mut b, lay.tag_obj);
+                        let o = is(b, lay.tag_obj);
                         b.ins().bor(nil, o)
                     }
                     JV::Arr => {
-                        let a = is(&mut b, lay.tag_arr);
+                        let a = is(b, lay.tag_arr);
                         b.ins().bor(nil, a)
                     }
                     _ => nil,
                 };
-                need(&mut b, ok);
+                need(b, ok);
                 let one = b.ins().iconst(types::I64, 1);
                 let zero = b.ins().iconst(types::I64, 0);
                 let nv = b.ins().select(undef, one, zero);
                 vals.push(b.ins().select(nil, nv, p));
             }
         }
+    };
+    match what {
+        Adapted::Closure { env, caps_off } => {
+            if env {
+                vals.push(b.ins().load(types::I64, mf(), ps[1], caps_off));
+            }
+            if rarena {
+                vals.push(b.ins().iconst(types::I64, 0));
+            }
+        }
+        Adapted::Method { this, .. } => {
+            if rarena {
+                vals.push(b.ins().iconst(types::I64, 0));
+            }
+            convert(&mut b, this, ps[1], ps[2], &mut vals);
+        }
+    }
+    for (&pj, &(t, p)) in pjs.iter().zip(&words) {
+        convert(&mut b, pj, t, p, &mut vals);
     }
     let call = b.ins().call(callee, &vals);
     let rs = b.inst_results(call).to_vec();
@@ -3164,7 +3307,7 @@ fn build_adapter(mut b: FunctionBuilder, lay: &Layout, callee: FuncRef, h_call: 
         }
     };
     b.ins().return_(&[rt, rp]);
-    // A mismatch: call the closure through the interpreter, with the values.
+    // A mismatch: the call through the interpreter, with the values.
     b.seal_block(slow);
     b.switch_to_block(slow);
     let n = words.len();
@@ -3178,12 +3321,23 @@ fn build_adapter(mut b: FunctionBuilder, lay: &Layout, callee: FuncRef, h_call: 
         b.ins().store(mf(), t, argv, (16 * i) as i32);
         b.ins().store(mf(), p, argv, (16 * i + 8) as i32);
     }
-    let kind = b.ins().iconst(types::I32, CALL_VALUE as i64);
-    let ft = b.ins().iconst(types::I64, lay.tag_func);
-    let ut = b.ins().iconst(types::I64, lay.tag_undef);
-    let z = b.ins().iconst(types::I64, 0);
     let argc = b.ins().iconst(types::I32, n as i64);
-    let call = b.ins().call(h_call, &[kind, ft, clo, ut, z, argv, argc]);
+    let args = match what {
+        Adapted::Closure { .. } => {
+            let kind = b.ins().iconst(types::I32, CALL_VALUE as i64);
+            let ft = b.ins().iconst(types::I64, lay.tag_func);
+            let ut = b.ins().iconst(types::I64, lay.tag_undef);
+            let z = b.ins().iconst(types::I64, 0);
+            [kind, ft, ps[1], ut, z, argv, argc]
+        }
+        Adapted::Method { fid, .. } => {
+            let kind = b.ins().iconst(types::I32, CALL_FUNC as i64);
+            let f = b.ins().iconst(types::I64, fid as i64);
+            let z = b.ins().iconst(types::I64, 0);
+            [kind, f, z, ps[1], ps[2], argv, argc]
+        }
+    };
+    let call = b.ins().call(h_call, &args);
     let p = b.inst_results(call)[0];
     let t = b.ins().load(types::I64, mf(), c, CTX_RET_TAG);
     b.ins().return_(&[t, p]);
@@ -3572,18 +3726,25 @@ pub fn compile(hir: &HProgram, prog: &mut Program, esc: &crate::escape::EscapeIn
     }
     // Adapters: each function callable through a function value, taking
     // values (for call sites whose kinds differ, such as generic callbacks).
-    let mut adapters: Vec<(FuncId, ClFuncId)> = Vec::new();
+    let mut adapters: Vec<(FuncId, ClFuncId, bool)> = Vec::new();
     if let Some(caps_off) = lay.clo_caps {
         let call_idx = helpers.iter().position(|(n, ..)| *n == "rts_call").unwrap();
         for &(f, id, _) in &ids {
-            if value_key(hir, f).is_none() {
-                continue;
-            }
             let hf = &hir.funcs[f as usize];
+            let what = if value_key(hir, f).is_some() {
+                Adapted::Closure { env: !hf.free.is_empty(), caps_off }
+            } else if method_key(hir, f) {
+                Adapted::Method { fid: f, this: var_jv(hir, hf.this_var.unwrap()) }
+            } else {
+                continue;
+            };
             let n = hf.params.len();
             let mut sig = m.make_signature();
             sig.params.push(AbiParam::new(ptr));
             sig.params.push(AbiParam::new(types::I64));
+            if matches!(what, Adapted::Method { .. }) {
+                sig.params.push(AbiParam::new(types::I64));
+            }
             for _ in 0..n {
                 sig.params.extend([AbiParam::new(types::I64), AbiParam::new(types::I64)]);
             }
@@ -3595,26 +3756,30 @@ pub fn compile(hir: &HProgram, prog: &mut Program, esc: &crate::escape::EscapeIn
                 let callee = m.declare_func_in_func(id, b.func);
                 let h_call = m.declare_func_in_func(h_ids[call_idx], b.func);
                 let pjs: Vec<JV> = hf.params.iter().map(|p| var_jv(hir, p.var)).collect();
-                build_adapter(b, &lay, callee, h_call, &pjs, ret_jv(hf).unwrap(), hf.free.is_empty(), caps_off, takes_rarena.contains(&f), m.isa().frontend_config());
+                build_adapter(b, &lay, callee, h_call, what, &pjs, ret_jv(hf).unwrap(), takes_rarena.contains(&f), m.isa().frontend_config());
             }
             if let Err(e) = m.define_function(aid, &mut ctx) {
                 eprintln!("rts: native code disabled (adapter for {} failed to compile: {e:?})", hf.name);
                 return 0;
             }
             m.clear_context(&mut ctx);
-            adapters.push((f, aid));
+            adapters.push((f, aid, matches!(what, Adapted::Method { .. })));
         }
     }
     if m.finalize_definitions().is_err() {
         return 0;
     }
-    for &(f, aid) in &adapters {
-        unsafe {
-            let e = &mut *entries.add(f as usize);
-            e.adapter = m.get_finalized_function(aid) as u64;
-            e.arity = hir.funcs[f as usize].params.len() as u64;
+    for &(f, aid, method) in &adapters {
+        let e = unsafe { &mut *entries.add(f as usize) };
+        let p = m.get_finalized_function(aid) as u64;
+        if method {
+            e.madapter = p;
+        } else {
+            e.adapter = p;
         }
+        e.arity = hir.funcs[f as usize].params.len() as u64;
     }
+    unsafe { ENTRIES = entries };
     if debug {
         let mut names: Vec<String> = order
             .iter()

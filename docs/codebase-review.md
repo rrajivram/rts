@@ -568,3 +568,11 @@ Not part of the brief, listed because they surfaced.
   only throws is inferred as `void` instead of `never`; a method call on a
   plain object cast to a class type throws instead of calling the
   object's property (interpreter and compiled code agree).
+- Adapters (`be8f79e`): each function callable through a function value
+  also gets an adapter taking values (checked and unboxed inline), for
+  call sites whose kinds differ, such as generic callbacks (DeltaBlue −12%).
+- By-name method calls: an inline cache per call site in compiled code
+  (receiver shape and class → method adapter); a miss calls the resolved
+  method directly and fills the cache. Typed CD −17%; untyped JS suite
+  −18% to −39% on 12 of 14 benchmarks (NBody, Sieve, Mandelbrot
+  unchanged). P1 is now done for virtual, closure and by-name calls.
