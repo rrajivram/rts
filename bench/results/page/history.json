@@ -70,5 +70,13 @@
   "rc_geomean_s": 0.1204,
   "gc_geomean_s": 0.1017,
   "jitless_geomean_s": 0.439
+ },
+ {
+  "commit": "119d143",
+  "date": "2026-11-17",
+  "step": "Start-up compile 252->166 ms; field-function calls (Richards -30%); untyped code compiled",
+  "rc_geomean_s": 0.1164,
+  "gc_geomean_s": 0.0969,
+  "jitless_geomean_s": 0.4374
  }
 ]
