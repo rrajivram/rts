@@ -57,6 +57,15 @@ impl JsStr {
             self.s.encode_utf16().nth(i)
         }
     }
+    /// The one-character string at UTF-16 index `i` (which must be in
+    /// range): shared for ASCII characters, so reading characters of a
+    /// string allocates nothing and `===` on them is a pointer test.
+    pub fn char_at(&self, i: usize) -> Value {
+        if self.ascii {
+            return ascii_char(self.s.as_bytes()[i]);
+        }
+        Value::str(self.slice16(i, i + 1))
+    }
     /// Substring by UTF-16 indices (clamped).
     pub fn slice16(&self, start: usize, end: usize) -> String {
         if self.ascii {
@@ -70,6 +79,38 @@ impl JsStr {
             String::from_utf16_lossy(&u[start..end])
         }
     }
+}
+
+/// The string of one ASCII character `b`. Shared (the reference-counting
+/// build keeps a table; the tracing GC can't see it, so that build
+/// allocates).
+pub fn ascii_char(b: u8) -> Value {
+    #[cfg(not(feature = "gc"))]
+    {
+        thread_local! {
+            static CHARS: Vec<Value> = (0u8..128).map(|c| Value::str((c as char).to_string())).collect();
+        }
+        if b < 128 {
+            return CHARS.with(|t| t[b as usize].clone());
+        }
+    }
+    Value::str((b as char).to_string())
+}
+
+/// `typeof`'s result for a value (shared strings, as `ascii_char`).
+pub fn type_of_value(v: &Value) -> Value {
+    #[cfg(not(feature = "gc"))]
+    {
+        const NAMES: [&str; 8] = ["undefined", "object", "boolean", "number", "bigint", "string", "function", "symbol"];
+        thread_local! {
+            static TYPES: Vec<Value> = NAMES.iter().map(|n| Value::str(*n)).collect();
+        }
+        let t = v.type_of();
+        if let Some(i) = NAMES.iter().position(|n| *n == t) {
+            return TYPES.with(|x| x[i].clone());
+        }
+    }
+    Value::str(v.type_of())
 }
 
 /// An array's elements. `repr(C, u8)`: the variant is the first byte and

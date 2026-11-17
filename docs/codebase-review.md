@@ -576,3 +576,7 @@ Not part of the brief, listed because they surfaced.
   method directly and fills the cache. Typed CD −17%; untyped JS suite
   −18% to −39% on 12 of 14 benchmarks (NBody, Sieve, Mandelbrot
   unchanged). P1 is now done for virtual, closure and by-name calls.
+- P5 (parts 1, 3, 5): one-character ASCII strings and `typeof` results
+  are shared (reference-counting build); compiled `===` decides strings
+  inline when they are the same box, differ in length, or are one byte
+  long. Json −22% typed, −12% untyped. New test `string_chars.ts`.

@@ -832,6 +832,7 @@ pub fn keys_of(v: &Value) -> Vec<Value> {
 pub fn iterate(vm: &mut Vm, v: &Value) -> Result<Vec<Value>, Value> {
     Ok(match v {
         Value::Arr(a) => a.to_vec(),
+        Value::Str(s) if s.ascii => s.s.bytes().map(ascii_char).collect(),
         Value::Str(s) => s.s.chars().map(|c| Value::str(c.to_string())).collect(),
         Value::Map(m) => m
             .borrow()
@@ -1015,7 +1016,7 @@ pub fn call_native(vm: &mut Vm, n: Native, this: Value, args: Vec<Value>) -> NRe
             if i < 0.0 {
                 Value::str("")
             } else {
-                Value::str(s.slice16(i as usize, i as usize + 1))
+                if (i as usize) < s.len16() { s.char_at(i as usize) } else { Value::str("") }
             }
         }
         StrCharCodeAt => {
@@ -1130,7 +1131,9 @@ pub fn call_native(vm: &mut Vm, n: Native, this: Value, args: Vec<Value>) -> NRe
                 Some(Value::Regex(re)) => regex_split(re, &s),
                 Some(sep) => {
                     let sep = sep.to_js_string();
-                    if sep.s.is_empty() {
+                    if sep.s.is_empty() && s.ascii {
+                        s.s.bytes().map(ascii_char).collect()
+                    } else if sep.s.is_empty() {
                         s.s.chars().map(|c| Value::str(c.to_string())).collect()
                     } else {
                         s.s.split(&*sep.s).map(Value::str).collect()
@@ -1234,7 +1237,7 @@ pub fn call_native(vm: &mut Vm, n: Native, this: Value, args: Vec<Value>) -> NRe
             if i < 0.0 || i >= len {
                 Value::Undef
             } else {
-                Value::str(s.slice16(i as usize, i as usize + 1))
+                s.char_at(i as usize)
             }
         }
         StrLocaleCompare => {
@@ -2034,7 +2037,7 @@ pub fn get_dyn(o: &Value, k: &Value) -> Value {
         },
         Value::Str(s) => {
             if let Some(i) = as_index(k) {
-                return if i < s.len16() { Value::str(s.slice16(i, i + 1)) } else { Value::Undef };
+                return if i < s.len16() { s.char_at(i) } else { Value::Undef };
             }
             if let Value::Str(n) = k
                 && &*n.s == "length"

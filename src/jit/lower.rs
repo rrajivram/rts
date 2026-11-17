@@ -93,6 +93,9 @@ pub(super) struct Layout {
     /// start of its box (None: the cells' pointer couldn't be found).
     clo_func: i32,
     clo_caps: Option<i32>,
+    /// A string's bytes pointer and length (bytes), from the start of its box.
+    str_bytes: Option<(i32, i32)>,
+    tag_str: i64,
     arr: Option<ArrLayout>,
 }
 
@@ -113,6 +116,16 @@ impl Layout {
                 (c.as_ptr() as usize - c.header_ptr().as_ptr() as usize) as i32
             },
             arr: if std::env::var_os("RTS_JIT_NO_INLINE_ARRAYS").is_some() { None } else { ArrLayout::probe() },
+            str_bytes: {
+                let st = crate::runtime::JsStr::new("abc");
+                let at = Gc::<crate::runtime::JsStr>::VALUE_OFFSET + std::mem::offset_of!(crate::runtime::JsStr, s);
+                let w: [usize; 2] = unsafe { std::mem::transmute_copy(&st.s) };
+                w.iter()
+                    .position(|x| *x == st.s.as_ptr() as usize)
+                    .filter(|&i| w[1 - i] == 3)
+                    .map(|i| ((at + 8 * i) as i32, (at + 8 * (1 - i)) as i32))
+            },
+            tag_str: t(Value::str("")),
             clo_func: (Gc::<Closure>::VALUE_OFFSET + std::mem::offset_of!(Closure, func)) as i32,
             clo_caps: {
                 // `Box<[T]>` is (pointer, length) in some order: find the pointer.
@@ -2173,6 +2186,45 @@ impl Lower<'_, '_> {
         let r = self.b.ins().select(is_num, num_eq, r);
         self.b.ins().jump(done, &[r.into()]);
         self.b.switch_to_block(slow);
+        // Same box: equal. Strings: different lengths differ, and one byte
+        // compares inline (one-character strings, mostly shared anyway).
+        let same_box = self.b.ins().icmp(IntCC::Equal, x.v, y.v);
+        let t1 = self.b.ins().iconst(types::I8, 1);
+        let other = self.b.create_block();
+        self.b.ins().brif(same_box, done, &[t1.into()], other, &[]);
+        self.b.seal_block(other);
+        self.b.switch_to_block(other);
+        let helper = self.b.create_block();
+        if let Some((ptr_off, len_off)) = l.str_bytes {
+            let is_str = self.b.ins().icmp_imm_u(IntCC::Equal, xt, l.tag_str);
+            let str_b = self.b.create_block();
+            self.b.ins().brif(is_str, str_b, &[], helper, &[]);
+            self.b.seal_block(str_b);
+            self.b.switch_to_block(str_b);
+            let xl = self.b.ins().load(types::I64, mf(), x.v, len_off);
+            let yl = self.b.ins().load(types::I64, mf(), y.v, len_off);
+            let same_len = self.b.ins().icmp(IntCC::Equal, xl, yl);
+            let f0 = self.b.ins().iconst(types::I8, 0);
+            let len_b = self.b.create_block();
+            self.b.ins().brif(same_len, len_b, &[], done, &[f0.into()]);
+            self.b.seal_block(len_b);
+            self.b.switch_to_block(len_b);
+            let one = self.b.ins().icmp_imm_u(IntCC::Equal, xl, 1);
+            let byte_b = self.b.create_block();
+            self.b.ins().brif(one, byte_b, &[], helper, &[]);
+            self.b.seal_block(byte_b);
+            self.b.switch_to_block(byte_b);
+            let xp = self.b.ins().load(types::I64, mf(), x.v, ptr_off);
+            let yp = self.b.ins().load(types::I64, mf(), y.v, ptr_off);
+            let xc = self.b.ins().load(types::I8, mf(), xp, 0);
+            let yc = self.b.ins().load(types::I8, mf(), yp, 0);
+            let r = self.b.ins().icmp(IntCC::Equal, xc, yc);
+            self.b.ins().jump(done, &[r.into()]);
+        } else {
+            self.b.ins().jump(helper, &[]);
+        }
+        self.b.seal_block(helper);
+        self.b.switch_to_block(helper);
         let r = self.op(OP_STRICT_EQ, xt, x.v, Some(y));
         let r = self.b.ins().ireduce(types::I8, r);
         self.b.ins().jump(done, &[r.into()]);

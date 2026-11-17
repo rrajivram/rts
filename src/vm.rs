@@ -1925,7 +1925,7 @@ impl Vm {
                         value!(output) = r
                     }
                     Instruction::DynamicBitNot { output, value } => value!(output) = dyn_bitnot(&value!(value)),
-                    Instruction::TypeOf { output, value } => value!(output) = Value::str(value!(value).type_of()),
+                    Instruction::TypeOf { output, value } => value!(output) = type_of_value(&value!(value)),
                     Instruction::In { output: d, key: k, object: o } => {
                         let r = match &value!(o) {
                             Value::Obj(ob) => {
@@ -2143,7 +2143,7 @@ impl Vm {
                             }
                             Value::Str(st) => {
                                 if idx >= 0.0 && idx.fract() == 0.0 && (idx as usize) < st.len16() {
-                                    Value::str(st.slice16(idx as usize, idx as usize + 1))
+                                    st.char_at(idx as usize)
                                 } else {
                                     Value::Undef
                                 }

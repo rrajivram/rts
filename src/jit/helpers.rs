@@ -541,7 +541,7 @@ pub(super) extern "C" fn h_op(op: u32, at: u64, ap: u64, bt: u64, bp: u64) -> u6
             let r = nested(|vm| vm.jit_to_string(&a));
             give_result(r)
         }
-        OP_TYPEOF => give(Value::str(a.type_of())),
+        OP_TYPEOF => give(crate::runtime::type_of_value(&a)),
         OP_STR_LEN => match &*a {
             Value::Str(st) => (st.len16() as f64).to_bits(),
             other => {
