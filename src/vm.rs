@@ -648,6 +648,14 @@ impl Vm {
         }
     }
 
+    /// The values `for-of` walks, as `ToIterationArray` makes them.
+    pub(crate) fn jit_iteration_array(&mut self, v: &Value) -> Result<Value, Value> {
+        self.gc_block += 1;
+        let r = natives::iterate(self, v).map(|xs| Value::Arr(Array::new_val(xs)));
+        self.gc_block -= 1;
+        r
+    }
+
     /// A built-in, as `CallTarget::Native`.
     pub(crate) fn jit_call_native(&mut self, n: Native, this: Value, args: &[Value]) -> Result<Value, Value> {
         self.gc_block += 1;
@@ -733,7 +741,7 @@ impl Vm {
         }
         // Two words per argument at most (a value: tag and payload). Only
         // the words written are read.
-        let mut argv = [std::mem::MaybeUninit::<u64>::uninit(); 32];
+        let mut argv = [std::mem::MaybeUninit::<u64>::uninit(); 33];
         let argv_ptr = argv.as_mut_ptr() as *mut u64;
         let put = |i: usize, w: u64| unsafe { argv_ptr.add(i).write(w) };
         let mut i = 0;
@@ -742,9 +750,18 @@ impl Vm {
             put(0, closure?.caps.as_ptr() as u64);
             i = 1;
         }
-        if jf.this {
-            put(i, JitFn::arg_bits(JV::Obj, this.unwrap_or(&Value::Undef))?);
-            i += 1;
+        match jf.this {
+            Some(JV::Val) => {
+                let [t, p] = JitFn::val_words(this.unwrap_or(&Value::Undef));
+                put(i, t);
+                put(i + 1, p);
+                i += 2;
+            }
+            Some(k) => {
+                put(i, JitFn::arg_bits(k, this.unwrap_or(&Value::Undef))?);
+                i += 1;
+            }
+            None => {}
         }
         for (&(_, r), &k) in ci.args.iter().zip(&jf.params) {
             match k {
@@ -822,15 +839,22 @@ impl Vm {
             return None;
         }
         let args = &args[..jf.params.len()];
-        let mut argv = [0u64; 33];
+        let mut argv = [0u64; 34];
         let mut i = 0;
         if jf.env {
             argv[0] = closure?.caps.as_ptr() as u64;
             i = 1;
         }
-        if jf.this {
-            argv[i] = JitFn::arg_bits(JV::Obj, this)?;
-            i += 1;
+        match jf.this {
+            Some(JV::Val) => {
+                [argv[i], argv[i + 1]] = JitFn::val_words(this);
+                i += 2;
+            }
+            Some(k) => {
+                argv[i] = JitFn::arg_bits(k, this)?;
+                i += 1;
+            }
+            None => {}
         }
         for (a, &k) in args.iter().zip(&jf.params) {
             if k == JV::Val {

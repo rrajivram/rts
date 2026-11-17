@@ -5,7 +5,8 @@
 //! compiled when it is neither async nor a generator and its body uses only
 //! what this file lowers: arithmetic, comparisons, control flow, `Math.*`,
 //! fields, array elements, properties by name, global and captured
-//! variables, string literals, closures, `new`, and calls.
+//! variables, string literals, closures, `new`, calls, `switch`, `for-of`
+//! and `throw`.
 //! Calls to other compiled functions are direct (methods too, when the class
 //! hierarchy shows a single target); any other call (a function value, a
 //! method by name, a built-in, a virtual method, a function that isn't
@@ -239,8 +240,8 @@ pub struct JitFn {
     pub entry: Entry,
     /// Takes its closure's cells (`Closure::caps`) as its first argument.
     pub env: bool,
-    /// Takes `this` as its first argument (after the cells).
-    pub this: bool,
+    /// Takes `this` (as this) as its first argument (after the cells).
+    pub this: Option<JV>,
     pub params: Vec<JV>,
     pub ret: JV,
 }
@@ -572,6 +573,29 @@ extern "C" fn h_closure(func: u32, cells: *const u64, n: u32) -> u64 {
     Gc::into_header(Gc::new(Closure { func, caps, props: Default::default() })).as_ptr() as u64
 }
 
+/// `throw v`, taking over `v`'s count.
+extern "C" fn h_throw_value(tag: u64, payload: u64) {
+    raise(std::mem::ManuallyDrop::into_inner(peek_value(tag, payload)));
+}
+
+/// The array a `for-of` walks (counted): an array itself, or a new array
+/// of another iterable's values. Errors (not iterable) set the status.
+extern "C" fn h_iter_array(tag: u64, payload: u64) -> u64 {
+    let v = peek_value(tag, payload);
+    let r = match &*v {
+        Value::Arr(a) => Ok(Value::Arr(a.clone())),
+        _ => nested(|vm| vm.jit_iteration_array(&v)),
+    };
+    match r {
+        Ok(Value::Arr(ref a)) => Gc::into_header(a.clone()).as_ptr() as u64,
+        Ok(_) => unreachable!("an iteration array"),
+        Err(e) => {
+            raise(e);
+            1
+        }
+    }
+}
+
 extern "C" fn h_inc_val(tag: u64, payload: u64) {
     std::mem::forget((*peek_value(tag, payload)).clone());
 }
@@ -643,7 +667,8 @@ extern "C" fn h_call(kind: u32, a: u64, b: u64, this_t: u64, this_p: u64, argv: 
         unsafe { (*ctx()).status = STATUS_OVERFLOW };
         return give(Value::Undef);
     }
-    let args = unsafe { std::slice::from_raw_parts(argv, argc as usize) };
+    // No arguments: compiled code passes a null `argv`.
+    let args: &[Value] = if argc == 0 { &[] } else { unsafe { std::slice::from_raw_parts(argv, argc as usize) } };
     let this = (*peek_value(this_t, this_p)).clone();
     let r = nested(|vm| match kind {
         CALL_FUNC => vm.jit_call_func(a as u32, this, args),
@@ -927,15 +952,15 @@ impl Elig<'_> {
     }
 
     fn pure_stmts(&self, ss: &[HStmt]) -> bool {
-        ss.iter().all(|s| match s {
-            HStmt::Expr(e) | HStmt::Return(Some(e)) | HStmt::Init(_, Some(e)) => self.pure_expr(e),
-            HStmt::Block(b, _) => self.pure_stmts(b),
-            HStmt::If(c, t, e) => self.pure_expr(c) && self.pure_stmts(t) && self.pure_stmts(e),
-            HStmt::Loop { test, body, update, .. } => {
-                test.as_ref().is_none_or(|t| self.pure_expr(t)) && update.as_ref().is_none_or(|u| self.pure_expr(u)) && self.pure_stmts(body)
+        ss.iter().all(|s| {
+            // A literal throw site constructs its error after unwinding.
+            if let HStmt::Throw(e) = s
+                && throw_site(e).is_some()
+            {
+                return true;
             }
-            HStmt::Labeled(_, s) => self.pure_stmts(std::slice::from_ref(&**s)),
-            _ => true,
+            let (xs, bodies) = parts(s);
+            xs.into_iter().all(|x| self.pure_expr(x)) && bodies.into_iter().all(|b| self.pure_stmts(b))
         })
     }
 
@@ -1030,7 +1055,7 @@ impl Elig<'_> {
             return reject("async or generator".into());
         }
         if let Some(t) = hf.this_var
-            && !(self.own_var(f, t) && self.vjk(t) == Some(JK::Ref))
+            && !(self.own_var(f, t) && self.vjk(t).is_some_and(JK::counted))
         {
             return reject(format!("`this` is {:?}", self.hir.vars[t as usize].ty));
         }
@@ -1087,7 +1112,12 @@ impl Elig<'_> {
                         self.why(f, body);
                     }
                 }
-                HStmt::Expr(e) | HStmt::Return(Some(e)) | HStmt::Init(_, Some(e)) => self.why_expr(f, e),
+                HStmt::Expr(e) | HStmt::Return(Some(e)) | HStmt::Init(_, Some(e)) | HStmt::Throw(e) => self.why_expr(f, e),
+                HStmt::Switch { disc, cases, .. } => match std::iter::once(disc).chain(cases.iter().filter_map(|c| c.0.as_ref())).find(|x| self.expr(f, x).is_none()) {
+                    Some(x) => self.why_expr(f, x),
+                    None => cases.iter().for_each(|c| self.why(f, &c.1)),
+                },
+                HStmt::ForOf { iter, body, is_await: false, .. } if self.expr(f, iter).is_some() => self.why(f, body),
                 _ => why_say(format!("{s:?}")),
             }
             return;
@@ -1111,7 +1141,16 @@ impl Elig<'_> {
             HStmt::MakeClosure(v, g) => self.own_var(f, *v) && self.vjk(*v) == Some(JK::Val) && self.closure_ok(f, *g),
             HStmt::Block(ss, vars) => vars.iter().all(|v| self.own_var(f, *v)) && ss.iter().all(|s| self.stmt(f, s)),
             HStmt::If(c, t, e) => self.cond(f, c) && t.iter().chain(e.iter()).all(|s| self.stmt(f, s)),
-            HStmt::Throw(e) => throw_site(e).is_some(),
+            HStmt::Throw(e) => throw_site(e).is_some() || self.fits(f, e, JK::Val),
+            HStmt::Switch { disc, cases, .. } => {
+                let dk = self.expr(f, disc);
+                dk.is_some()
+                    && cases.iter().all(|(t, body)| t.as_ref().is_none_or(|t| self.expr(f, t).is_some()) && body.iter().all(|s| self.stmt(f, s)))
+            }
+            // Over an array as it is, or over a copy of another iterable's values.
+            HStmt::ForOf { elem, iter, body, is_await: false, .. } => {
+                self.own_var(f, *elem) && self.fits(f, iter, JK::Val) && body.iter().all(|s| self.stmt(f, s))
+            }
             // Captured per-iteration variables get a new cell each iteration.
             HStmt::Loop { test, body, update, fresh, .. } => {
                 fresh.iter().all(|v| self.own_var(f, *v))
@@ -1162,6 +1201,7 @@ impl Elig<'_> {
             HK::Assign(p, x) => self.assign_ok(f, p, x, k),
             HK::Compound(p, HBin::Num(_), x) => k == JK::Num && self.num_place(f, p) && is(x, JK::Num),
             HK::Update { place, .. } => k == JK::Num && self.num_place(f, place),
+            HK::Compound(p, HBin::Concat, x) => concat_assign(p, x, &e.ty).is_some_and(|a| self.expr(f, &a) == Some(k)),
             HK::Cast(x) => fits(x, k),
             HK::Seq(xs) => !xs.is_empty() && xs.iter().all(|x| self.expr(f, x).is_some()) && fits(xs.last().unwrap(), k),
             HK::Call(c) => self.call(f, c, k),
@@ -1277,7 +1317,7 @@ impl Elig<'_> {
         }
         if let Some(g) = self.direct_target(c) {
             let hg = &self.hir.funcs[g as usize];
-            let this_ok = c.this.as_ref().is_none_or(|t| self.fits(f, t, JK::Ref));
+            let this_ok = c.this.as_ref().is_none_or(|t| hg.this_var.is_some_and(|tv| self.fits(f, t, self.vjk(tv).unwrap())));
             return this_ok && coercible(ret_jk(hg).unwrap(), k) && self.args(f, g, &c.args);
         }
         let this_ok = c.this.as_ref().is_none_or(|t| self.fits(f, t, JK::Val));
@@ -1298,6 +1338,32 @@ impl Elig<'_> {
             Callee::Method { .. } => c.this.as_ref().is_some_and(|t| self.fits(f, t, JK::Val)) && self.val_args(f, &c.args),
         }
     }
+}
+
+/// `p += x` on strings as `p = p + x`, when evaluating `p`'s object twice
+/// is the same as once (a variable, or fields of one).
+fn concat_assign(p: &Place, x: &HExpr, ty: &Type) -> Option<HExpr> {
+    fn plain(e: &HExpr) -> bool {
+        match &e.kind {
+            HK::Read(p) => match &**p {
+                Place::Var(_) => true,
+                Place::Field { obj, opt: false, .. } => plain(obj),
+                _ => false,
+            },
+            HK::Cast(y) => plain(y),
+            _ => false,
+        }
+    }
+    let ok = match p {
+        Place::Var(_) => true,
+        Place::Field { obj, opt: false, .. } => plain(obj),
+        _ => false,
+    };
+    ok.then(|| {
+        let cur = HExpr { kind: HK::Read(Box::new(p.clone())), ty: ty.clone() };
+        let sum = HExpr { kind: HK::Binary(HBin::Concat, Box::new(cur), Box::new(x.clone())), ty: ty.clone() };
+        HExpr { kind: HK::Assign(Box::new(p.clone()), Box::new(sum)), ty: ty.clone() }
+    })
 }
 
 /// `throw new C("…", …)` with string literal arguments: the class and arguments.
@@ -1394,6 +1460,25 @@ fn math_native(n: Native) -> bool {
 }
 
 /// Assignments (and initializations) of variables in `ss`, with their values.
+/// A statement's own expressions and its nested statement lists.
+fn parts(s: &HStmt) -> (Vec<&HExpr>, Vec<&[HStmt]>) {
+    match s {
+        HStmt::Expr(x) | HStmt::Return(Some(x)) | HStmt::Throw(x) | HStmt::Init(_, Some(x)) => (vec![x], vec![]),
+        HStmt::Block(b, _) => (vec![], vec![b]),
+        HStmt::If(c, t, f) => (vec![c], vec![t, f]),
+        HStmt::Loop { test, body, update, .. } => (test.iter().chain(update.iter()).collect(), vec![body]),
+        HStmt::ForOf { iter, body, .. } | HStmt::ForIn { obj: iter, body, .. } => (vec![iter], vec![body]),
+        HStmt::Switch { disc, cases, .. } => {
+            (std::iter::once(disc).chain(cases.iter().filter_map(|c| c.0.as_ref())).collect(), cases.iter().map(|c| c.1.as_slice()).collect())
+        }
+        HStmt::Labeled(_, s) => (vec![], vec![std::slice::from_ref(&**s)]),
+        HStmt::Try { block, handler, finalizer, .. } => (vec![], std::iter::once(block.as_slice()).chain([handler.as_slice()]).chain(finalizer.as_deref()).collect()),
+        HStmt::Init(_, None) | HStmt::MakeClosure(..) | HStmt::Break(_) | HStmt::Continue(_) | HStmt::Return(None) => (vec![], vec![]),
+    }
+}
+
+/// Every `v = x` of a variable: assignments, initializers, and a `for-of`
+/// variable taking `iter`'s elements (`(elem, iter)`).
 fn collect_ref_assigns<'a>(ss: &'a [HStmt], out: &mut Vec<(VarId, &'a HExpr)>) {
     fn e<'a>(x: &'a HExpr, out: &mut Vec<(VarId, &'a HExpr)>) {
         if let HK::Assign(p, v) = &x.kind
@@ -1407,28 +1492,16 @@ fn collect_ref_assigns<'a>(ss: &'a [HStmt], out: &mut Vec<(VarId, &'a HExpr)>) {
     }
     for s in ss {
         match s {
-            HStmt::Expr(x) | HStmt::Return(Some(x)) => e(x, out),
-            HStmt::Init(v, Some(x)) => {
-                out.push((*v, x));
-                e(x, out);
-            }
-            HStmt::Block(b, _) => collect_ref_assigns(b, out),
-            HStmt::If(c, t, f) => {
-                e(c, out);
-                collect_ref_assigns(t, out);
-                collect_ref_assigns(f, out);
-            }
-            HStmt::Loop { test, body, update, .. } => {
-                if let Some(t) = test {
-                    e(t, out);
-                }
-                if let Some(u) = update {
-                    e(u, out);
-                }
-                collect_ref_assigns(body, out);
-            }
-            HStmt::Labeled(_, s) => collect_ref_assigns(std::slice::from_ref(&**s), out),
+            HStmt::Init(v, Some(x)) => out.push((*v, x)),
+            HStmt::ForOf { elem, iter, .. } => out.push((*elem, iter)),
             _ => {}
+        }
+        let (xs, bodies) = parts(s);
+        for x in xs {
+            e(x, out);
+        }
+        for b in bodies {
+            collect_ref_assigns(b, out);
         }
     }
 }
@@ -1471,26 +1544,12 @@ fn assigned_vars(ss: &[HStmt], out: &mut FxHashSet<VarId>) {
         }
     }
     for s in ss {
-        match s {
-            HStmt::Expr(x) | HStmt::Return(Some(x)) => e(x, out),
-            HStmt::Init(_, Some(x)) => e(x, out),
-            HStmt::Block(b, _) => assigned_vars(b, out),
-            HStmt::If(c, t, f) => {
-                e(c, out);
-                assigned_vars(t, out);
-                assigned_vars(f, out);
-            }
-            HStmt::Loop { test, body, update, .. } => {
-                if let Some(t) = test {
-                    e(t, out);
-                }
-                if let Some(u) = update {
-                    e(u, out);
-                }
-                assigned_vars(body, out);
-            }
-            HStmt::Labeled(_, s) => assigned_vars(std::slice::from_ref(&**s), out),
-            _ => {}
+        let (xs, bodies) = parts(s);
+        for x in xs {
+            e(x, out);
+        }
+        for b in bodies {
+            assigned_vars(b, out);
         }
     }
 }
@@ -1533,6 +1592,8 @@ struct Helpers {
     op: FuncRef,
     new_cell: FuncRef,
     closure: FuncRef,
+    throw_value: FuncRef,
+    iter_array: FuncRef,
 }
 
 /// Layout facts compiled code relies on.
@@ -1663,8 +1724,11 @@ struct Lower<'a, 'b> {
     /// Owned temporaries not yet consumed (payload, tag): released if the
     /// code unwinds.
     pending: Vec<(CV, Option<CV>)>,
-    /// (label, break target, continue target).
-    loops: Vec<(Option<Name>, Block, Option<Block>)>,
+    /// (label, break target, continue target, is a switch).
+    loops: Vec<(Option<Name>, Block, Option<Block>, bool)>,
+    /// Each `for-of`'s array (keyed by the statement's address): owned,
+    /// or 1 when the loop isn't running.
+    iters: FxHashMap<usize, Variable>,
     funcs: FxHashMap<FuncId, FuncRef>,
     h: Helpers,
     lay: &'a Layout,
@@ -2090,6 +2154,12 @@ impl Lower<'_, '_> {
             let c = self.b.use_var(x);
             self.dec(c);
         }
+        let mut iters: Vec<(usize, Variable)> = self.iters.iter().map(|(k, x)| (*k, *x)).collect();
+        iters.sort_by_key(|c| c.0);
+        for (_, x) in iters {
+            let a = self.b.use_var(x);
+            self.dec(a);
+        }
     }
 
     fn ret(&mut self, r: RV) {
@@ -2232,7 +2302,7 @@ impl Lower<'_, '_> {
                     }
                 }
                 self.b.switch_to_block(bb);
-                self.loops.push((label.clone(), xb, Some(ub)));
+                self.loops.push((label.clone(), xb, Some(ub), false));
                 self.stmts(body);
                 self.loops.pop();
                 self.b.ins().jump(ub, &[]);
@@ -2260,9 +2330,10 @@ impl Lower<'_, '_> {
                 self.b.seal_block(xb);
                 self.b.switch_to_block(xb);
             }
+            HStmt::Labeled(name, s) if matches!(&**s, HStmt::ForOf { .. }) => self.for_of(s, Some(name.clone())),
             HStmt::Labeled(name, s) if !matches!(&**s, HStmt::Loop { .. }) => {
                 let xb = self.b.create_block();
-                self.loops.push((Some(name.clone()), xb, None));
+                self.loops.push((Some(name.clone()), xb, None, false));
                 self.stmt(s);
                 self.loops.pop();
                 self.b.ins().jump(xb, &[]);
@@ -2280,15 +2351,24 @@ impl Lower<'_, '_> {
             }
             HStmt::Break(label) | HStmt::Continue(label) => {
                 let is_break = matches!(s, HStmt::Break(_));
-                let target = self.loops.iter().rev().find(|(l, _, c)| match label {
+                let target = self.loops.iter().rev().find(|(l, _, c, sw)| match label {
                     Some(n) => l.as_ref() == Some(n),
-                    None => c.is_some(),
+                    None => c.is_some() || (is_break && *sw),
                 });
-                let (_, xb, cb) = target.expect("break target").clone();
+                let (_, xb, cb, _) = target.expect("break target").clone();
                 let to = if is_break { xb } else { cb.expect("continue target") };
                 self.b.ins().jump(to, &[]);
                 self.dead_block();
             }
+            HStmt::Throw(e) if throw_site(e).is_none() => {
+                let r = self.value_as(e, JV::Val);
+                let r = self.own(r);
+                self.b.ins().call(self.h.throw_value, &[r.t.unwrap(), r.v]);
+                self.bail();
+                self.dead_block();
+            }
+            HStmt::Switch { label, disc, cases } => self.switch(label, disc, cases),
+            HStmt::ForOf { .. } => self.for_of(s, None),
             HStmt::Throw(e) => {
                 let site = throw_site(e).unwrap();
                 let i = THROW_SITES.with(|t| {
@@ -2346,6 +2426,158 @@ impl Lower<'_, '_> {
                 self.dead_block();
             }
             _ => unreachable!("checked by Elig"),
+        }
+    }
+
+    /// `switch`: the cases' tests in order (`===`), then the bodies, each
+    /// falling through to the next.
+    fn switch(&mut self, label: &Option<Name>, disc: &HExpr, cases: &[(Option<HExpr>, Vec<HStmt>)]) {
+        let dj = jv(&disc.ty).unwrap();
+        let d = self.value_of(disc);
+        let var = is_var_read(self.hir, disc);
+        let d = if dj.jk().counted() && !d.owned && cases.iter().any(|c| c.0.as_ref().is_some_and(|t| self.el.effects(t, var))) { self.hold(d) } else { d };
+        let chosen = self.b.create_block();
+        self.b.append_block_param(chosen, types::I32);
+        for (k, (t, _)) in cases.iter().enumerate() {
+            let Some(t) = t else { continue };
+            let tj = jv(&t.ty).unwrap();
+            let hit = match (dj, tj) {
+                (JV::Num, JV::Num) => {
+                    let y = self.expr(t);
+                    self.b.ins().fcmp(FloatCC::Equal, d.v, y)
+                }
+                (JV::Bool, JV::Bool) => {
+                    let y = self.expr(t);
+                    self.b.ins().icmp(IntCC::Equal, d.v, y)
+                }
+                _ => {
+                    let x = self.coerce(RV { owned: false, ..d }, dj, JV::Val);
+                    let y = self.value_as(t, JV::Val);
+                    let h = self.strict_eq(x, y);
+                    self.release(y);
+                    h
+                }
+            };
+            let next = self.b.create_block();
+            let kc = self.b.ins().iconst(types::I32, k as i64);
+            self.b.ins().brif(hit, chosen, &[kc.into()], next, &[]);
+            self.b.seal_block(next);
+            self.b.switch_to_block(next);
+        }
+        let n = cases.len();
+        let default = cases.iter().position(|c| c.0.is_none()).unwrap_or(n);
+        let dc = self.b.ins().iconst(types::I32, default as i64);
+        self.b.ins().jump(chosen, &[dc.into()]);
+        self.b.seal_block(chosen);
+        self.b.switch_to_block(chosen);
+        let i = self.b.block_params(chosen)[0];
+        self.release(d);
+        let bodies: Vec<Block> = (0..n).map(|_| self.b.create_block()).collect();
+        let xb = self.b.create_block();
+        let mut sw = cranelift_frontend::Switch::new();
+        for (k, blk) in bodies.iter().enumerate() {
+            sw.set_entry(k as u128, *blk);
+        }
+        sw.emit(&mut self.b, i, xb);
+        self.loops.push((label.clone(), xb, None, true));
+        for (k, (_, body)) in cases.iter().enumerate() {
+            self.b.switch_to_block(bodies[k]);
+            self.b.seal_block(bodies[k]);
+            self.stmts(body);
+            self.b.ins().jump(*bodies.get(k + 1).unwrap_or(&xb), &[]);
+        }
+        self.loops.pop();
+        self.b.seal_block(xb);
+        self.b.switch_to_block(xb);
+    }
+
+    /// `for (x of iter)`: over an array as it is (its length read each
+    /// time round), or over an array of another iterable's values.
+    fn for_of(&mut self, s: &HStmt, outer: Option<Name>) {
+        let HStmt::ForOf { label, elem, iter, body, .. } = s else { unreachable!() };
+        let label = label.clone().or(outer);
+        let held = self.iters[&(s as *const HStmt as usize)];
+        let ij = jv(&iter.ty).unwrap();
+        let a = if ij == JV::Arr {
+            let r = self.value_as(iter, JV::Arr);
+            let r = self.own(r);
+            // null or undefined: the interpreter's error.
+            let nullish = self.b.ins().icmp_imm_u(IntCC::UnsignedLessThan, r.v, 2);
+            let (t, p) = self.value_words(JV::Arr, r);
+            self.if_then(nullish, |s| {
+                s.b.ins().call(s.h.iter_array, &[t, p]);
+            });
+            self.check_status();
+            r.v
+        } else {
+            let r = self.value_as(iter, JV::Val);
+            let call = self.b.ins().call(self.h.iter_array, &[r.t.unwrap(), r.v]);
+            let a = self.b.inst_results(call)[0];
+            self.release(r);
+            self.check_status();
+            a
+        };
+        let old = self.b.use_var(held);
+        self.b.def_var(held, a);
+        self.dec(old);
+        let iv = self.b.declare_var(types::F64);
+        let zero = self.b.ins().f64const(0.0);
+        self.b.def_var(iv, zero);
+        let (tb, bb, ub, xb) = (self.b.create_block(), self.b.create_block(), self.b.create_block(), self.b.create_block());
+        self.b.ins().jump(tb, &[]);
+        self.b.switch_to_block(tb);
+        let a = self.b.use_var(held);
+        let len = self.arr_len(a);
+        let i = self.b.use_var(iv);
+        let more = self.b.ins().fcmp(FloatCC::LessThan, i, len);
+        self.b.ins().brif(more, bb, &[], xb, &[]);
+        self.b.switch_to_block(bb);
+        let ej = var_jv(self.hir, *elem);
+        let r = self.arr_get(a, i, ej);
+        if self.cells.contains_key(elem) {
+            // A new binding each time round.
+            self.new_cell(*elem);
+            let r = if ej.jk().counted() { self.own(r) } else { r };
+            self.mem_set(*elem, r);
+        } else if ej.jk().counted() && !self.borrowed.contains(elem) {
+            let r = self.own(r);
+            self.set_var(*elem, r);
+        } else {
+            self.set_var(*elem, r);
+        }
+        self.loops.push((label, xb, Some(ub), false));
+        self.stmts(body);
+        self.loops.pop();
+        self.b.ins().jump(ub, &[]);
+        self.b.switch_to_block(ub);
+        self.b.seal_block(ub);
+        let i = self.b.use_var(iv);
+        let one = self.b.ins().f64const(1.0);
+        let i1 = self.b.ins().fadd(i, one);
+        self.b.def_var(iv, i1);
+        self.b.ins().jump(tb, &[]);
+        self.b.seal_block(tb);
+        self.b.seal_block(bb);
+        self.b.seal_block(xb);
+        self.b.switch_to_block(xb);
+        let a = self.b.use_var(held);
+        self.dec(a);
+        let none = self.b.ins().iconst(types::I64, 1);
+        self.b.def_var(held, none);
+    }
+
+    /// A variable for each `for-of`'s array, released with the variables.
+    fn declare_iters(&mut self, ss: &[HStmt]) {
+        for s in ss {
+            if matches!(s, HStmt::ForOf { .. }) {
+                let x = self.b.declare_var(types::I64);
+                let none = self.b.ins().iconst(types::I64, 1);
+                self.b.def_var(x, none);
+                self.iters.insert(s as *const HStmt as usize, x);
+            }
+            for b in parts(s).1 {
+                self.declare_iters(b);
+            }
         }
     }
 
@@ -3281,6 +3513,10 @@ impl Lower<'_, '_> {
                 self.coerce(r, JV::Val, want)
             }
             HK::Assign(p, x) => self.assign(p, x, want),
+            HK::Compound(p, HBin::Concat, x) => {
+                let a = concat_assign(p, x, &e.ty).unwrap();
+                self.rexpr(&a)
+            }
             HK::Cast(x) => self.value_as(x, want),
             HK::Seq(xs) => {
                 for x in &xs[..xs.len() - 1] {
@@ -3560,18 +3796,23 @@ impl Lower<'_, '_> {
         let pure = self.el.pure.contains(&g);
         let mut vals = vec![self.ctx];
         let mut held = Vec::new();
-        if hg.this_var.is_some() {
+        if let Some(tv) = hg.this_var {
+            // An instance's methods take an object; static methods, their class (a value).
+            let tj = var_jv(self.hir, tv);
             match &c.this {
                 Some(t) => {
-                    let r = self.value_as(t, JV::Obj);
+                    let r = self.value_as(t, tj);
                     let r = if self.must_hold(&r, t, &c.args, pure) { self.hold(r) } else { r };
-                    if matches!(c.callee, Callee::Method { .. }) {
+                    if matches!(c.callee, Callee::Method { .. }) && tj.jk() == JK::Ref {
                         self.check_obj(r.v, ERR_METHOD);
                     }
-                    vals.push(r.v);
+                    vals.extend(r.words());
                     held.push(r);
                 }
-                None => vals.push(self.b.ins().iconst(types::I64, 1)),
+                None => {
+                    let z = self.zero_rv(tj.jk());
+                    vals.extend(z.words());
+                }
             }
         }
         let pjs = self.param_jvs(g, false);
@@ -3740,7 +3981,7 @@ pub fn compile(hir: &HProgram, prog: &mut Program) -> usize {
         return 0;
     };
     let mut jb = JITBuilder::with_isa(isa, cranelift_module::default_libcall_names());
-    let helpers: [(&str, *const u8); 22] = [
+    let helpers: [(&str, *const u8); 24] = [
         ("rts_mod", h_mod as *const u8),
         ("rts_pow", h_pow as *const u8),
         ("rts_int32", h_int32 as *const u8),
@@ -3763,6 +4004,8 @@ pub fn compile(hir: &HProgram, prog: &mut Program) -> usize {
         ("rts_op", h_op as *const u8),
         ("rts_new_cell", h_new_cell as *const u8),
         ("rts_closure", h_closure as *const u8),
+        ("rts_throw_value", h_throw_value as *const u8),
+        ("rts_iter_array", h_iter_array as *const u8),
     ];
     for (n, p) in helpers {
         jb.symbol(n, p);
@@ -3807,6 +4050,8 @@ pub fn compile(hir: &HProgram, prog: &mut Program) -> usize {
         { let s = sig(&m, &[i32t, i64t, i64t, i64t, i64t], Some(i64t)); decl(&mut m, "rts_op", s) },
         { let s = sig(&m, &[], Some(i64t)); decl(&mut m, "rts_new_cell", s) },
         { let s = sig(&m, &[i32t, i64t, i32t], Some(i64t)); decl(&mut m, "rts_closure", s) },
+        { let s = sig(&m, &[i64t, i64t], None); decl(&mut m, "rts_throw_value", s) },
+        { let s = sig(&m, &[i64t, i64t], Some(i64t)); decl(&mut m, "rts_iter_array", s) },
     ];
 
     // Declare every compiled function (typed) and its entry trampoline.
@@ -3891,6 +4136,8 @@ pub fn compile(hir: &HProgram, prog: &mut Program) -> usize {
                 op: hr[19],
                 new_cell: hr[20],
                 closure: hr[21],
+                throw_value: hr[22],
+                iter_array: hr[23],
             };
             let entry = b.create_block();
             b.append_block_params_for_function_params(entry);
@@ -3939,6 +4186,7 @@ pub fn compile(hir: &HProgram, prog: &mut Program) -> usize {
                 unwind,
                 pending: vec![],
                 loops: vec![],
+                iters: FxHashMap::default(),
                 funcs,
                 h,
                 lay: &lay,
@@ -3995,6 +4243,7 @@ pub fn compile(hir: &HProgram, prog: &mut Program) -> usize {
                     }
                 }
             }
+            lw.declare_iters(&hf.body);
             lw.stmts(&hf.body);
             // Falling off the end returns undefined.
             lw.release_vars(None);
@@ -4085,7 +4334,7 @@ pub fn compile(hir: &HProgram, prog: &mut Program) -> usize {
         if let Some(fc) = prog.funcs.get_mut(f as usize).and_then(std::rc::Rc::get_mut) {
             fc.jit = Some(Box::new(JitFn {
                 entry: unsafe { std::mem::transmute::<*const u8, Entry>(p) },
-                this: hf.this_var.is_some(),
+                this: hf.this_var.map(|v| var_jv(hir, v)),
                 env: !hf.free.is_empty(),
                 params: hf.params.iter().map(|p| var_jv(hir, p.var)).collect(),
                 ret: ret_jv(hf).unwrap(),

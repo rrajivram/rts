@@ -1,0 +1,16 @@
+zero small big negative
+11 10 1100 1000
+two p1 p2
+none p1 p2 p3
+1 | five | 2 | 
+number one string one true null undefined other
+5100 ac b null
+5 h,é,l,l,o,a=1,b=2,3,4 12 10
+TypeError
+1234
+true expected a digit at 2, got 'x' 2
+caught string "a string"
+caught number 42
+caught object {"code":2}
+3
+triangle #1; square #2; 5-gon #3; 
