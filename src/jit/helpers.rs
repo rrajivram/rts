@@ -465,16 +465,7 @@ pub(super) extern "C" fn h_call_named(site: *const crate::bytecode::PropertySite
         && let Some(cls) = &o.class
         && o.lookup(&site.name).is_none()
     {
-        let mut k = Some(cls.clone());
-        let mut found = None;
-        while let Some(c) = k {
-            if let Some(fi) = c.methods.get(&*site.name) {
-                found = Some(*fi);
-                break;
-            }
-            k = c.parent.clone();
-        }
-        if let Some(fi) = found {
+        if let Some(fi) = cls.find_method(&site.name) {
             let ad = super::lower::NativeEntry::method(fi, args.len());
             if ad != 0 {
                 let shape = o.shape();

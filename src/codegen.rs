@@ -352,7 +352,6 @@ struct InlineCtx {
     out: Option<Op>,
     exits: Vec<usize>,
     try_depth: usize,
-    loop_depth: usize,
     region_depth: usize,
 }
 
@@ -1336,7 +1335,7 @@ impl FnGen<'_, '_> {
         let mut has_default = false;
         // All case bodies share one scope (as in JS).
         let bm = self.mark();
-        for ((test, body), j) in cases.iter().zip(case_jumps) {
+        for ((_, body), j) in cases.iter().zip(case_jumps) {
             match j {
                 Some(j) => self.patch_here(j),
                 None => {
@@ -1344,7 +1343,6 @@ impl FnGen<'_, '_> {
                     self.patch_here(default_jump);
                 }
             }
-            let _ = test;
             self.stmts(body);
         }
         if self.v_top > bm.1 {
@@ -2868,13 +2866,6 @@ impl FnGen<'_, '_> {
             }
             _ => None,
         };
-        let map_num = matches!(n, ArrMap) && {
-            if let Some(d) = dst {
-                let _ = d;
-            }
-            false
-        };
-        let _ = map_num;
         let len = self.alloc_s();
         self.emit(Instruction::ArrayLength { output: NumSlot(len), array: ValSlot(arr.r) });
         let i = self.alloc_s();
@@ -3007,7 +2998,7 @@ impl FnGen<'_, '_> {
             }
             _ => {}
         }
-        if let Some((j, x)) = early {
+        if let Some((j, _)) = early {
             let end = self.jump_placeholder();
             self.patch_here(j);
             let d = fd.unwrap();
@@ -3031,7 +3022,6 @@ impl FnGen<'_, '_> {
                 }
                 _ => {}
             }
-            let _ = x;
             self.patch_here(end);
         }
         if let Some(d) = dst {
@@ -3121,13 +3111,11 @@ impl FnGen<'_, '_> {
             out,
             exits: vec![],
             try_depth: self.tries.len(),
-            loop_depth: self.loops.len(),
             region_depth: self.regions.len(),
         });
         let body = hf.body.clone();
         self.stmts(&body);
         let ctx = self.inline.pop().unwrap();
-        let _ = ctx.loop_depth;
         for j in ctx.exits {
             self.patch_here(j);
         }

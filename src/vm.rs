@@ -243,6 +243,24 @@ pub(crate) fn dyn_bitnot(v: &Value) -> Value {
     }
 }
 
+/// The class method a by-name call site reaches on an instance (not
+/// shadowed by an own property), through the site's cache (same shape and
+/// class as last time: same method).
+fn class_method(site: &PropertySite, o: &Object, cls: &Rc<ClassRt>) -> Option<u32> {
+    if let Some((sh, c, fi)) = &*site.cache.method.borrow()
+        && Rc::ptr_eq(c, cls)
+        && o.has_shape(sh)
+    {
+        return Some(*fi);
+    }
+    if o.lookup(&site.name).is_some() {
+        return None;
+    }
+    let fi = cls.find_method(&site.name)?;
+    *site.cache.method.borrow_mut() = Some((o.shape(), cls.clone(), fi));
+    Some(fi)
+}
+
 /// Whether `ordering` satisfies the relational operator `op`.
 fn holds(op: CmpOp, o: std::cmp::Ordering) -> bool {
     match op {
@@ -503,6 +521,17 @@ impl Vm {
         }
     }
 
+    /// Call function `fid` (one that captures nothing) from native code.
+    pub fn call_fid(&mut self, fid: u32, this: Value, args: &[Value]) -> Result<Value, Value> {
+        self.gc_block += 1;
+        let r = match self.call_native_values(fid, None, &this, args) {
+            Some(r) => r,
+            None => self.call_function(fid, None, this, args),
+        };
+        self.gc_block -= 1;
+        r
+    }
+
     /// Call from native code with arguments borrowed from the caller (no allocation
     /// for the argument list — used by callbacks such as `map`'s).
     pub fn call_slice(&mut self, callee: &Value, this: Value, args: &[Value]) -> Result<Value, Value> {
@@ -519,12 +548,18 @@ impl Vm {
         {
             return r;
         }
-        let (func, closure) = match callee {
-            Value::Func(c) => (self.prog.funcs[c.func as usize].clone(), Some(c.clone())),
-            Value::Native(n) => return call_native(self, *n, this, args),
-            Value::Bound(_) => return self.call(callee, this, args.to_vec()),
-            v => return Err(self.type_error(format!("{} is not a function", describe(v)))),
-        };
+        match callee {
+            Value::Func(c) => self.call_function(c.func, Some(c.clone()), this, args),
+            Value::Native(n) => call_native(self, *n, this, args),
+            Value::Bound(_) => self.call(callee, this, args.to_vec()),
+            v => Err(self.type_error(format!("{} is not a function", describe(v)))),
+        }
+    }
+
+    /// Run function `fid` (with `closure`'s cells, if it captures any) in
+    /// the interpreter, from native code. The caller blocks the tracing GC.
+    pub(crate) fn call_function(&mut self, fid: u32, closure: Option<Gc<Closure>>, this: Value, args: &[Value]) -> Result<Value, Value> {
+        let func = self.prog.funcs[fid as usize].clone();
         if self.frames.len() >= MAX_DEPTH {
             return Err(self.range_error("Maximum call stack size exceeded".into()));
         }
@@ -561,11 +596,7 @@ impl Vm {
 
     /// Call function `fid` (one that captures nothing), as `CallTarget::Direct`.
     pub(crate) fn jit_call_func(&mut self, fid: u32, this: Value, args: &[Value]) -> Result<Value, Value> {
-        if let Some(r) = self.call_native_values(fid, None, &this, args) {
-            return r;
-        }
-        let f = Value::Func(Gc::new(Closure { func: fid, caps: Box::new([]), props: Default::default() }));
-        self.call_slice(&f, this, args)
+        self.call_fid(fid, this, args)
     }
 
     /// `recv.<method in vtable slot>(…)`, as `CallTarget::Method`.
@@ -587,30 +618,7 @@ impl Vm {
         if let Value::Obj(o) = &recv
             && let Some(cls) = &o.class
         {
-            let hit = match &*site.cache.method.borrow() {
-                Some((sh, c, fi)) if Rc::ptr_eq(c, cls) && o.has_shape(sh) => Some(*fi),
-                _ => None,
-            };
-            let fi = match hit {
-                Some(fi) => Some(fi),
-                None if o.lookup(&site.name).is_none() => {
-                    let mut k = Some(cls.clone());
-                    let mut found = None;
-                    while let Some(c) = k {
-                        if let Some(fi) = c.methods.get(&*site.name) {
-                            found = Some(*fi);
-                            break;
-                        }
-                        k = c.parent.clone();
-                    }
-                    if let Some(fi) = found {
-                        *site.cache.method.borrow_mut() = Some((o.shape(), cls.clone(), fi));
-                    }
-                    found
-                }
-                None => None,
-            };
-            if let Some(fi) = fi {
+            if let Some(fi) = class_method(site, o, cls) {
                 return self.jit_call_func(fi, recv, args);
             }
         }
@@ -1127,30 +1135,7 @@ impl Vm {
                 if let Value::Obj(o) = &recv
                     && let Some(cls) = &o.class
                 {
-                    let hit = match &*site.cache.method.borrow() {
-                        Some((sh, c, fi)) if Rc::ptr_eq(c, cls) && o.has_shape(sh) => Some(*fi),
-                        _ => None,
-                    };
-                    let fi = match hit {
-                        Some(fi) => Some(fi),
-                        None if o.lookup(&site.name).is_none() => {
-                            let mut k = Some(cls.clone());
-                            let mut found = None;
-                            while let Some(c) = k {
-                                if let Some(fi) = c.methods.get(&*site.name) {
-                                    found = Some(*fi);
-                                    break;
-                                }
-                                k = c.parent.clone();
-                            }
-                            if let Some(fi) = found {
-                                *site.cache.method.borrow_mut() = Some((o.shape(), cls.clone(), fi));
-                            }
-                            found
-                        }
-                        None => None,
-                    };
-                    if let Some(fi) = fi {
+                    if let Some(fi) = class_method(site, o, cls) {
                         break 'prop (self.code(fi), None);
                     }
                 }
@@ -1204,7 +1189,7 @@ impl Vm {
                     Some(&(ak, ar)) => {
                         if ak == *pk {
                             match ak {
-                                Kind::Val if borrowed & (1 << vi) != 0 && vi < 64 => unsafe {
+                                Kind::Val if vi < 64 && borrowed & (1 << vi) != 0 => unsafe {
                                     // Borrowed: a bitwise copy, not counted.
                                     let v = std::ptr::read(&self.values[vb + ar as usize]);
                                     std::ptr::write(&mut self.values[nvb + vi], v);
@@ -1294,18 +1279,8 @@ impl Vm {
                 if let Some(v) = o.get_chain(name) {
                     return Ok(v);
                 }
-                if let Some(c) = &o.class {
-                    let mut k = Some(c.clone());
-                    while let Some(c) = k {
-                        if let Some(fi) = c.methods.get(name) {
-                            return Ok(Value::Func(Gc::new(Closure {
-                                func: *fi,
-                                caps: Box::new([]),
-                                props: Default::default(),
-                            })));
-                        }
-                        k = c.parent.clone();
-                    }
+                if let Some(fi) = o.class.as_ref().and_then(|c| c.find_method(name)) {
+                    return Ok(Value::Func(Gc::new(Closure { func: fi, caps: Box::new([]), props: Default::default() })));
                 }
                 Ok(method_by_name(recv, name).map_or(Value::Undef, Value::Native))
             }
@@ -1350,8 +1325,7 @@ impl Vm {
                     });
                 }
                 if let Some(g) = Self::accessor(o, "get", name) {
-                    let f = Value::Func(Gc::new(Closure { func: g, caps: Box::new([]), props: Default::default() }));
-                    return self.call(&f, recv.clone(), vec![]);
+                    return self.call_fid(g, recv.clone(), &[]);
                 }
                 self.lookup_method(recv, name)
             }
@@ -1397,8 +1371,7 @@ impl Vm {
         match recv {
             Value::Obj(o) if o.lookup(&site.name).is_none() && Self::accessor(o, "set", &site.name).is_some() => {
                 let s = Self::accessor(o, "set", &site.name).unwrap();
-                let f = Value::Func(Gc::new(Closure { func: s, caps: Box::new([]), props: Default::default() }));
-                self.call(&f, recv.clone(), vec![val])?;
+                self.call_fid(s, recv.clone(), &[val])?;
                 Ok(())
             }
             Value::Obj(o) if matches!(o.get(&site.name), Some(Value::Accessor(_))) => {
@@ -1855,7 +1828,7 @@ impl Vm {
                                 let v = v.clone();
                                 self.frames[fi].pc = pc;
                                 let r = self.to_string_value(&v);
-                                                                tri!(r)
+                                tri!(r)
                             }
                             v => v.to_js_string(),
                         };
@@ -1937,17 +1910,7 @@ impl Vm {
                         let r = match &value!(o) {
                             Value::Obj(ob) => {
                                 let key = value!(k).to_js_string();
-                                ob.get_chain(&key.s).is_some()
-                                    || ob.class.as_ref().is_some_and(|c| {
-                                        let mut c = Some(c.clone());
-                                        while let Some(k) = c {
-                                            if k.methods.contains_key(&*key.s) {
-                                                return true;
-                                            }
-                                            c = k.parent.clone();
-                                        }
-                                        false
-                                    })
+                                ob.get_chain(&key.s).is_some() || ob.class.as_ref().is_some_and(|c| c.find_method(&key.s).is_some())
                             }
                             Value::Arr(a) => as_index(&value!(k)).is_some_and(|i| i < a.len()) || value!(k).to_display() == "length",
                             other => {
@@ -2013,7 +1976,7 @@ impl Vm {
                     Instruction::Call { site } => {
                         self.frames[fi].pc = pc;
                         let r = self.do_call(func, &func.call_sites[site as usize], sb, vb);
-                                                match r {
+                        match r {
                             Ok(true) => continue 'outer,
                             Ok(false) => {}
                             Err(e) => break e,
@@ -2272,8 +2235,6 @@ impl Vm {
 
                     Instruction::NewObject { output, shape } => {
                         let sh = self.prog.shapes[shape as usize].clone();
-                        let n = sh.keys.len();
-                        let _ = n;
                         value!(output) = Value::Obj(Object::blank(sh, None))
                     }
                     Instruction::SpreadIntoObject { object, source } => {
@@ -2341,14 +2302,14 @@ impl Vm {
                                 let recv = value!(object).clone();
                                 self.frames[fi].pc = pc;
                                 let r = self.read_accessor(Value::Accessor(a.clone()), &recv);
-                                                                tri!(r)
+                                tri!(r)
                             }
                             Some(x) => x,
                             None => {
                                 let recv = value!(object).clone();
                                 self.frames[fi].pc = pc;
                                 let r = self.get_prop_slow(&recv, site);
-                                                                tri!(r)
+                                tri!(r)
                             }
                         };
                         value!(output) = x
@@ -2376,13 +2337,11 @@ impl Vm {
                             let recv = value!(object).clone();
                             self.frames[fi].pc = pc;
                             let r = self.set_prop(&recv, site, x);
-                                                        tri!(r);
+                            tri!(r);
                         }
                     }
                     Instruction::NewInstance { output, class } => {
                         let c = self.prog.classes[class as usize].clone();
-                        let n = c.shape.keys.len();
-                        let _ = n;
                         value!(output) = Value::Obj(Object::blank(c.shape.clone(), Some(c)))
                     }
                     Instruction::LoadClass { output, class } => value!(output) = Value::Class(self.prog.classes[class as usize].clone()),
@@ -2413,7 +2372,7 @@ impl Vm {
                     | Instruction::NewArrayIn { .. } => {
                         self.frames[fi].pc = pc;
                         let r = self.exec_extended(fi, pc, sb, vb, stop);
-                                                match tri!(r) {
+                        match tri!(r) {
                             Flow::Next => {}
                             Flow::Jump(to) => pc = to,
                             Flow::Switch => continue 'outer,

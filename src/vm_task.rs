@@ -12,7 +12,7 @@
 
 use std::collections::VecDeque;
 use std::rc::Rc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use super::*;
 use crate::runtime::task::*;
@@ -297,7 +297,7 @@ impl Vm {
             Resume::Next => Ok((Value::Undef, true)),
             Resume::Return => Ok((val, true)),
             Resume::Throw => {
-                let _ = vm;
+                let _ = vm; // (the closure's signature)
                 Err(val)
             }
         };
@@ -889,7 +889,6 @@ impl Vm {
             self.call_hosted(&t.f, Value::Undef, t.args)?;
             self.run_microtasks()?;
         }
-        let _ = Instant::now();
         Ok(())
     }
 }
@@ -1268,8 +1267,7 @@ impl Vm {
         match f {
             Value::Class(c) => {
                 let o = Value::Obj(Object::blank(c.shape.clone(), Some(c.clone())));
-                let ctor = Value::Func(Gc::new(Closure { func: c.ctor, caps: Box::new([]), props: Default::default() }));
-                self.call(&ctor, o.clone(), args)?;
+                self.call_fid(c.ctor, o.clone(), &args)?;
                 Ok(o)
             }
             Value::Func(cl) => {

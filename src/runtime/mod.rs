@@ -554,6 +554,17 @@ pub struct ClassRt {
 }
 
 impl ClassRt {
+    /// The method `name` of this class or the nearest ancestor that has it.
+    pub fn find_method(&self, name: &str) -> Option<u32> {
+        let mut c = Some(self);
+        while let Some(k) = c {
+            if let Some(f) = k.methods.get(name) {
+                return Some(*f);
+            }
+            c = k.parent.as_deref();
+        }
+        None
+    }
     pub fn is_subclass_of(&self, id: u32) -> bool {
         let mut c = Some(self);
         while let Some(k) = c {

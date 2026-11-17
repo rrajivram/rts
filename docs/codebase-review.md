@@ -603,3 +603,9 @@ Not part of the brief, listed because they surfaced.
   compilation included, within +2.4% of eager compilation.
   `async.ts`'s timer margins were widened: compile pauses mid-run could
   flip millisecond races on a loaded machine.
+- S2, S3, S7: one method lookup (`ClassRt::find_method`, and one cached
+  `class_method` for the interpreter's by-name call paths, replacing five
+  copies of the class-chain walk); functions are called by id without
+  allocating a throwaway closure (`Vm::call_fid`/`call_function`, used by
+  getters, setters, constructors and compiled code's calls); leftover
+  placeholders, a dead block and a misplaced doc comment removed. Havlak −5%.
