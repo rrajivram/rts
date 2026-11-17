@@ -326,14 +326,18 @@ the next experiments (see [Next steps](#next-steps)).
 ## Native code (in progress)
 
 Functions are compiled to machine code at start-up with
-[Cranelift](https://cranelift.dev) (`src/jit.rs`) when their parameters,
-locals and result are numbers, booleans, class instances or arrays (or
-null/undefined), and their bodies use arithmetic, comparisons, control flow,
-`Math.*`, field and element access, `new`, array literals and `push`,
-`throw new C('…')`, and calls to other compiled functions (methods included,
-when the class hierarchy shows a single target). The interpreter calls
-compiled code directly; `--no-jit` turns it off, and `RTS_JIT_DEBUG=1` /
-`RTS_JIT_WHY=<function>|*` say what compiled and why not.
+[Cranelift](https://cranelift.dev) (`src/jit.rs`). Numbers, booleans and
+class instances or arrays are held unboxed; any other value (`T`, strings,
+unions, `any`) as its two words (tag, payload). Bodies may use arithmetic,
+comparisons, control flow, `Math.*`, field and element access, properties by
+name, strings, global variables, closures and captured variables (in cells,
+as the interpreter keeps them), `new`, array literals and `push`,
+`throw new C('…')`, and calls: direct to other compiled functions (methods
+too, when the class hierarchy shows a single target), otherwise through the
+interpreter, which enters compiled callees (closures included) directly.
+`--no-jit` turns it off, and `RTS_JIT_DEBUG=1` / `RTS_JIT_WHY=<function>|*`
+say what compiled and why not. Not compiled yet: `try`, `switch`, `for-of`,
+`throw` of a computed value, static methods, generators and async functions.
 
 Typed suite geometric mean: 0.494 s → 0.237 s (`node --jitless`: 0.452 s).
 List runs 8× faster than in the interpreter, Towers 8.6×, Queens 9.9×,
@@ -354,9 +358,8 @@ is only 3% faster on the suite; and compiled code doesn't use scope arenas
 yet, which shows: on a list-building loop, arenas cut peak heap 9× (the nodes
 die at scope exit instead of waiting for the cycle collector).
 
-Next: generic values (`T` in `Vector<T>`) and calls from compiled code back
-into the interpreter (closures, `forEach`), then the memory-mode comparison on
-compiled code (arenas in compiled code; stack maps so the tracing GC can
+Next: the remaining statements (`switch`, `for-of`, `throw` of any value,
+`try`), then the memory-mode comparison on compiled code (arenas in compiled code; stack maps so the tracing GC can
 collect while compiled code runs), then generators, async functions and
 exceptions. LLVM is planned as a later, more optimizing tier.
 

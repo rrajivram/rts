@@ -1,11 +1,11 @@
 //! Native compilation with Cranelift.
 //!
 //! Stage 1: numeric functions. Stage 2: class instances, arrays, then values
-//! of any type and calls back into the interpreter. A function is compiled
-//! when it is neither async nor a generator, captures nothing, has no
-//! captured locals, and its body uses only what this file lowers:
-//! arithmetic, comparisons, control flow, `Math.*`, fields, array elements,
-//! properties by name, global variables, string literals, `new`, and calls.
+//! of any type, calls back into the interpreter, and closures. A function is
+//! compiled when it is neither async nor a generator and its body uses only
+//! what this file lowers: arithmetic, comparisons, control flow, `Math.*`,
+//! fields, array elements, properties by name, global and captured
+//! variables, string literals, closures, `new`, and calls.
 //! Calls to other compiled functions are direct (methods too, when the class
 //! hierarchy shows a single target); any other call (a function value, a
 //! method by name, a built-in, a virtual method, a function that isn't
@@ -21,6 +21,15 @@
 //! Conversions between these are codegen's `coerce`: boxing is free,
 //! unboxing checks the tag. A field is read straight from the object's
 //! inline slots (`Object::field_offset`), checking the slot's tag.
+//!
+//! **Closures.** A captured variable lives in a cell (`Value::Cell`'s box),
+//! as in the interpreter: the declaring function holds the cell's address
+//! (counted) in a register and makes a new cell where codegen does (block
+//! entry, a first `Init`, each iteration for per-iteration loop variables).
+//! A closure's code takes its cells (`Closure::caps`) as a hidden first
+//! argument. Reads and writes go through the cell like a global's. A read
+//! of a global or captured variable is never a safe borrow (any call may
+//! change it), and writing one makes a function impure.
 //!
 //! **Reference counts.** Compiled code maintains counts itself, inline (for a
 //! value, inline when it is an object or array, else through a helper):
@@ -72,7 +81,7 @@ use crate::bytecode::Program;
 use crate::hir::*;
 use crate::runtime::heap::{self, Gc, Header};
 use crate::runtime::natives::{self, Native};
-use crate::runtime::{ClassRt, Object, Value};
+use crate::runtime::{ClassRt, Closure, Object, Value};
 use crate::types::{Kind, Type};
 
 /// Recursion limit of compiled code (as the interpreter's).
@@ -228,7 +237,9 @@ impl JV {
 #[derive(Debug)]
 pub struct JitFn {
     pub entry: Entry,
-    /// Takes `this` as its first argument.
+    /// Takes its closure's cells (`Closure::caps`) as its first argument.
+    pub env: bool,
+    /// Takes `this` as its first argument (after the cells).
     pub this: bool,
     pub params: Vec<JV>,
     pub ret: JV,
@@ -543,6 +554,24 @@ fn give_result(r: Result<Value, Value>) -> u64 {
 
 /// Take a reference to a value given as words (one of a kind compiled
 /// code doesn't count inline).
+/// A new cell holding undefined (its box address, counted).
+extern "C" fn h_new_cell() -> u64 {
+    Gc::into_header(Gc::new(RefCell::new(Value::Undef))).as_ptr() as u64
+}
+
+/// A closure of function `func` capturing the `n` cells at `cells`
+/// (borrowed box addresses): its box address, counted.
+extern "C" fn h_closure(func: u32, cells: *const u64, n: u32) -> u64 {
+    let caps: Box<[Gc<RefCell<Value>>]> = (0..n as usize)
+        .map(|i| {
+            let h = unsafe { NonNull::new_unchecked(*cells.add(i) as *mut Header) };
+            let c = std::mem::ManuallyDrop::new(unsafe { Gc::<RefCell<Value>>::from_header_owned(h) });
+            (*c).clone()
+        })
+        .collect();
+    Gc::into_header(Gc::new(Closure { func, caps, props: Default::default() })).as_ptr() as u64
+}
+
 extern "C" fn h_inc_val(tag: u64, payload: u64) {
     std::mem::forget((*peek_value(tag, payload)).clone());
 }
@@ -810,6 +839,37 @@ impl Elig<'_> {
         vi.owner == Some(f) && !vi.captured && jk(&vi.ty).is_some()
     }
 
+    /// `f`'s own variable that a closure captured: it lives in a cell.
+    fn cell(&self, f: FuncId, v: VarId) -> bool {
+        let vi = &self.hir.vars[v as usize];
+        vi.owner == Some(f) && vi.captured && jk(&vi.ty).is_some()
+    }
+
+    /// An enclosing function's variable `f` uses (through its closure's cells).
+    fn free(&self, f: FuncId, v: VarId) -> bool {
+        self.hir.funcs[f as usize].free.contains(&v) && jk(&self.hir.vars[v as usize].ty).is_some()
+    }
+
+    /// A variable compiled code can read and write, wherever it lives.
+    fn var_ok(&self, f: FuncId, v: VarId) -> bool {
+        self.local(f, v) || self.cell(f, v) || self.free(f, v) || self.global(v)
+    }
+
+    /// A variable `f` declares (in a register or a cell).
+    fn own_var(&self, f: FuncId, v: VarId) -> bool {
+        self.local(f, v) || self.cell(f, v)
+    }
+
+    /// `f` can make a closure of `g`: each cell `g` captures is one of
+    /// `f`'s or one `f` captured itself.
+    fn closure_ok(&self, f: FuncId, g: FuncId) -> bool {
+        let hf = &self.hir.funcs[f as usize];
+        self.hir.funcs[g as usize].free.iter().all(|v| {
+            let vi = &self.hir.vars[*v as usize];
+            (vi.owner == Some(f) && vi.captured) || hf.free.contains(v)
+        })
+    }
+
     /// A global variable compiled code can read and write.
     fn global(&self, v: VarId) -> bool {
         let vi = &self.hir.vars[v as usize];
@@ -881,7 +941,9 @@ impl Elig<'_> {
 
     fn pure_expr(&self, e: &HExpr) -> bool {
         let top = match &e.kind {
-            HK::Assign(p, _) | HK::Compound(p, _, _) | HK::Update { place: p, .. } => matches!(**p, Place::Var(v) if self.hir.vars[v as usize].owner.is_some()),
+            HK::Assign(p, _) | HK::Compound(p, _, _) | HK::Update { place: p, .. } => {
+                matches!(**p, Place::Var(v) if self.hir.vars[v as usize].owner.is_some() && !self.hir.vars[v as usize].captured)
+            }
             HK::New { .. } | HK::Array(_) | HK::NewBuiltin(..) | HK::Unary(HUnary::ToStr, _) | HK::Binary(HBin::DynAdd, ..) => false,
             HK::Read(p) => !matches!(**p, Place::Prop { .. }),
             HK::Call(c) => self.pure_call(c),
@@ -899,7 +961,7 @@ impl Elig<'_> {
         if !self.pure.contains(&f) {
             return FxHashSet::default();
         }
-        let mut set: FxHashSet<VarId> = vars.iter().copied().filter(|v| self.vjk(*v) == Some(JK::Ref)).collect();
+        let mut set: FxHashSet<VarId> = vars.iter().copied().filter(|v| self.vjk(*v) == Some(JK::Ref) && !self.hir.vars[*v as usize].captured).collect();
         loop {
             let mut assigns: Vec<(VarId, &HExpr)> = Vec::new();
             collect_ref_assigns(&hf.body, &mut assigns);
@@ -954,23 +1016,40 @@ impl Elig<'_> {
         {
             return false;
         }
-        if hf.is_async || hf.is_generator || !hf.free.is_empty() || f == self.hir.main {
+        let reject = |msg: String| {
+            if why_wanted(&hf.name) && f != self.hir.main {
+                WHY_FN.with(|w| *w.borrow_mut() = hf.name.to_string());
+                why_say(msg);
+            }
+            false
+        };
+        if f == self.hir.main {
             return false;
+        }
+        if hf.is_async || hf.is_generator {
+            return reject("async or generator".into());
         }
         if let Some(t) = hf.this_var
-            && !(self.local(f, t) && self.vjk(t) == Some(JK::Ref))
+            && !(self.own_var(f, t) && self.vjk(t) == Some(JK::Ref))
         {
-            return false;
+            return reject(format!("`this` is {:?}", self.hir.vars[t as usize].ty));
         }
         for p in &hf.params {
-            if p.default.is_some() || p.rest || !self.local(f, p.var) || self.vjk(p.var).map(JK::kind) != Some(p.arrival) {
-                return false;
+            if p.default.is_some() || p.rest || !self.own_var(f, p.var) || self.vjk(p.var).map(JK::kind) != Some(p.arrival) {
+                let vi = &self.hir.vars[p.var as usize];
+                return reject(format!(
+                    "parameter {} (default {}, rest {}, captured {})",
+                    vi.name,
+                    p.default.is_some(),
+                    p.rest,
+                    vi.captured
+                ));
             }
         }
         // Falling off the end would return undefined, which the interpreter
         // reports as a type error for a number or boolean result.
         if !rk.counted() && !always_returns(&hf.body) {
-            return false;
+            return reject("may fall off the end".into());
         }
         let ok = hf.body.iter().all(|s| self.stmt(f, s));
         if !ok && why_wanted(&hf.name) {
@@ -988,13 +1067,17 @@ impl Elig<'_> {
                 continue;
             }
             match s {
+                HStmt::Block(_, vars) if !vars.iter().all(|v| self.own_var(f, *v)) => {
+                    let names: Vec<_> = vars.iter().filter(|v| !self.own_var(f, **v)).map(|v| self.hir.vars[*v as usize].name.to_string()).collect();
+                    why_say(format!("block variables {names:?}"))
+                }
                 HStmt::Block(b, _) => self.why(f, b),
                 HStmt::If(c, t, e) if self.expr(f, c).is_some() => {
                     self.why(f, t);
                     self.why(f, e);
                 }
                 HStmt::Loop { body, fresh, test, update, .. } => {
-                    if !fresh.iter().all(|v| self.local(f, *v)) {
+                    if !fresh.iter().all(|v| self.own_var(f, *v)) {
                         why_say(format!("loop with per-iteration variables {fresh:?}"));
                     } else if let Some(t) = test.as_ref().filter(|t| self.expr(f, t).is_none()) {
                         self.why_expr(f, t);
@@ -1024,14 +1107,14 @@ impl Elig<'_> {
     fn stmt(&self, f: FuncId, s: &HStmt) -> bool {
         match s {
             HStmt::Expr(e) => self.expr(f, e).is_some(),
-            HStmt::Init(v, e) => self.local(f, *v) && e.as_ref().is_none_or(|e| self.fits(f, e, self.vjk(*v).unwrap())),
-            HStmt::Block(ss, vars) => vars.iter().all(|v| self.local(f, *v)) && ss.iter().all(|s| self.stmt(f, s)),
+            HStmt::Init(v, e) => self.own_var(f, *v) && e.as_ref().is_none_or(|e| self.fits(f, e, self.vjk(*v).unwrap())),
+            HStmt::MakeClosure(v, g) => self.own_var(f, *v) && self.vjk(*v) == Some(JK::Val) && self.closure_ok(f, *g),
+            HStmt::Block(ss, vars) => vars.iter().all(|v| self.own_var(f, *v)) && ss.iter().all(|s| self.stmt(f, s)),
             HStmt::If(c, t, e) => self.cond(f, c) && t.iter().chain(e.iter()).all(|s| self.stmt(f, s)),
             HStmt::Throw(e) => throw_site(e).is_some(),
-            // Per-iteration copies of `let` variables only matter to closures,
-            // and compiled functions' variables are never captured.
+            // Captured per-iteration variables get a new cell each iteration.
             HStmt::Loop { test, body, update, fresh, .. } => {
-                fresh.iter().all(|v| self.local(f, *v))
+                fresh.iter().all(|v| self.own_var(f, *v))
                     && test.as_ref().is_none_or(|t| self.cond(f, t))
                     && update.as_ref().is_none_or(|u| self.expr(f, u).is_some())
                     && body.iter().all(|s| self.stmt(f, s))
@@ -1054,9 +1137,14 @@ impl Elig<'_> {
             HK::Bool(_) => k == JK::Bool,
             HK::Null | HK::Undefined => k == JK::Ref,
             HK::Str(_) => k == JK::Val,
+            HK::Closure(g) => k == JK::Val && self.closure_ok(f, *g),
             HK::Read(p) => match &**p {
                 Place::ArrLen { obj, opt: false } => k == JK::Num && self.is_array(f, obj),
                 Place::StrLen { obj, opt: false } => k == JK::Num && self.fits(f, obj, JK::Val),
+                // Narrowing a global or captured variable is unsound (a call
+                // may change it), and the interpreter doesn't check it: a
+                // value narrowed to an object or null may be anything.
+                Place::Var(v) if k == JK::Ref && self.vjk(*v) == Some(JK::Val) && !self.local(f, *v) => false,
                 p => self.place(f, p, k),
             },
             HK::Binary(HBin::Num(_), a, b) | HK::Binary(HBin::NumCmp(_), a, b) => is(a, JK::Num) && is(b, JK::Num),
@@ -1088,7 +1176,8 @@ impl Elig<'_> {
     /// `new C(…)` calling the compiled constructor directly.
     fn new_direct(&self, f: FuncId, class: u32, args: &[HElem]) -> bool {
         let ctor = self.hir.classes[class as usize].ctor;
-        self.set.contains(&ctor) && self.hir.funcs[ctor as usize].this_var.is_some() && self.args(f, ctor, args)
+        let hc = &self.hir.funcs[ctor as usize];
+        self.set.contains(&ctor) && hc.this_var.is_some() && hc.free.is_empty() && self.args(f, ctor, args)
     }
 
     /// Can compiled code evaluate `x` and convert it to a `want`?
@@ -1114,7 +1203,7 @@ impl Elig<'_> {
     /// value, so reads check its tag; a variable's value is converted.
     fn place(&self, f: FuncId, p: &Place, k: JK) -> bool {
         match p {
-            Place::Var(v) => (self.local(f, *v) || self.global(*v)) && coercible(self.vjk(*v).unwrap(), k),
+            Place::Var(v) => self.var_ok(f, *v) && coercible(self.vjk(*v).unwrap(), k),
             Place::Field { obj, opt: false, .. } => self.expr(f, obj) == Some(JK::Ref) && jv(&obj.ty) == Some(JV::Obj),
             Place::Index { obj, index, opt: false } => self.is_array(f, obj) && self.expr(f, index) == Some(JK::Num),
             Place::Prop { obj, opt: false, .. } => self.fits(f, obj, JK::Val),
@@ -1125,7 +1214,7 @@ impl Elig<'_> {
     /// A place holding a number, for `+=` and `++`.
     fn num_place(&self, f: FuncId, p: &Place) -> bool {
         match p {
-            Place::Var(v) => (self.local(f, *v) || self.global(*v)) && self.vjk(*v) == Some(JK::Num),
+            Place::Var(v) => self.var_ok(f, *v) && self.vjk(*v) == Some(JK::Num),
             Place::Field { .. } | Place::Index { .. } => self.place(f, p, JK::Num),
             _ => false,
         }
@@ -1164,7 +1253,7 @@ impl Elig<'_> {
         }?;
         let hg = &self.hir.funcs[g as usize];
         let this_ok = c.this.is_none() || hg.this_var.is_some();
-        (self.set.contains(&g) && this_ok && hg.params.len() == c.args.len()).then_some(g)
+        (self.set.contains(&g) && this_ok && hg.free.is_empty() && hg.params.len() == c.args.len()).then_some(g)
     }
 
     /// `arr.push(x)` compiled inline.
@@ -1201,7 +1290,7 @@ impl Elig<'_> {
             Callee::Direct { func, closure } => {
                 let free = !self.hir.funcs[*func as usize].free.is_empty();
                 let closure_ok = match closure {
-                    Some(v) if free => self.local(f, *v),
+                    Some(v) if free => self.var_ok(f, *v),
                     _ => !free,
                 };
                 closure_ok && this_ok && self.val_args(f, &c.args)
@@ -1362,7 +1451,7 @@ fn safe_borrow(x: &HExpr, set: &FxHashSet<VarId>) -> bool {
 /// callee may change a global), or a constant.
 fn is_var_read(hir: &HProgram, e: &HExpr) -> bool {
     match &e.kind {
-        HK::Read(p) => matches!(**p, Place::Var(v) if hir.vars[v as usize].owner.is_some()),
+        HK::Read(p) => matches!(**p, Place::Var(v) if hir.vars[v as usize].owner.is_some() && !hir.vars[v as usize].captured),
         HK::Cast(x) => is_var_read(hir, x),
         HK::Null | HK::Undefined | HK::Str(_) => true,
         _ => false,
@@ -1442,6 +1531,8 @@ struct Helpers {
     get_prop: FuncRef,
     set_prop: FuncRef,
     op: FuncRef,
+    new_cell: FuncRef,
+    closure: FuncRef,
 }
 
 /// Layout facts compiled code relies on.
@@ -1452,8 +1543,11 @@ struct Layout {
     tag_num: i64,
     tag_obj: i64,
     tag_arr: i64,
+    tag_func: i64,
     /// Tags from here on (`BigInt`, …) may own a box.
     tag_first_gc: i64,
+    /// Where a cell's value is, from the start of its box.
+    cell_value: i32,
     arr: Option<ArrLayout>,
 }
 
@@ -1467,7 +1561,12 @@ impl Layout {
             tag_num: t(Value::Num(0.0)),
             tag_obj: t(Value::Obj(Object::new(crate::runtime::Shape::new(vec![]), vec![], None))),
             tag_arr: t(Value::Arr(crate::runtime::Array::new_num(vec![]))),
+            tag_func: t(Value::Func(Gc::new(Closure { func: 0, caps: Box::new([]), props: Default::default() }))),
             tag_first_gc: t(Value::BigInt(Gc::new(0))),
+            cell_value: {
+                let c = Gc::new(RefCell::new(Value::Undef));
+                (c.as_ptr() as usize - c.header_ptr().as_ptr() as usize) as i32
+            },
             arr: if std::env::var_os("RTS_JIT_NO_INLINE_ARRAYS").is_some() { None } else { ArrLayout::probe() },
         };
         assert!(l.tag_undef < l.tag_first_gc && l.tag_null < l.tag_first_gc && l.tag_bool < l.tag_first_gc && l.tag_num < l.tag_first_gc);
@@ -1547,6 +1646,13 @@ struct Lower<'a, 'b> {
     vars: FxHashMap<VarId, Variable>,
     /// A value variable's tag word.
     tvars: FxHashMap<VarId, Variable>,
+    /// Captured variables this function declares: each holds its cell (a
+    /// counted box address, or 1 before the cell is made).
+    cells: FxHashMap<VarId, Variable>,
+    /// Cells declared by a block this code has entered (see `HStmt::Init`).
+    declared: FxHashSet<VarId>,
+    /// The cells this function's closure captured (its `free` variables, in order).
+    env: Option<CV>,
     /// Counted variables holding a counted reference (locals, and assigned parameters).
     owned: Vec<VarId>,
     /// Reference variables that hold borrowed values (see `Elig::borrowed_vars`).
@@ -1674,6 +1780,80 @@ impl Lower<'_, '_> {
 
     fn is_global(&self, v: VarId) -> bool {
         self.hir.vars[v as usize].owner.is_none()
+    }
+
+    /// A variable in memory (a global, or captured: in a cell), not a register.
+    fn in_mem(&self, v: VarId) -> bool {
+        let vi = &self.hir.vars[v as usize];
+        vi.owner.is_none() || vi.captured
+    }
+
+    /// The address of a captured variable's cell (borrowed).
+    fn cell_ptr(&mut self, v: VarId) -> CV {
+        if let Some(x) = self.cells.get(&v).copied() {
+            return self.b.use_var(x);
+        }
+        let i = self.hir.funcs[self.fid as usize].free.iter().position(|x| *x == v).expect("a captured variable");
+        let env = self.env.expect("a closure's cells");
+        self.b.ins().load(types::I64, mf(), env, (i * 8) as i32)
+    }
+
+    /// A variable's value (borrowed: a global's or cell's may change in any call).
+    fn read_var(&mut self, v: VarId) -> RV {
+        if self.is_global(v) {
+            self.global_get(v)
+        } else if self.in_mem(v) {
+            let c = self.cell_ptr(v);
+            let off = self.lay.cell_value;
+            self.load_slot(c, off, var_jv(self.hir, v), [ERR_UNBOX_NUM, ERR_UNBOX_BOOL, ERR_UNBOX_REF])
+        } else {
+            self.use_var(v)
+        }
+    }
+
+    /// Store into a global or captured variable (`r` owned, if counted), releasing the old value.
+    fn mem_set(&mut self, v: VarId, r: RV) {
+        if self.is_global(v) {
+            self.global_set(v, r);
+        } else {
+            let c = self.cell_ptr(v);
+            let off = self.lay.cell_value;
+            self.store_slot(c, off, var_jv(self.hir, v), r);
+        }
+    }
+
+    /// Give captured variable `v` (one this function declares) a new cell,
+    /// holding undefined, releasing the old one.
+    fn new_cell(&mut self, v: VarId) {
+        let x = self.cells[&v];
+        let old = self.b.use_var(x);
+        let call = self.b.ins().call(self.h.new_cell, &[]);
+        let c = self.b.inst_results(call)[0];
+        self.b.def_var(x, c);
+        self.dec(old);
+    }
+
+    /// A new closure of `g` (owned), capturing its cells from this function.
+    fn make_closure(&mut self, g: FuncId) -> RV {
+        use cranelift_codegen::ir::{StackSlotData, StackSlotKind};
+        let free = self.hir.funcs[g as usize].free.clone();
+        let n = free.len();
+        let cells = if n > 0 {
+            let slot = self.b.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, (8 * n) as u32, 3));
+            self.b.ins().stack_addr(types::I64, slot, 0)
+        } else {
+            self.b.ins().iconst(types::I64, 0)
+        };
+        for (i, v) in free.iter().enumerate() {
+            let c = self.cell_ptr(*v);
+            self.b.ins().store(mf(), c, cells, (8 * i) as i32);
+        }
+        let gi = self.b.ins().iconst(types::I32, g as i64);
+        let ni = self.b.ins().iconst(types::I32, n as i64);
+        let call = self.b.ins().call(self.h.closure, &[gi, cells, ni]);
+        let p = self.b.inst_results(call)[0];
+        let t = self.b.ins().iconst(types::I64, self.lay.tag_func);
+        self.fresh(RV::val(t, p))
     }
 
     fn def_var(&mut self, v: VarId, r: RV) {
@@ -1896,13 +2076,19 @@ impl Lower<'_, '_> {
         self.b.ins().jump(self.unwind, &[]);
     }
 
-    /// Release every owned variable (except `keep`).
+    /// Release every owned variable (except `keep`) and cell.
     fn release_vars(&mut self, keep: Option<VarId>) {
         for v in self.owned.clone() {
             if Some(v) != keep {
                 let r = self.use_var(v);
                 self.dec_rv(r);
             }
+        }
+        let mut cells: Vec<(VarId, Variable)> = self.cells.iter().map(|(v, x)| (*v, *x)).collect();
+        cells.sort_by_key(|c| c.0);
+        for (_, x) in cells {
+            let c = self.b.use_var(x);
+            self.dec(c);
         }
     }
 
@@ -1962,6 +2148,34 @@ impl Lower<'_, '_> {
     fn stmt(&mut self, s: &HStmt) {
         match s {
             HStmt::Expr(e) => self.discard(e),
+            HStmt::Init(v, e) if self.cells.contains_key(v) => {
+                // A cell unless the enclosing block made one (as codegen does).
+                if !self.declared.contains(v) {
+                    self.new_cell(*v);
+                }
+                let vj = var_jv(self.hir, *v);
+                let val = match e {
+                    Some(e) => {
+                        let r = self.value_as(e, vj);
+                        if vj.jk().counted() { self.own(r) } else { r }
+                    }
+                    None => self.zero_rv(vj.jk()),
+                };
+                self.mem_set(*v, val);
+            }
+            HStmt::MakeClosure(v, g) => {
+                let r = self.make_closure(*g);
+                if self.cells.contains_key(v) {
+                    if !self.declared.contains(v) {
+                        self.new_cell(*v);
+                    }
+                    self.unpend(r);
+                    self.mem_set(*v, RV { owned: true, ..r });
+                } else {
+                    self.unpend(r);
+                    self.set_var(*v, RV { owned: true, ..r });
+                }
+            }
             HStmt::Init(v, e) => {
                 let vj = var_jv(self.hir, *v);
                 let val = match e {
@@ -1980,7 +2194,15 @@ impl Lower<'_, '_> {
                 };
                 self.set_var(*v, val);
             }
-            HStmt::Block(ss, _) => self.stmts(ss),
+            HStmt::Block(ss, vars) => {
+                for v in vars {
+                    if self.cells.contains_key(v) {
+                        self.new_cell(*v);
+                        self.declared.insert(*v);
+                    }
+                }
+                self.stmts(ss);
+            }
             HStmt::If(c, t, e) => {
                 let (tb, eb, done) = (self.b.create_block(), self.b.create_block(), self.b.create_block());
                 let cv = self.truthy(c);
@@ -1996,7 +2218,7 @@ impl Lower<'_, '_> {
                 self.b.seal_block(done);
                 self.b.switch_to_block(done);
             }
-            HStmt::Loop { label, test, body, update, test_after, .. } => {
+            HStmt::Loop { label, test, body, update, test_after, fresh } => {
                 let (tb, bb, ub, xb) = (self.b.create_block(), self.b.create_block(), self.b.create_block(), self.b.create_block());
                 self.b.ins().jump(if *test_after { bb } else { tb }, &[]);
                 self.b.switch_to_block(tb);
@@ -2016,6 +2238,19 @@ impl Lower<'_, '_> {
                 self.b.ins().jump(ub, &[]);
                 self.b.switch_to_block(ub);
                 self.b.seal_block(ub);
+                // Each iteration's closures keep their own copy of a captured loop variable.
+                for v in fresh {
+                    if let Some(x) = self.cells.get(v).copied() {
+                        let old = self.b.use_var(x);
+                        let r = self.load_slot(old, self.lay.cell_value, JV::Val, [0; 3]);
+                        self.inc_rv(r);
+                        let call = self.b.ins().call(self.h.new_cell, &[]);
+                        let c = self.b.inst_results(call)[0];
+                        self.b.def_var(x, c);
+                        self.store_slot(c, self.lay.cell_value, JV::Val, r);
+                        self.dec(old);
+                    }
+                }
                 if let Some(u) = update {
                     self.discard(u);
                 }
@@ -2807,11 +3042,11 @@ impl Lower<'_, '_> {
             HK::Cond(c, a, b) => self.cond_expr(c, a, b, want).v,
             HK::Assign(p, x) => self.assign(p, x, want).v,
             HK::Compound(p, HBin::Num(op), x) => match &**p {
-                Place::Var(v) if self.is_global(*v) => {
-                    let cur = self.global_get(*v).v;
+                Place::Var(v) if self.in_mem(*v) => {
+                    let cur = self.read_var(*v).v;
                     let y = self.expr(x);
                     let r = self.num_op(*op, cur, y);
-                    self.global_set(*v, RV::new(r));
+                    self.mem_set(*v, RV::new(r));
                     r
                 }
                 Place::Var(v) => {
@@ -2847,10 +3082,10 @@ impl Lower<'_, '_> {
                 let one = self.b.ins().f64const(1.0);
                 let step = |s: &mut Self, cur: CV| if *inc { s.b.ins().fadd(cur, one) } else { s.b.ins().fsub(cur, one) };
                 match &**place {
-                    Place::Var(v) if self.is_global(*v) => {
-                        let cur = self.global_get(*v).v;
+                    Place::Var(v) if self.in_mem(*v) => {
+                        let cur = self.read_var(*v).v;
                         let r = step(self, cur);
-                        self.global_set(*v, RV::new(r));
+                        self.mem_set(*v, RV::new(r));
                         if *prefix { r } else { cur }
                     }
                     Place::Var(v) => {
@@ -3041,6 +3276,10 @@ impl Lower<'_, '_> {
                 RV::val(t, p)
             }
             HK::Read(p) => self.read(p, &e.ty),
+            HK::Closure(g) => {
+                let r = self.make_closure(*g);
+                self.coerce(r, JV::Val, want)
+            }
             HK::Assign(p, x) => self.assign(p, x, want),
             HK::Cast(x) => self.value_as(x, want),
             HK::Seq(xs) => {
@@ -3132,7 +3371,7 @@ impl Lower<'_, '_> {
         let counted = want.jk().counted();
         match p {
             Place::Var(v) => {
-                let r = if self.is_global(*v) { self.global_get(*v) } else { self.use_var(*v) };
+                let r = self.read_var(*v);
                 self.coerce(r, var_jv(self.hir, *v), want)
             }
             Place::StrLen { obj, .. } => {
@@ -3206,8 +3445,8 @@ impl Lower<'_, '_> {
                 let vj = var_jv(self.hir, *v);
                 let r = self.value_as(x, vj);
                 let r = if vj.jk().counted() { self.own(r) } else { r };
-                if self.is_global(*v) {
-                    self.global_set(*v, r);
+                if self.in_mem(*v) {
+                    self.mem_set(*v, r);
                 } else {
                     self.set_var(*v, r);
                 }
@@ -3366,9 +3605,9 @@ impl Lower<'_, '_> {
         let (kind, a, b) = match &c.callee {
             Callee::Direct { func, closure } if !self.hir.funcs[*func as usize].free.is_empty() => {
                 let v = closure.unwrap();
-                let r = self.use_var(v);
+                let r = self.read_var(v);
                 let r = self.coerce(r, var_jv(self.hir, v), JV::Val);
-                let r = if c.args.iter().any(|a| matches!(a, HElem::Expr(y) if self.el.effects(y, true))) { self.hold(r) } else { r };
+                let r = if self.in_mem(v) || c.args.iter().any(|a| matches!(a, HElem::Expr(y) if self.el.effects(y, true))) { self.hold(r) } else { r };
                 held.push(r);
                 (iconst32(self, CALL_VALUE), r.t.unwrap(), Some(r.v))
             }
@@ -3501,7 +3740,7 @@ pub fn compile(hir: &HProgram, prog: &mut Program) -> usize {
         return 0;
     };
     let mut jb = JITBuilder::with_isa(isa, cranelift_module::default_libcall_names());
-    let helpers: [(&str, *const u8); 20] = [
+    let helpers: [(&str, *const u8); 22] = [
         ("rts_mod", h_mod as *const u8),
         ("rts_pow", h_pow as *const u8),
         ("rts_int32", h_int32 as *const u8),
@@ -3522,6 +3761,8 @@ pub fn compile(hir: &HProgram, prog: &mut Program) -> usize {
         ("rts_get_prop", h_get_prop as *const u8),
         ("rts_set_prop", h_set_prop as *const u8),
         ("rts_op", h_op as *const u8),
+        ("rts_new_cell", h_new_cell as *const u8),
+        ("rts_closure", h_closure as *const u8),
     ];
     for (n, p) in helpers {
         jb.symbol(n, p);
@@ -3564,6 +3805,8 @@ pub fn compile(hir: &HProgram, prog: &mut Program) -> usize {
         { let s = sig(&m, &[i64t, i64t, i64t], Some(i64t)); decl(&mut m, "rts_get_prop", s) },
         { let s = sig(&m, &[i64t, i64t, i64t, i64t, i64t], None); decl(&mut m, "rts_set_prop", s) },
         { let s = sig(&m, &[i32t, i64t, i64t, i64t, i64t], Some(i64t)); decl(&mut m, "rts_op", s) },
+        { let s = sig(&m, &[], Some(i64t)); decl(&mut m, "rts_new_cell", s) },
+        { let s = sig(&m, &[i32t, i64t, i32t], Some(i64t)); decl(&mut m, "rts_closure", s) },
     ];
 
     // Declare every compiled function (typed) and its entry trampoline.
@@ -3574,6 +3817,10 @@ pub fn compile(hir: &HProgram, prog: &mut Program) -> usize {
     for &f in &order {
         let hf = &hir.funcs[f as usize];
         let mut params = vec![ptr];
+        // A closure's cells come first.
+        if !hf.free.is_empty() {
+            params.push(ptr);
+        }
         params.extend(param_tys(&el, hf));
         let s = sig_n(&m, &params, &cl_tys(ret_jk(hf).unwrap()));
         let id = m.declare_function(&format!("f{f}"), Linkage::Local, &s).unwrap();
@@ -3642,6 +3889,8 @@ pub fn compile(hir: &HProgram, prog: &mut Program) -> usize {
                 get_prop: hr[17],
                 set_prop: hr[18],
                 op: hr[19],
+                new_cell: hr[20],
+                closure: hr[21],
             };
             let entry = b.create_block();
             b.append_block_params_for_function_params(entry);
@@ -3680,6 +3929,9 @@ pub fn compile(hir: &HProgram, prog: &mut Program) -> usize {
                 b,
                 vars: FxHashMap::default(),
                 tvars: FxHashMap::default(),
+                cells: FxHashMap::default(),
+                declared: FxHashSet::default(),
+                env: (!hf.free.is_empty()).then(|| params[1]),
                 owned: vec![],
                 borrowed: FxHashSet::default(),
                 ctx: c,
@@ -3700,7 +3952,16 @@ pub fn compile(hir: &HProgram, prog: &mut Program) -> usize {
             let pvars: Vec<VarId> = hf.this_var.iter().chain(hf.params.iter().map(|p| &p.var)).copied().collect();
             let all: Vec<VarId> = pvars.iter().chain(vars_of.get(&f).map(|v| v.as_slice()).unwrap_or(&[])).copied().collect();
             lw.borrowed = el.borrowed_vars(f, &all);
-            let mut words = params[1..].iter().copied();
+            // Captured variables: no cell yet (a block or `Init` makes it).
+            for &v in vars_of.get(&f).map(|v| v.as_slice()).unwrap_or(&[]) {
+                if hir.vars[v as usize].captured {
+                    let x = lw.b.declare_var(types::I64);
+                    let none = lw.b.ins().iconst(types::I64, 1);
+                    lw.b.def_var(x, none);
+                    lw.cells.insert(v, x);
+                }
+            }
+            let mut words = params[if lw.env.is_some() { 2 } else { 1 }..].iter().copied();
             for v in &pvars {
                 let k = lw.el.vjk(*v).unwrap();
                 let r = if k.wide() {
@@ -3709,6 +3970,16 @@ pub fn compile(hir: &HProgram, prog: &mut Program) -> usize {
                 } else {
                     RV::new(words.next().unwrap())
                 };
+                if lw.cells.contains_key(v) {
+                    // A captured parameter moves to a cell, which owns a copy.
+                    lw.new_cell(*v);
+                    lw.declared.insert(*v);
+                    if k.counted() {
+                        lw.inc_rv(r);
+                    }
+                    lw.mem_set(*v, RV { owned: true, ..r });
+                    continue;
+                }
                 lw.def_var(*v, r);
                 if k.counted() && assigned.contains(v) && !lw.borrowed.contains(v) {
                     lw.inc_rv(r);
@@ -3717,7 +3988,7 @@ pub fn compile(hir: &HProgram, prog: &mut Program) -> usize {
             }
             // Locals: declared here, so every path sees them (undefined at first).
             for &v in vars_of.get(&f).map(|v| v.as_slice()).unwrap_or(&[]) {
-                if !pvars.contains(&v) {
+                if !pvars.contains(&v) && !lw.cells.contains_key(&v) {
                     lw.var(v);
                     if lw.el.vjk(v).unwrap().counted() && !lw.borrowed.contains(&v) {
                         lw.owned.push(v);
@@ -3758,6 +4029,10 @@ pub fn compile(hir: &HProgram, prog: &mut Program) -> usize {
             let (c, argv) = (b.block_params(blk)[0], b.block_params(blk)[1]);
             let mut args = vec![c];
             let mut i = 0;
+            if !hf.free.is_empty() {
+                args.push(b.ins().load(types::I64, mf(), argv, 0));
+                i = 1;
+            }
             for k in param_jks(&el, hf) {
                 for _ in 0..cl_tys(k).len() {
                     let bits = b.ins().load(types::I64, mf(), argv, (i * 8) as i32);
@@ -3811,6 +4086,7 @@ pub fn compile(hir: &HProgram, prog: &mut Program) -> usize {
             fc.jit = Some(Box::new(JitFn {
                 entry: unsafe { std::mem::transmute::<*const u8, Entry>(p) },
                 this: hf.this_var.is_some(),
+                env: !hf.free.is_empty(),
                 params: hf.params.iter().map(|p| var_jv(hir, p.var)).collect(),
                 ret: ret_jv(hf).unwrap(),
             }));

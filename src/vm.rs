@@ -516,6 +516,12 @@ impl Vm {
     }
 
     fn call_slice_unblocked(&mut self, callee: &Value, this: Value, args: &[Value]) -> Result<Value, Value> {
+        if let Value::Func(c) = callee
+            && self.code(c.func).jit.is_some()
+            && let Some(r) = self.call_native_values(c.func, Some(c), &this, args)
+        {
+            return r;
+        }
         let (func, closure) = match callee {
             Value::Func(c) => (self.prog.funcs[c.func as usize].clone(), Some(c.clone())),
             Value::Native(n) => return call_native(self, *n, this, args.to_vec()),
@@ -558,7 +564,7 @@ impl Vm {
 
     /// Call function `fid` (one that captures nothing), as `CallTarget::Direct`.
     pub(crate) fn jit_call_func(&mut self, fid: u32, this: Value, args: &[Value]) -> Result<Value, Value> {
-        if let Some(r) = self.call_native_values(fid, &this, args) {
+        if let Some(r) = self.call_native_values(fid, None, &this, args) {
             return r;
         }
         let f = Value::Func(Gc::new(Closure { func: fid, caps: Box::new([]), props: Default::default() }));
@@ -627,9 +633,9 @@ impl Vm {
     pub(crate) fn jit_call_value(&mut self, f: &Value, this: Value, args: &[Value]) -> Result<Value, Value> {
         match f {
             Value::Class(c) => Err(self.type_error(format!("Class constructor {} cannot be invoked without 'new'", c.name))),
-            Value::Func(c) if c.caps.is_empty() && self.code(c.func).jit.is_some() => {
+            Value::Func(c) if self.code(c.func).jit.is_some() => {
                 let fid = c.func;
-                match self.call_native_values(fid, &this, args) {
+                match self.call_native_values(fid, Some(c), &this, args) {
                     Some(r) => r,
                     None => self.call_slice(f, this, args),
                 }
@@ -703,7 +709,17 @@ impl Vm {
     /// passes exactly its parameters, as values compiled code can take.
     /// None: use the interpreter.
     #[inline(never)]
-    fn call_native_code(&mut self, jf: &crate::jit::JitFn, func: &FunctionCode, ci: &CallSite, this: Option<&Value>, sb: usize, vb: usize) -> Option<Result<bool, Value>> {
+    #[allow(clippy::too_many_arguments)]
+    fn call_native_code(
+        &mut self,
+        jf: &crate::jit::JitFn,
+        func: &FunctionCode,
+        ci: &CallSite,
+        closure: Option<&Gc<Closure>>,
+        this: Option<&Value>,
+        sb: usize,
+        vb: usize,
+    ) -> Option<Result<bool, Value>> {
         use crate::jit::{JitFn, JV};
         let n = func.params.len();
         if ci.has_spread || ci.args.len() != n || n > 15 || ci.args.iter().zip(&func.params).any(|(a, p)| a.0 != *p) {
@@ -721,9 +737,14 @@ impl Vm {
         let argv_ptr = argv.as_mut_ptr() as *mut u64;
         let put = |i: usize, w: u64| unsafe { argv_ptr.add(i).write(w) };
         let mut i = 0;
-        if jf.this {
-            put(0, JitFn::arg_bits(JV::Obj, this.unwrap_or(&Value::Undef))?);
+        if jf.env {
+            // Borrowed: the caller holds the closure.
+            put(0, closure?.caps.as_ptr() as u64);
             i = 1;
+        }
+        if jf.this {
+            put(i, JitFn::arg_bits(JV::Obj, this.unwrap_or(&Value::Undef))?);
+            i += 1;
         }
         for (&(_, r), &k) in ci.args.iter().zip(&jf.params) {
             match k {
@@ -792,18 +813,24 @@ impl Vm {
 
     /// Call compiled function `fid` with values, if it is compiled and the
     /// arguments are values it takes. None: use the interpreter.
-    fn call_native_values(&mut self, fid: u32, this: &Value, args: &[Value]) -> Option<Result<Value, Value>> {
+    fn call_native_values(&mut self, fid: u32, closure: Option<&Gc<Closure>>, this: &Value, args: &[Value]) -> Option<Result<Value, Value>> {
         use crate::jit::{JitFn, JV};
         let func = self.code(fid);
         let jf = func.jit.as_deref()?;
-        if args.len() != jf.params.len() || args.len() > 15 {
+        // Extra arguments (a callback's index and array, say) are dropped.
+        if args.len() < jf.params.len() || jf.params.len() > 15 {
             return None;
         }
-        let mut argv = [0u64; 32];
+        let args = &args[..jf.params.len()];
+        let mut argv = [0u64; 33];
         let mut i = 0;
-        if jf.this {
-            argv[0] = JitFn::arg_bits(JV::Obj, this)?;
+        if jf.env {
+            argv[0] = closure?.caps.as_ptr() as u64;
             i = 1;
+        }
+        if jf.this {
+            argv[i] = JitFn::arg_bits(JV::Obj, this)?;
+            i += 1;
         }
         for (a, &k) in args.iter().zip(&jf.params) {
             if k == JV::Val {
@@ -1157,7 +1184,7 @@ impl Vm {
             }
         };
         if let Some(jf) = &func.jit
-            && let Some(r) = self.call_native_code(jf, func, ci, this.as_deref(), sb, vb)
+            && let Some(r) = self.call_native_code(jf, func, ci, closure.as_ref(), this.as_deref(), sb, vb)
         {
             return r;
         }
