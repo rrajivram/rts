@@ -43,8 +43,11 @@ pub fn compile_file(path: &std::path::Path, src: String, erase_types: bool) -> R
             prelude.extend(parser::parse_program(lexer::tokenize_at(PRELUDE_DATE, base)?)?);
         }
         let hir = check::check_program(&prelude, &graph, erase_types)?;
-        let mut prog = codegen::compile(&hir);
-        jit::compile(&hir, &mut prog);
+        // One analysis for both: compiled code allocates in the same scope
+        // arenas as the interpreter (its sites are keyed by HIR address).
+        let escape = escape::analyze(&hir);
+        let mut prog = codegen::compile(&hir, &escape);
+        jit::compile(&hir, &mut prog, &escape);
         Ok(prog)
     })();
     r.map_err(|e: CompileError| sources.render(&e))

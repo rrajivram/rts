@@ -29,7 +29,10 @@ fn main() -> ExitCode {
             "--no-types" => erase = true,
             "--no-cycles" => rts::runtime::cycles::disable(),
             "--mem-stats" => mem_stats = true,
-            "--no-arena" => no_arena = true,
+            "--no-arena" => {
+                no_arena = true;
+                rts::jit::no_arenas();
+            }
             "--profile" => profile = true,
             "--no-jit" => rts::jit::disable(),
             _ => path = Some(a),

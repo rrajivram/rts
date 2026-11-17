@@ -69,10 +69,10 @@ struct TryCtx {
     close_iterator: Option<u16>,
 }
 
-pub fn compile(hir: &HProgram) -> Program {
+pub fn compile(hir: &HProgram, escape: &crate::escape::EscapeInfo) -> Program {
     let mut cg = Codegen {
         hir,
-        escape: crate::escape::analyze(hir),
+        escape,
         shapes: Vec::new(),
         shape_ids: HashMap::new(),
         globals: HashMap::new(),
@@ -140,7 +140,7 @@ pub fn compile(hir: &HProgram) -> Program {
 struct Codegen<'a> {
     hir: &'a HProgram,
     /// Which allocations are scope-bound, and which blocks hold regions.
-    escape: crate::escape::EscapeInfo,
+    escape: &'a crate::escape::EscapeInfo,
     shapes: Vec<Rc<Shape>>,
     shape_ids: HashMap<Vec<Rc<str>>, u32>,
     globals: HashMap<VarId, Home>,

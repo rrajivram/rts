@@ -82,6 +82,7 @@ use crate::bytecode::Program;
 use crate::hir::*;
 use crate::runtime::heap::{self, Gc, Header};
 use crate::runtime::natives::{self, Native};
+use crate::runtime::arena::Arena;
 use crate::runtime::{ClassRt, Closure, Object, Value};
 use crate::types::{Kind, Type};
 
@@ -240,6 +241,8 @@ pub struct JitFn {
     pub entry: Entry,
     /// Takes its closure's cells (`Closure::caps`) as its first argument.
     pub env: bool,
+    /// Takes the arena for its result next (0: the heap).
+    pub rarena: bool,
     /// Takes `this` (as this) as its first argument (after the cells).
     pub this: Option<JV>,
     pub params: Vec<JV>,
@@ -346,7 +349,14 @@ extern "C" fn h_math2(i: u32, a: f64, b: f64) -> f64 {
 /// That is sound because compiled code holds no uncounted pointer across a
 /// call (a borrowed reference is a variable's or a caller's, both counted).
 /// The tracing GC can't run here: it would need compiled frames' roots.
-extern "C" fn h_new(class: *const ClassRt) -> u64 {
+extern "C" fn h_new(class: *const ClassRt, arena: *const Arena) -> u64 {
+    if !arena.is_null() {
+        let c = unsafe {
+            std::rc::Rc::increment_strong_count(class);
+            std::rc::Rc::from_raw(class)
+        };
+        return Gc::into_header(Object::blank_in(c.shape.clone(), Some(c), unsafe { &*arena })).as_ptr() as u64;
+    }
     #[cfg(not(feature = "gc"))]
     if crate::runtime::cycles::wanted() {
         crate::runtime::cycles::collect();
@@ -517,13 +527,73 @@ extern "C" fn h_arr_push(a: u64, tag: u64, payload: u64) -> f64 {
 }
 
 /// `[]`: a new array (number storage or not), owned by the caller.
-extern "C" fn h_arr_new(numbers: u32) -> u64 {
+extern "C" fn h_arr_new(numbers: u32, arena: *const Arena) -> u64 {
+    if !arena.is_null() {
+        return Gc::into_header(crate::runtime::Array::new_in(numbers != 0, unsafe { &*arena })).as_ptr() as u64;
+    }
     #[cfg(not(feature = "gc"))]
     if crate::runtime::cycles::wanted() {
         crate::runtime::cycles::collect();
     }
     let a = if numbers != 0 { crate::runtime::Array::new_num(Vec::new()) } else { crate::runtime::Array::new_val(Vec::new()) };
     Gc::into_header(a).as_ptr() as u64
+}
+
+// ── scope arenas (see `escape.rs`): compiled code's regions ──
+
+/// `--no-arena` (and the tracing-GC build): allocate everything on the heap.
+static mut ARENAS: bool = !cfg!(feature = "gc");
+
+/// `--no-arena`.
+pub fn no_arenas() {
+    unsafe { ARENAS = false };
+}
+
+fn arenas_on() -> bool {
+    unsafe { ARENAS }
+}
+
+/// Compiled code's active regions, innermost last (boxed: compiled code
+/// holds their addresses), and arenas to reuse. The VM runs on one thread.
+#[allow(clippy::vec_box)] // boxed: arenas must not move
+type Arenas = (Vec<Box<Arena>>, Vec<Box<Arena>>);
+struct RegionStack(UnsafeCell<Arenas>);
+unsafe impl Sync for RegionStack {}
+static REGIONS: RegionStack = RegionStack(UnsafeCell::new((Vec::new(), Vec::new())));
+
+#[allow(clippy::mut_from_ref)]
+fn regions() -> &'static mut Arenas {
+    unsafe { &mut *REGIONS.0.get() }
+}
+
+/// How many regions compiled code has open (read inline on entry by
+/// functions with regions, to unwind to on an error).
+static mut REGION_DEPTH: u64 = 0;
+
+/// A block with scope-bound allocations starts: its arena's address.
+extern "C" fn h_region_enter() -> u64 {
+    let (open, pool) = regions();
+    let a = pool.pop().unwrap_or_default();
+    let p = &*a as *const Arena as u64;
+    open.push(a);
+    unsafe { REGION_DEPTH += 1 };
+    p
+}
+
+/// The innermost region's block ends: free everything in its arena.
+extern "C" fn h_region_exit() {
+    let (open, pool) = regions();
+    let a = open.pop().expect("region stack");
+    unsafe { REGION_DEPTH -= 1 };
+    a.reset();
+    pool.push(a);
+}
+
+/// Unwinding: free the regions opened since the depth was `depth`.
+extern "C" fn h_region_unwind(depth: u64) {
+    while unsafe { REGION_DEPTH } > depth {
+        h_region_exit();
+    }
 }
 
 /// Return a value's words from a helper: the payload, and its tag in
@@ -1386,6 +1456,9 @@ fn throw_site(e: &HExpr) -> Option<(u32, Vec<std::rc::Rc<str>>)> {
 /// site in compiled code, and how often each ran.
 #[cfg(feature = "profile")]
 const RC_SITE_MAX: usize = 1 << 16;
+/// Profile builds: inline count updates of boxes in scope arenas.
+#[cfg(feature = "profile")]
+static mut ARENA_RC: u64 = 0;
 #[cfg(feature = "profile")]
 static mut RC_SITE_COUNTS: [u64; RC_SITE_MAX] = [0; RC_SITE_MAX];
 #[cfg(feature = "profile")]
@@ -1420,7 +1493,7 @@ pub fn rc_sites_report() {
         *by_line.entry((*line, *inc)).or_default() += n;
         *by_fn.entry(f.clone()).or_default() += n;
     }
-    eprintln!("compiled code count updates: {total}");
+    eprintln!("compiled code count updates: {total} ({} on scope-arena boxes)", unsafe { ARENA_RC });
     let mut v: Vec<_> = by_line.into_iter().collect();
     v.sort_by_key(|x| std::cmp::Reverse(x.1));
     for ((line, inc), n) in v.iter().take(15) {
@@ -1530,6 +1603,40 @@ fn parts(s: &HStmt) -> (Vec<&HExpr>, Vec<&[HStmt]>) {
         HStmt::Labeled(_, s) => (vec![], vec![std::slice::from_ref(&**s)]),
         HStmt::Try { block, handler, finalizer, .. } => (vec![], std::iter::once(block.as_slice()).chain([handler.as_slice()]).chain(finalizer.as_deref()).collect()),
         HStmt::Init(_, None) | HStmt::MakeClosure(..) | HStmt::Break(_) | HStmt::Continue(_) | HStmt::Return(None) => (vec![], vec![]),
+    }
+}
+
+/// Does any expression in `ss` (at any depth) satisfy `f`?
+fn any_expr(ss: &[HStmt], f: &mut impl FnMut(&HExpr) -> bool) -> bool {
+    fn e(x: &HExpr, f: &mut impl FnMut(&HExpr) -> bool) -> bool {
+        f(x) || children(x).into_iter().any(|c| e(c, f))
+    }
+    ss.iter().any(|s| {
+        let (xs, bodies) = parts(s);
+        xs.into_iter().any(|x| e(x, f)) || bodies.into_iter().any(|b| any_expr(b, f))
+    })
+}
+
+/// Does any block in `ss` (at any depth, `ss` included) satisfy `f`?
+fn any_block(ss: &[HStmt], f: &mut impl FnMut(&[HStmt]) -> bool) -> bool {
+    f(ss) || ss.iter().any(|s| parts(s).1.into_iter().any(|b| any_block(b, f)))
+}
+
+/// Variables declared anywhere inside `ss`, and its `for-of` statements' keys.
+fn block_decls(ss: &[HStmt], vars: &mut Vec<VarId>, iters: &mut Vec<usize>) {
+    for s in ss {
+        match s {
+            HStmt::Init(v, _) | HStmt::MakeClosure(v, _) => vars.push(*v),
+            HStmt::Block(_, vs) => vars.extend(vs),
+            HStmt::ForOf { elem, .. } => {
+                vars.push(*elem);
+                iters.push(s as *const HStmt as usize);
+            }
+            _ => {}
+        }
+        for b in parts(s).1 {
+            block_decls(b, vars, iters);
+        }
     }
 }
 
@@ -1650,6 +1757,9 @@ struct Helpers {
     closure: FuncRef,
     throw_value: FuncRef,
     iter_array: FuncRef,
+    region_enter: FuncRef,
+    region_exit: FuncRef,
+    region_unwind: FuncRef,
 }
 
 /// Layout facts compiled code relies on.
@@ -1780,8 +1890,19 @@ struct Lower<'a, 'b> {
     /// Owned temporaries not yet consumed (payload, tag): released if the
     /// code unwinds.
     pending: Vec<(CV, Option<CV>)>,
-    /// (label, break target, continue target, is a switch).
-    loops: Vec<(Option<Name>, Block, Option<Block>, bool)>,
+    loops: Vec<LoopT>,
+    /// The escape analysis (allocation sites → scope regions).
+    esc: &'a crate::escape::EscapeInfo,
+    /// Regions entered and not yet left, innermost last: the block's key,
+    /// its arena's address, and what to release before freeing it.
+    regions: Vec<RegionT>,
+    /// The arena the caller gave for this function's result (0: the heap),
+    /// when the function has allocations only ever returned.
+    rarena: Option<CV>,
+    /// The JIT region stack's height on entry (functions with regions), for unwinding.
+    region_mark: Option<CV>,
+    /// Compiled functions that take a result arena.
+    takes_rarena: &'a FxHashSet<FuncId>,
     /// Each `for-of`'s array (keyed by the statement's address): owned,
     /// or 1 when the loop isn't running.
     iters: FxHashMap<usize, Variable>,
@@ -1792,6 +1913,27 @@ struct Lower<'a, 'b> {
     /// Each global variable's index (in `Vm::global_scalars` or `global_values`, by kind).
     globals: &'a FxHashMap<VarId, u32>,
     stats: &'a mut RcStats,
+}
+
+/// A `break` / `continue` target.
+#[derive(Clone)]
+struct LoopT {
+    label: Option<Name>,
+    brk: Block,
+    cont: Option<Block>,
+    switch: bool,
+    /// Regions active outside it (left when jumping out).
+    regions: usize,
+}
+
+/// An entered scope region (see `escape.rs`).
+struct RegionT {
+    key: usize,
+    arena: CV,
+    /// Variables declared in the block (counted, owned) and `for-of`
+    /// arrays: released before the arena is freed.
+    vars: Vec<VarId>,
+    iters: Vec<usize>,
 }
 
 /// A value in compiled code: one word (a number, boolean or reference), or
@@ -2028,15 +2170,25 @@ impl Lower<'_, '_> {
 
     // ── reference counts ──
 
+    /// Profile builds: count an inline update of box `p` (and whether the
+    /// box is in a scope arena).
     #[cfg(feature = "profile")]
-    fn count_rc(&mut self) {
+    fn count_rc(&mut self, p: CV) {
         let a = self.b.ins().iconst(types::I64, heap::STATS.rc_ops.as_ptr() as i64);
         let n = self.b.ins().load(types::I64, mf(), a, 0);
         let n1 = self.b.ins().iadd_imm_s(n, 1);
         self.b.ins().store(mf(), n1, a, 0);
+        let fl = self.b.ins().load(types::I32, mf(), p, 4);
+        let bit = self.b.ins().ushr_imm_u(fl, heap::flag::ARENA.trailing_zeros() as i64);
+        let bit = self.b.ins().band_imm_u(bit, 1);
+        let bit = self.b.ins().uextend(types::I64, bit);
+        let a = self.b.ins().iconst(types::I64, (&raw mut ARENA_RC) as i64);
+        let n = self.b.ins().load(types::I64, mf(), a, 0);
+        let n1 = self.b.ins().iadd(n, bit);
+        self.b.ins().store(mf(), n1, a, 0);
     }
     #[cfg(not(feature = "profile"))]
-    fn count_rc(&mut self) {}
+    fn count_rc(&mut self, _p: CV) {}
 
     /// Profile builds: count a count update at the jit.rs line that asked
     /// for it (see `rc_sites_report`).
@@ -2070,7 +2222,7 @@ impl Lower<'_, '_> {
         let rc = self.b.ins().load(types::I32, mf(), p, 0);
         let rc1 = self.b.ins().iadd_imm_s(rc, 1);
         self.b.ins().store(mf(), rc1, p, 0);
-        self.count_rc();
+        self.count_rc(p);
     }
 
     /// Take a reference (`p` may be null or undefined).
@@ -2171,7 +2323,7 @@ impl Lower<'_, '_> {
         self.b.switch_to_block(fb);
         let rc1 = self.b.ins().iadd_imm_s(rc, -1);
         self.b.ins().store(mf(), rc1, p, 0);
-        self.count_rc();
+        self.count_rc(p);
         self.b.ins().jump(done, &[]);
         self.b.switch_to_block(sb);
         self.b.ins().call(self.h.dec, &[p]);
@@ -2378,7 +2530,16 @@ impl Lower<'_, '_> {
                         self.declared.insert(*v);
                     }
                 }
-                self.stmts(ss);
+                // A block with scope-bound allocations gets an arena, freed when it ends.
+                if self.region_on(ss) {
+                    self.enter_region(ss, vars);
+                    self.stmts(ss);
+                    let i = self.regions.len() - 1;
+                    self.leave_region(i);
+                    self.regions.pop();
+                } else {
+                    self.stmts(ss);
+                }
             }
             HStmt::If(c, t, e) => {
                 let (tb, eb, done) = (self.b.create_block(), self.b.create_block(), self.b.create_block());
@@ -2395,7 +2556,17 @@ impl Lower<'_, '_> {
                 self.b.seal_block(done);
                 self.b.switch_to_block(done);
             }
-            HStmt::Loop { label, test, body, update, test_after, fresh } => {
+            HStmt::Loop { label, .. } => self.loop_stmt(s, label.clone()),
+            HStmt::Labeled(name, s) if matches!(&**s, HStmt::Loop { label: None, .. }) => self.loop_stmt(s, Some(name.clone())),
+            _ => self.stmt2(s),
+        }
+    }
+
+    /// `while`/`for`/`do` (`label` names it).
+    fn loop_stmt(&mut self, s: &HStmt, label: Option<Name>) {
+        let HStmt::Loop { test, body, update, test_after, fresh, .. } = s else { unreachable!() };
+        {
+            {
                 let (tb, bb, ub, xb) = (self.b.create_block(), self.b.create_block(), self.b.create_block(), self.b.create_block());
                 self.b.ins().jump(if *test_after { bb } else { tb }, &[]);
                 self.b.switch_to_block(tb);
@@ -2409,7 +2580,7 @@ impl Lower<'_, '_> {
                     }
                 }
                 self.b.switch_to_block(bb);
-                self.loops.push((label.clone(), xb, Some(ub), false));
+                self.loops.push(LoopT { label: label.clone(), brk: xb, cont: Some(ub), switch: false, regions: self.regions.len() });
                 self.stmts(body);
                 self.loops.pop();
                 self.b.ins().jump(ub, &[]);
@@ -2437,33 +2608,34 @@ impl Lower<'_, '_> {
                 self.b.seal_block(xb);
                 self.b.switch_to_block(xb);
             }
+        }
+    }
+
+    fn stmt2(&mut self, s: &HStmt) {
+        match s {
             HStmt::Labeled(name, s) if matches!(&**s, HStmt::ForOf { .. }) => self.for_of(s, Some(name.clone())),
             HStmt::Labeled(name, s) if !matches!(&**s, HStmt::Loop { .. }) => {
                 let xb = self.b.create_block();
-                self.loops.push((Some(name.clone()), xb, None, false));
+                self.loops.push(LoopT { label: Some(name.clone()), brk: xb, cont: None, switch: false, regions: self.regions.len() });
                 self.stmt(s);
                 self.loops.pop();
                 self.b.ins().jump(xb, &[]);
                 self.b.seal_block(xb);
                 self.b.switch_to_block(xb);
             }
-            HStmt::Labeled(name, s) => {
-                // `l: for (…)`: the label names the loop.
-                if let HStmt::Loop { label: None, test, body, update, test_after, fresh } = &**s {
-                    let l = HStmt::Loop { label: Some(name.clone()), test: test.clone(), body: body.clone(), update: update.clone(), test_after: *test_after, fresh: fresh.clone() };
-                    self.stmt(&l);
-                } else {
-                    self.stmt(s);
-                }
-            }
+            HStmt::Labeled(_, s) => self.stmt(s),
             HStmt::Break(label) | HStmt::Continue(label) => {
                 let is_break = matches!(s, HStmt::Break(_));
-                let target = self.loops.iter().rev().find(|(l, _, c, sw)| match label {
-                    Some(n) => l.as_ref() == Some(n),
-                    None => c.is_some() || (is_break && *sw),
+                let target = self.loops.iter().rev().find(|l| match label {
+                    Some(n) => l.label.as_ref() == Some(n),
+                    None => l.cont.is_some() || (is_break && l.switch),
                 });
-                let (_, xb, cb, _) = target.expect("break target").clone();
-                let to = if is_break { xb } else { cb.expect("continue target") };
+                let t = target.expect("break target").clone();
+                let to = if is_break { t.brk } else { t.cont.expect("continue target") };
+                // Leave the regions entered inside the target.
+                for i in (t.regions..self.regions.len()).rev() {
+                    self.leave_region(i);
+                }
                 self.b.ins().jump(to, &[]);
                 self.dead_block();
             }
@@ -2529,6 +2701,10 @@ impl Lower<'_, '_> {
                         r
                     }
                 };
+                // Variables are released: free the arenas still open.
+                for _ in 0..self.regions.len() {
+                    self.b.ins().call(self.h.region_exit, &[]);
+                }
                 self.ret(r);
                 self.dead_block();
             }
@@ -2586,7 +2762,7 @@ impl Lower<'_, '_> {
             sw.set_entry(k as u128, *blk);
         }
         sw.emit(&mut self.b, i, xb);
-        self.loops.push((label.clone(), xb, None, true));
+        self.loops.push(LoopT { label: label.clone(), brk: xb, cont: None, switch: true, regions: self.regions.len() });
         for (k, (_, body)) in cases.iter().enumerate() {
             self.b.switch_to_block(bodies[k]);
             self.b.seal_block(bodies[k]);
@@ -2652,7 +2828,7 @@ impl Lower<'_, '_> {
         } else {
             self.set_var(*elem, r);
         }
-        self.loops.push((label, xb, Some(ub), false));
+        self.loops.push(LoopT { label, brk: xb, cont: Some(ub), switch: false, regions: self.regions.len() });
         self.stmts(body);
         self.loops.pop();
         self.b.ins().jump(ub, &[]);
@@ -2686,6 +2862,56 @@ impl Lower<'_, '_> {
                 self.declare_iters(b);
             }
         }
+    }
+
+    /// Does block `ss` get an arena?
+    fn region_on(&self, ss: &[HStmt]) -> bool {
+        arenas_on() && !ss.is_empty() && self.esc.regions.contains(&(ss.as_ptr() as usize))
+    }
+
+    /// Enter block `ss`'s region: a new arena.
+    fn enter_region(&mut self, ss: &[HStmt], vars: &[VarId]) {
+        let call = self.b.ins().call(self.h.region_enter, &[]);
+        let arena = self.b.inst_results(call)[0];
+        let mut all = vars.to_vec();
+        let mut iters = Vec::new();
+        block_decls(ss, &mut all, &mut iters);
+        let vars = all.into_iter().filter(|v| self.owned.contains(v)).collect();
+        self.regions.push(RegionT { key: ss.as_ptr() as usize, arena, vars, iters });
+    }
+
+    /// Leave region `i` (on the way out of its block): release its block's
+    /// variables (which may point into the arena), then free the arena.
+    fn leave_region(&mut self, i: usize) {
+        let vars = self.regions[i].vars.clone();
+        for v in vars {
+            let r = self.use_var(v);
+            self.dec_rv(r);
+            let z = self.zero_rv(self.el.vjk(v).unwrap());
+            self.def_var(v, z);
+        }
+        for k in self.regions[i].iters.clone() {
+            if let Some(x) = self.iters.get(&k).copied() {
+                let a = self.b.use_var(x);
+                self.dec(a);
+                let none = self.b.ins().iconst(types::I64, 1);
+                self.b.def_var(x, none);
+            }
+        }
+        self.b.ins().call(self.h.region_exit, &[]);
+    }
+
+    /// The arena allocation (or call result) `key` goes in, if the escape
+    /// analysis bound it to a scope: a region's, or the caller's result arena.
+    fn arena_for(&mut self, key: usize) -> Option<CV> {
+        if !arenas_on() {
+            return None;
+        }
+        if self.esc.result.contains(&key) {
+            return self.rarena;
+        }
+        let blk = self.esc.sites.get(&key)?;
+        self.regions.iter().rev().find(|r| r.key == *blk).map(|r| r.arena)
     }
 
     /// Evaluate for effect.
@@ -3500,7 +3726,7 @@ impl Lower<'_, '_> {
                 }
                 self.value_as(xs.last().unwrap(), want).v
             }
-            HK::Call(c) => self.call(c, want).v,
+            HK::Call(c) => self.call(e, c, want).v,
             _ => unreachable!("checked by Elig"),
         }
     }
@@ -3670,7 +3896,7 @@ impl Lower<'_, '_> {
                 }
                 self.value_as(xs.last().unwrap(), want)
             }
-            HK::Call(c) => self.call(c, want),
+            HK::Call(c) => self.call(e, c, want),
             HK::New { class, args } => {
                 let ctor = self.hir.classes[*class as usize].ctor;
                 if !self.el.new_direct(self.fid, *class, args) {
@@ -3680,10 +3906,15 @@ impl Lower<'_, '_> {
                     return self.coerce(r, JV::Val, want);
                 }
                 let cls = self.b.ins().iconst(types::I64, std::rc::Rc::as_ptr(&self.classes[*class as usize]) as i64);
-                let call = self.b.ins().call(self.h.new, &[cls]);
+                let arena = self.arena_for(e as *const HExpr as usize).unwrap_or_else(|| self.b.ins().iconst(types::I64, 0));
+                let call = self.b.ins().call(self.h.new, &[cls, arena]);
                 let obj = self.b.inst_results(call)[0];
                 let res = self.fresh(RV::new(obj));
-                let mut vals = vec![self.ctx, obj];
+                let mut vals = vec![self.ctx];
+                if self.takes_rarena.contains(&ctor) {
+                    vals.push(self.b.ins().iconst(types::I64, 0));
+                }
+                vals.push(obj);
                 let pjs = self.param_jvs(ctor, false);
                 let held = self.args(args, &pjs, &mut vals, false);
                 let fr = self.funcs[&ctor];
@@ -3711,7 +3942,8 @@ impl Lower<'_, '_> {
                     _ => false,
                 };
                 let n = self.b.ins().iconst(types::I32, numbers as i64);
-                let call = self.b.ins().call(self.h.arr_new, &[n]);
+                let arena = self.arena_for(e as *const HExpr as usize).unwrap_or_else(|| self.b.ins().iconst(types::I64, 0));
+                let call = self.b.ins().call(self.h.arr_new, &[n, arena]);
                 let a = self.b.inst_results(call)[0];
                 let res = self.fresh(RV::new(a));
                 for x in elems {
@@ -3913,9 +4145,9 @@ impl Lower<'_, '_> {
     }
 
     /// A call, its result as a `want`.
-    fn call(&mut self, c: &HCall, want: JV) -> RV {
+    fn call(&mut self, e: &HExpr, c: &HCall, want: JV) -> RV {
         if let Some(g) = self.el.direct_target(c) {
-            return self.call_compiled(c, g, want);
+            return self.call_compiled(e, c, g, want);
         }
         match &c.callee {
             Callee::Native(Native::ArrPush) if self.el.inline_push(self.fid, c, want.jk()) => {
@@ -3937,11 +4169,17 @@ impl Lower<'_, '_> {
     }
 
     /// A call to a compiled function.
-    fn call_compiled(&mut self, c: &HCall, g: FuncId, want: JV) -> RV {
+    fn call_compiled(&mut self, e: &HExpr, c: &HCall, g: FuncId, want: JV) -> RV {
         let hg = &self.hir.funcs[g as usize];
         let pure = self.el.pure.contains(&g);
         let mut vals = vec![self.ctx];
         let mut held = Vec::new();
+        // Where the callee allocates a fresh result: a region of ours, or
+        // our own result arena (none: the heap).
+        if self.takes_rarena.contains(&g) {
+            let a = self.arena_for(e as *const HExpr as usize).unwrap_or_else(|| self.b.ins().iconst(types::I64, 0));
+            vals.push(a);
+        }
         if let Some(tv) = hg.this_var {
             // An instance's methods take an object; static methods, their class (a value).
             let tj = var_jv(self.hir, tv);
@@ -4094,7 +4332,7 @@ fn var_jv(hir: &HProgram, v: VarId) -> JV {
 
 /// Compile every eligible function and attach its entry point to `prog`.
 /// Returns how many were compiled.
-pub fn compile(hir: &HProgram, prog: &mut Program) -> usize {
+pub fn compile(hir: &HProgram, prog: &mut Program, esc: &crate::escape::EscapeInfo) -> usize {
     if !unsafe { ENABLED } {
         return 0;
     }
@@ -4116,6 +4354,13 @@ pub fn compile(hir: &HProgram, prog: &mut Program) -> usize {
         el.set = keep;
     }
     el.compute_pure();
+    // Functions with allocations (or calls) whose object is only returned
+    // take the arena their caller gives for the result.
+    let takes_rarena: FxHashSet<FuncId> = if arenas_on() {
+        el.set.iter().copied().filter(|&f| any_expr(&hir.funcs[f as usize].body, &mut |e| esc.result.contains(&(e as *const HExpr as usize)))).collect()
+    } else {
+        FxHashSet::default()
+    };
     let debug = std::env::var_os("RTS_JIT_DEBUG").is_some();
     if el.set.is_empty() {
         return 0;
@@ -4127,7 +4372,7 @@ pub fn compile(hir: &HProgram, prog: &mut Program) -> usize {
         return 0;
     };
     let mut jb = JITBuilder::with_isa(isa, cranelift_module::default_libcall_names());
-    let helpers: [(&str, *const u8); 24] = [
+    let helpers: [(&str, *const u8); 27] = [
         ("rts_mod", h_mod as *const u8),
         ("rts_pow", h_pow as *const u8),
         ("rts_int32", h_int32 as *const u8),
@@ -4152,6 +4397,9 @@ pub fn compile(hir: &HProgram, prog: &mut Program) -> usize {
         ("rts_closure", h_closure as *const u8),
         ("rts_throw_value", h_throw_value as *const u8),
         ("rts_iter_array", h_iter_array as *const u8),
+        ("rts_region_enter", h_region_enter as *const u8),
+        ("rts_region_exit", h_region_exit as *const u8),
+        ("rts_region_unwind", h_region_unwind as *const u8),
     ];
     for (n, p) in helpers {
         jb.symbol(n, p);
@@ -4179,7 +4427,7 @@ pub fn compile(hir: &HProgram, prog: &mut Program) -> usize {
         { let s = sig(&m, &[f64t], Some(i32t)); decl(&mut m, "rts_int32", s) },
         { let s = sig(&m, &[i32t, f64t], Some(f64t)); decl(&mut m, "rts_math1", s) },
         { let s = sig(&m, &[i32t, f64t, f64t], Some(f64t)); decl(&mut m, "rts_math2", s) },
-        { let s = sig(&m, &[i64t], Some(i64t)); decl(&mut m, "rts_new", s) },
+        { let s = sig(&m, &[i64t, i64t], Some(i64t)); decl(&mut m, "rts_new", s) },
         { let s = sig(&m, &[i64t], None); decl(&mut m, "rts_dec", s) },
         { let s = sig(&m, &[i64t, i64t], None); decl(&mut m, "rts_drop_val", s) },
         { let s = sig(&m, &[i32t, i64t, i64t], None); decl(&mut m, "rts_throw", s) },
@@ -4187,7 +4435,7 @@ pub fn compile(hir: &HProgram, prog: &mut Program) -> usize {
         { let s = sig(&m, &[i64t, f64t, i64t, i64t, i32t], None); decl(&mut m, "rts_arr_set", s) },
         { let s = sig(&m, &[i64t], Some(f64t)); decl(&mut m, "rts_arr_len", s) },
         { let s = sig(&m, &[i64t, i64t, i64t], Some(f64t)); decl(&mut m, "rts_arr_push", s) },
-        { let s = sig(&m, &[i32t], Some(i64t)); decl(&mut m, "rts_arr_new", s) },
+        { let s = sig(&m, &[i32t, i64t], Some(i64t)); decl(&mut m, "rts_arr_new", s) },
         { let s = sig(&m, &[i32t], None); decl(&mut m, "rts_throw_site", s) },
         { let s = sig(&m, &[i64t, i64t], None); decl(&mut m, "rts_inc_val", s) },
         { let s = sig(&m, &[i32t, i64t, i64t, i64t, i64t, i64t, i32t], Some(i64t)); decl(&mut m, "rts_call", s) },
@@ -4198,6 +4446,9 @@ pub fn compile(hir: &HProgram, prog: &mut Program) -> usize {
         { let s = sig(&m, &[i32t, i64t, i32t], Some(i64t)); decl(&mut m, "rts_closure", s) },
         { let s = sig(&m, &[i64t, i64t], None); decl(&mut m, "rts_throw_value", s) },
         { let s = sig(&m, &[i64t, i64t], Some(i64t)); decl(&mut m, "rts_iter_array", s) },
+        { let s = sig(&m, &[], Some(i64t)); decl(&mut m, "rts_region_enter", s) },
+        { let s = sig(&m, &[], None); decl(&mut m, "rts_region_exit", s) },
+        { let s = sig(&m, &[i64t], None); decl(&mut m, "rts_region_unwind", s) },
     ];
 
     // Declare every compiled function (typed) and its entry trampoline.
@@ -4208,8 +4459,11 @@ pub fn compile(hir: &HProgram, prog: &mut Program) -> usize {
     for &f in &order {
         let hf = &hir.funcs[f as usize];
         let mut params = vec![ptr];
-        // A closure's cells come first.
+        // A closure's cells come first, then the result arena.
         if !hf.free.is_empty() {
+            params.push(ptr);
+        }
+        if takes_rarena.contains(&f) {
             params.push(ptr);
         }
         params.extend(param_tys(&el, hf));
@@ -4295,6 +4549,9 @@ pub fn compile(hir: &HProgram, prog: &mut Program) -> usize {
                 closure: hr[21],
                 throw_value: hr[22],
                 iter_array: hr[23],
+                region_enter: hr[24],
+                region_exit: hr[25],
+                region_unwind: hr[26],
             };
             let entry = b.create_block();
             b.append_block_params_for_function_params(entry);
@@ -4336,6 +4593,11 @@ pub fn compile(hir: &HProgram, prog: &mut Program) -> usize {
                 cells: FxHashMap::default(),
                 declared: FxHashSet::default(),
                 env: (!hf.free.is_empty()).then(|| params[1]),
+                rarena: takes_rarena.contains(&f).then(|| params[1 + !hf.free.is_empty() as usize]),
+                esc,
+                regions: Vec::new(),
+                region_mark: None,
+                takes_rarena: &takes_rarena,
                 owned: vec![],
                 borrowed: FxHashSet::default(),
                 ctx: c,
@@ -4366,7 +4628,12 @@ pub fn compile(hir: &HProgram, prog: &mut Program) -> usize {
                     lw.cells.insert(v, x);
                 }
             }
-            let mut words = params[if lw.env.is_some() { 2 } else { 1 }..].iter().copied();
+            let mut words = params[1 + lw.env.is_some() as usize + lw.rarena.is_some() as usize..].iter().copied();
+            // Unwinding frees the regions opened since entry.
+            if arenas_on() && any_block(&hf.body, &mut |ss| esc.regions.contains(&(ss.as_ptr() as usize))) {
+                let a = lw.b.ins().iconst(types::I64, (&raw const REGION_DEPTH) as i64);
+                lw.region_mark = Some(lw.b.ins().load(types::I64, mf(), a, 0));
+            }
             for v in &pvars {
                 let k = lw.el.vjk(*v).unwrap();
                 let r = if k.wide() {
@@ -4410,6 +4677,9 @@ pub fn compile(hir: &HProgram, prog: &mut Program) -> usize {
             lw.b.switch_to_block(lw.unwind);
             lw.b.seal_block(lw.unwind);
             lw.release_vars(None);
+            if let Some(m) = lw.region_mark {
+                lw.b.ins().call(lw.h.region_unwind, &[m]);
+            }
             let z = lw.zero_rv(rk);
             lw.ret(z);
             let _ = lw.fid;
@@ -4438,6 +4708,10 @@ pub fn compile(hir: &HProgram, prog: &mut Program) -> usize {
             if !hf.free.is_empty() {
                 args.push(b.ins().load(types::I64, mf(), argv, 0));
                 i = 1;
+            }
+            if takes_rarena.contains(&f) {
+                args.push(b.ins().load(types::I64, mf(), argv, i * 8));
+                i += 1;
             }
             for k in param_jks(&el, hf) {
                 for _ in 0..cl_tys(k).len() {
@@ -4493,6 +4767,7 @@ pub fn compile(hir: &HProgram, prog: &mut Program) -> usize {
                 entry: unsafe { std::mem::transmute::<*const u8, Entry>(p) },
                 this: hf.this_var.map(|v| var_jv(hir, v)),
                 env: !hf.free.is_empty(),
+                rarena: takes_rarena.contains(&f),
                 params: hf.params.iter().map(|p| var_jv(hir, p.var)).collect(),
                 ret: ret_jv(hf).unwrap(),
             }));

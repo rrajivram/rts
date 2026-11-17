@@ -23,7 +23,8 @@ pub(crate) struct RegionRec {
     pub frame: u32,
     pub first: u16,
     pub count: u16,
-    pub arena: crate::runtime::arena::Arena,
+    /// Boxed, so its address stays put while the region stack grows.
+    pub arena: Box<crate::runtime::arena::Arena>,
 }
 
 impl Vm {
@@ -79,7 +80,7 @@ impl Vm {
 
     /// The arena an `…In { up }` allocation in frame `fi` goes to (None: the heap).
     #[inline]
-    fn alloc_region(&self, fi: usize, up: u16) -> Option<usize> {
+    pub(crate) fn alloc_region(&self, fi: usize, up: u16) -> Option<usize> {
         if !self.arenas {
             return None;
         }

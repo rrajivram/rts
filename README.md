@@ -370,8 +370,15 @@ report compiled code's count updates by source line) and sampling:
   0.222 s gap and CD 0.043 s of 0.073 s: trial deletion traces large live
   structures from each candidate.
 
-Scope arenas (the next experiment as first planned) bind few objects on this
-suite (CD aside), so on their own they can't close the gap.
+Scope arenas now work in compiled code too: it allocates the same
+scope-bound objects in the same arenas as the interpreter (CD 1.27M of
+3.3M objects, List 99%), opening and leaving regions on every way out of a
+block, and a function whose fresh result is only returned allocates it in
+an arena its caller passes. With the region reset made allocation-free and
+arenas keeping a chunk between uses, arenas make CD 1.7% and List 1%
+faster than `--no-arena`. They save the `free` but not the count updates:
+on CD only 3% of compiled code's count updates touch arena objects. So on
+this suite arenas can't close the gap to the tracing GC.
 
 Next: the memory-mode comparison on compiled code (arenas in compiled code; stack maps so the tracing GC can
 collect while compiled code runs), then generators, async functions and

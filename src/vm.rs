@@ -163,7 +163,9 @@ pub struct Vm {
     /// Active scope regions, innermost last (see `escape.rs`).
     pub(crate) regions: Vec<task::RegionRec>,
     /// Arenas of exited regions, for reuse.
-    pub(crate) arena_pool: Vec<crate::runtime::arena::Arena>,
+    /// Boxed: compiled code holds arenas' addresses (`call_native_code`).
+    #[allow(clippy::vec_box)]
+    pub(crate) arena_pool: Vec<Box<crate::runtime::arena::Arena>>,
     /// Frames given a region for their result by their caller: (frame
     /// index, index into `regions`), innermost last.
     pub(crate) result_regions: Vec<(u32, u32)>,
@@ -733,7 +735,7 @@ impl Vm {
         }
         // Two words per argument at most (a value: tag and payload). Only
         // the words written are read.
-        let mut argv = [std::mem::MaybeUninit::<u64>::uninit(); 33];
+        let mut argv = [std::mem::MaybeUninit::<u64>::uninit(); 34];
         let argv_ptr = argv.as_mut_ptr() as *mut u64;
         let put = |i: usize, w: u64| unsafe { argv_ptr.add(i).write(w) };
         let mut i = 0;
@@ -741,6 +743,13 @@ impl Vm {
             // Borrowed: the caller holds the closure.
             put(0, closure?.caps.as_ptr() as u64);
             i = 1;
+        }
+        if jf.rarena {
+            // The region this call site gives the callee's fresh result (0: the heap).
+            let caller = self.frames.len() - 1;
+            let a = ci.region.and_then(|up| self.alloc_region(caller, up)).map_or(0, |r| &*self.regions[r].arena as *const _ as u64);
+            put(i, a);
+            i += 1;
         }
         match jf.this {
             Some(JV::Val) => {
@@ -831,11 +840,15 @@ impl Vm {
             return None;
         }
         let args = &args[..jf.params.len()];
-        let mut argv = [0u64; 34];
+        let mut argv = [0u64; 35];
         let mut i = 0;
         if jf.env {
             argv[0] = closure?.caps.as_ptr() as u64;
             i = 1;
+        }
+        if jf.rarena {
+            argv[i] = 0;
+            i += 1;
         }
         match jf.this {
             Some(JV::Val) => {

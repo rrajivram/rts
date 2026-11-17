@@ -74,8 +74,13 @@ impl Arena {
     /// The region exits: drop every box's value and recycle the chunks.
     #[inline]
     pub fn reset(&self) {
-        if self.cur.get() == 0 {
-            return; // nothing was allocated
+        if self.boxes.borrow().is_empty() && self.chunks.borrow().len() <= 1 {
+            // Nothing was allocated (bump allocation always tracks its box):
+            // rewind into the chunk this arena keeps.
+            if let Some(c) = self.chunks.borrow().first() {
+                self.cur.set(c.ptr.as_ptr() as usize);
+            }
+            return;
         }
         self.reset_slow();
     }
@@ -86,24 +91,29 @@ impl Arena {
         if !boxes.is_empty() {
             STATS.arena_resets.set(STATS.arena_resets.get() + 1);
             // Later boxes usually point to earlier ones, so drop newest first;
-            // repeat while dropping frees up more.
-            let mut pending: Vec<NonNull<Header>> = boxes.drain(..).rev().collect();
+            // repeat while dropping frees up more. Boxes still referenced
+            // are kept (compacted at the end of `boxes`), with no allocation.
+            let (mut lo, hi) = (0, boxes.len());
             loop {
-                let before = pending.len();
-                pending.retain(|&h| {
+                let mut w = hi;
+                for i in (lo..hi).rev() {
+                    let h = boxes[i];
                     let hd = unsafe { h.as_ref() };
                     if hd.rc.get() == ARENA_COUNT {
                         hd.rc.set(ARENA_COUNT + 1); // pinned while its value drops
                         unsafe { drop_header_value(h) };
-                        false
                     } else {
-                        true
+                        w -= 1;
+                        boxes[w] = h;
                     }
-                });
-                if pending.is_empty() || pending.len() == before {
+                }
+                let progressed = w != lo;
+                lo = w;
+                if lo == hi || !progressed {
                     break;
                 }
             }
+            let pending: Vec<NonNull<Header>> = boxes.drain(..).skip(lo).collect();
             if !pending.is_empty() {
                 // Referenced from outside the scope: keep the memory alive.
                 // The box behaves as an ordinary counted box from now on,
@@ -124,18 +134,31 @@ impl Arena {
             }
         }
         let mut chunks = self.chunks.borrow_mut();
-        POOL.with(|p| {
-            let mut p = p.borrow_mut();
-            for c in chunks.drain(..) {
-                if c.size == CHUNK && p.len() < 64 {
-                    p.push(c);
-                } else {
-                    unsafe { Global.deallocate(c.ptr, Layout::from_size_align(c.size, 16).unwrap()) };
+        // Keep the first chunk (arenas are reused, mostly for a few small
+        // boxes); recycle the rest.
+        let keep = if chunks.first().is_some_and(|c| c.size == CHUNK) { 1 } else { 0 };
+        if chunks.len() > keep {
+            POOL.with(|p| {
+                let mut p = p.borrow_mut();
+                for c in chunks.drain(keep..) {
+                    if c.size == CHUNK && p.len() < 64 {
+                        p.push(c);
+                    } else {
+                        unsafe { Global.deallocate(c.ptr, Layout::from_size_align(c.size, 16).unwrap()) };
+                    }
                 }
+            });
+        }
+        match chunks.first() {
+            Some(c) => {
+                self.cur.set(c.ptr.as_ptr() as usize);
+                self.end.set(c.ptr.as_ptr() as usize + c.size);
             }
-        });
-        self.cur.set(0);
-        self.end.set(0);
+            None => {
+                self.cur.set(0);
+                self.end.set(0);
+            }
+        }
     }
 }
 
