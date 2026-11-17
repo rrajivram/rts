@@ -15,24 +15,12 @@ use super::*;
 impl Trace for Value {
     #[inline]
     fn trace(&self, t: &mut Tracer) {
-        match self {
-            Value::Undef | Value::Null | Value::Bool(_) | Value::Num(_) | Value::Native(_) => {}
-            Value::BigInt(g) => t.edge(g),
-            Value::Str(g) => t.edge(g),
-            Value::Arr(g) => t.edge(g),
-            Value::Obj(g) => t.edge(g),
-            Value::Func(g) => t.edge(g),
-            Value::Cell(g) => t.edge(g),
-            Value::Class(c) => trace_class(c, t),
-            Value::Map(g) => t.edge(g),
-            Value::Set(g) => t.edge(g),
-            Value::Bound(g) => t.edge(g),
-            Value::Symbol(g) => t.edge(g),
-            Value::Gen(g) => t.edge(g),
-            Value::Promise(g) => t.edge(g),
-            Value::Iter(g) => t.edge(g),
-            Value::Regex(g) => t.edge(g),
-            Value::Accessor(g) => t.edge(g),
+        // Every `Gc` variant's payload is its box (see `Value::gc_header`):
+        // one tag test, no match.
+        if let Some(h) = self.gc_header() {
+            (t.visit)(h);
+        } else if let Value::Class(c) = self {
+            trace_class(c, t);
         }
     }
 }
@@ -87,7 +75,9 @@ impl Trace for Object {
         self.inline_slots().len() * size_of::<Value>()
     }
     fn trace(&self, t: &mut Tracer) {
-        trace_shape(&self.shape(), t);
+        // Borrowed: cloning the `Rc` would cost a count update per object
+        // per collector pass (which skips shapes anyway).
+        trace_shape(self.shape_ref(), t);
         for v in self.inline_slots().iter().chain(self.spilled()) {
             v.trace(t);
         }

@@ -584,3 +584,10 @@ Not part of the brief, listed because they surfaced.
   no longer copy arguments into a vector); the interpreter collects call
   arguments in a `SmallVec` (inline up to four). Json −15%, Storage −11%
   typed; Json −8%, Storage −6% untyped.
+- P4 (part 1): tracing an object no longer clones its shape's `Rc`;
+  collector passes visit children directly instead of copying them into
+  a vector; `Value::trace` is one tag test. CD −8%, Havlak −4%,
+  DeltaBlue −2%. The trigger threshold was already close to the best
+  fixed setting for Havlak and DeltaBlue (measured at 50K, 200K, 1M
+  candidates), so the remaining cost is the tracing work itself; parts
+  2–3 (fewer candidates, heap-size-aware trigger) remain open.

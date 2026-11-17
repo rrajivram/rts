@@ -96,12 +96,12 @@ pub fn wanted() -> bool {
     s.roots.len() >= s.threshold
 }
 
-/// The children of a box, skipping acyclic ones.
-fn children(p: NonNull<Header>, out: &mut Vec<NonNull<Header>>) {
-    out.clear();
+/// Visit the children of a box, skipping acyclic ones.
+#[inline]
+fn each_child(p: NonNull<Header>, mut f: impl FnMut(NonNull<Header>)) {
     let mut visit = |c: NonNull<Header>| {
         if !unsafe { c.as_ref() }.has(flag::ACYCLIC) {
-            out.push(c);
+            f(c);
         }
     };
     trace_header(p, &mut Tracer { visit: &mut visit, shared: false });
@@ -114,7 +114,6 @@ pub fn collect() {
     let start = Instant::now();
     let s = st();
     let roots = std::mem::take(&mut s.roots);
-    let mut kids = Vec::new();
     let mut stack: Vec<NonNull<Header>> = Vec::new();
 
     // 1. Mark gray from each live purple candidate; drop the others.
@@ -147,15 +146,14 @@ pub fn collect() {
         set_color(h, GRAY);
         stack.push(p);
         while let Some(n) = stack.pop() {
-            children(n, &mut kids);
-            for &c in &kids {
+            each_child(n, |c| {
                 let ch = unsafe { c.as_ref() };
                 ch.rc.set(ch.rc.get() - 1);
                 if color(ch) != GRAY {
                     set_color(ch, GRAY);
                     stack.push(c);
                 }
-            }
+            });
         }
     }
 
@@ -172,20 +170,18 @@ pub fn collect() {
                 set_color(h, BLACK);
                 black.push(n);
                 while let Some(m) = black.pop() {
-                    children(m, &mut kids);
-                    for &c in &kids {
+                    each_child(m, |c| {
                         let ch = unsafe { c.as_ref() };
                         ch.rc.set(ch.rc.get() + 1);
                         if color(ch) != BLACK {
                             set_color(ch, BLACK);
                             black.push(c);
                         }
-                    }
+                    });
                 }
             } else {
                 set_color(h, WHITE);
-                children(n, &mut kids);
-                stack.extend_from_slice(&kids);
+                each_child(n, |c| stack.push(c));
             }
         }
     }
@@ -203,8 +199,7 @@ pub fn collect() {
                 set_color(h, BLACK);
                 h.set(flag::MARK); // "in the garbage set", until freed
                 garbage.push(n);
-                children(n, &mut kids);
-                stack.extend_from_slice(&kids);
+                each_child(n, |c| stack.push(c));
             }
         }
     }
@@ -213,13 +208,12 @@ pub fn collect() {
     // subtracted. The garbage values are about to be dropped normally, which
     // subtracts those edges again, so restore them first.
     for &p in &garbage {
-        children(p, &mut kids);
-        for &c in &kids {
+        each_child(p, |c| {
             let ch = unsafe { c.as_ref() };
             if !ch.has(flag::MARK) {
                 ch.rc.set(ch.rc.get() + 1);
             }
-        }
+        });
     }
     // Free them: first pin every white box (so the references between them,
     // released while their values drop, can't free a box twice), then drop

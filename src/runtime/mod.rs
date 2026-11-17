@@ -394,7 +394,7 @@ impl Object {
     }
     /// The shape. Valid until the object's keys or prototype change.
     #[inline(always)]
-    fn shape_ref(&self) -> &Shape {
+    pub(crate) fn shape_ref(&self) -> &Shape {
         unsafe { &**self.shape.get() }
     }
     pub fn shape(&self) -> Rc<Shape> {
@@ -670,7 +670,7 @@ impl Value {
 
     /// The box header of a `Gc` variant.
     #[inline(always)]
-    fn gc_header(&self) -> Option<std::ptr::NonNull<heap::Header>> {
+    pub(crate) fn gc_header(&self) -> Option<std::ptr::NonNull<heap::Header>> {
         let t = self.tag();
         if t >= TAG_FIRST_GC && t != TAG_CLASS && t != TAG_NATIVE {
             // SAFETY: `repr(C, u8)` puts every payload at offset 8, and a
