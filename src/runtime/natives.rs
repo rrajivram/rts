@@ -482,7 +482,7 @@ pub fn json_stringify(v: &Value, indent: &str, cur: &str, out: &mut String) -> b
             }
             out.push(']');
         }
-        Value::Obj(o) if o.class.as_ref().is_some_and(|c| &*c.name == "Date") => match o.get("t") {
+        Value::Obj(o) if o.class().is_some_and(|c| &*c.name == "Date") => match o.get("t") {
             Some(Value::Num(t)) if t.is_finite() => json_quote(&iso_time(t), out),
             _ => out.push_str("null"),
         },
@@ -557,7 +557,7 @@ fn json_needs_prepare(args: &[Value]) -> bool {
         match v {
             Value::Obj(o) => {
                 o.get("toJSON").is_some()
-                    || o.class.as_ref().is_some_and(|c| c.methods.contains_key("toJSON") && &*c.name != "Date")
+                    || o.class().is_some_and(|c| c.methods.contains_key("toJSON") && &*c.name != "Date")
                     || o.keys().iter().any(|k| o.get(k).is_some_and(|x| has_to_json(&x, depth + 1)))
             }
             Value::Arr(a) => a.to_vec().iter().any(|x| has_to_json(x, depth + 1)),
@@ -612,7 +612,7 @@ fn json_prepare(vm: &mut Vm, holder: &Value, key: Value, v: Value, replacer: &Va
                     vals.push(x);
                 }
             }
-            Value::Obj(Object::new(Shape::new(keys), vals, None))
+            Value::Obj(Object::new(Shape::new(keys), vals))
         }
         Value::Undef | Value::Func(_) | Value::Native(_) | Value::Bound(_) => return Ok(None),
         _ => v.clone(),
@@ -706,7 +706,7 @@ impl JsonParser<'_> {
                         }
                     }
                 }
-                Ok(Value::Obj(Object::new(Shape::new(keys), vals, None)))
+                Ok(Value::Obj(Object::new(Shape::new(keys), vals)))
             }
             b'[' => {
                 self.i += 1;
@@ -1367,7 +1367,6 @@ pub fn call_native(vm: &mut Vm, n: Native, this: Value, args: &[Value]) -> NResu
             Value::Obj(Object::new(
                 Shape::new(names.iter().map(|n| Rc::from(*n)).collect()),
                 fns.iter().map(|f| Value::Native(*f)).collect(),
-                None,
             ))
         }
         ArrReverse => {
@@ -1615,7 +1614,7 @@ pub fn call_native(vm: &mut Vm, n: Native, this: Value, args: &[Value]) -> NResu
         }
         ObjFreeze => arg(args, 0),
         ObjFromEntries => {
-            let o = Object::new(Shape::new(vec![]), vec![], None);
+            let o = Object::new(Shape::new(vec![]), vec![]);
             for e in iterate(vm, &arg(args, 0))? {
                 if let Value::Arr(ref p) = e {
                     o.set(&p.get(0).to_js_string().s.clone().into(), p.get(1));
@@ -1626,7 +1625,7 @@ pub fn call_native(vm: &mut Vm, n: Native, this: Value, args: &[Value]) -> NResu
         JsonStringify if json_needs_prepare(args) => {
             // A replacer or toJSON methods: build the value to serialize first.
             let replacer = arg(args, 1);
-            let root = Value::Obj(Object::new(Shape::new(vec!["".into()]), vec![arg(args, 0)], None));
+            let root = Value::Obj(Object::new(Shape::new(vec!["".into()]), vec![arg(args, 0)]));
             let v = json_prepare(vm, &root, Value::str(""), arg(args, 0), &replacer, 0)?;
             let mut rest = args.to_vec();
             rest[0] = v.unwrap_or(Value::Undef);
@@ -1658,7 +1657,7 @@ pub fn call_native(vm: &mut Vm, n: Native, this: Value, args: &[Value]) -> NResu
             p.ws();
             match v {
                 Ok(v) if p.i == p.b.len() && is_callable_value(&arg(args, 1)) => {
-                    let root = Value::Obj(Object::new(Shape::new(vec!["".into()]), vec![v.clone()], None));
+                    let root = Value::Obj(Object::new(Shape::new(vec!["".into()]), vec![v.clone()]));
                     json_revive(vm, &root, Value::str(""), &arg(args, 1))?
                 }
                 Ok(v) if p.i == p.b.len() => v,
@@ -1846,7 +1845,7 @@ pub fn call_native(vm: &mut Vm, n: Native, this: Value, args: &[Value]) -> NResu
             let n = arg(args, 0).to_number() as usize;
             let cooked = Array::new_val(args[1..1 + n].to_vec());
             let raw = Value::Arr(Array::new_val(args[1 + n..].to_vec()));
-            *cooked.props.borrow_mut() = Some(Object::new(Shape::new(vec!["raw".into()]), vec![raw], None));
+            *cooked.props.borrow_mut() = Some(Object::new(Shape::new(vec!["raw".into()]), vec![raw]));
             Value::Arr(cooked)
         }
         ObjRest => {
@@ -1862,7 +1861,7 @@ pub fn call_native(vm: &mut Vm, n: Native, this: Value, args: &[Value]) -> NResu
                 vals.push(get_dyn(&src, &k));
                 keys.push(Rc::<str>::from(&*ks.s));
             }
-            Value::Obj(Object::new(Shape::new(keys), vals, None))
+            Value::Obj(Object::new(Shape::new(keys), vals))
         }
         ObjDefineAccessor => {
             // (object, name, getter, setter): merge with an existing accessor.
@@ -1952,10 +1951,10 @@ fn regex_replace(vm: &mut Vm, re: &Gc<regexp::RegExp>, s: &Gc<JsStr>, rep: &Valu
 fn deep_clone(v: &Value) -> Value {
     match v {
         Value::Arr(a) => Value::Arr(make_array(a.to_vec().iter().map(deep_clone).collect())),
-        Value::Obj(o) if o.class.is_none() => {
+        Value::Obj(o) if o.class().is_none() => {
             let keys = o.keys();
             let vals = keys.iter().map(|k| deep_clone(&o.get(k).unwrap_or(Value::Undef))).collect();
-            Value::Obj(Object::new(Shape::new(keys), vals, None))
+            Value::Obj(Object::new(Shape::new(keys), vals))
         }
         Value::Map(m) => {
             let copy: IndexMap<HKey, Value, rustc_hash::FxBuildHasher> = m.borrow().iter().map(|(k, x)| (HKey(deep_clone(&k.0)), deep_clone(x))).collect();
@@ -2082,7 +2081,7 @@ pub fn set_dyn(o: &Value, k: &Value, v: Value) -> bool {
             let key: Rc<str> = (&*k.to_js_string().s).into();
             let key: Rc<str> = if &*key == "prototype" { crate::vm::PROTOTYPE_KEY.into() } else { key };
             let mut props = f.props.borrow_mut();
-            props.get_or_insert_with(|| Object::new(Shape::new(vec![]), vec![], None)).set(&key, v);
+            props.get_or_insert_with(|| Object::new(Shape::new(vec![]), vec![])).set(&key, v);
             true
         }
         Value::Regex(r) if &*k.to_js_string().s == "lastIndex" => {

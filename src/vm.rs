@@ -244,11 +244,10 @@ pub(crate) fn dyn_bitnot(v: &Value) -> Value {
 }
 
 /// The class method a by-name call site reaches on an instance (not
-/// shadowed by an own property), through the site's cache (same shape and
-/// class as last time: same method).
-fn class_method(site: &PropertySite, o: &Object, cls: &Rc<ClassRt>) -> Option<u32> {
-    if let Some((sh, c, fi)) = &*site.cache.method.borrow()
-        && Rc::ptr_eq(c, cls)
+/// shadowed by an own property), through the site's cache (same shape,
+/// hence same class, as last time: same method).
+fn class_method(site: &PropertySite, o: &Object, cls: &ClassRt) -> Option<u32> {
+    if let Some((sh, fi)) = &*site.cache.method.borrow()
         && o.has_shape(sh)
     {
         return Some(*fi);
@@ -257,7 +256,7 @@ fn class_method(site: &PropertySite, o: &Object, cls: &Rc<ClassRt>) -> Option<u3
         return None;
     }
     let fi = cls.find_method(&site.name)?;
-    *site.cache.method.borrow_mut() = Some((o.shape(), cls.clone(), fi));
+    *site.cache.method.borrow_mut() = Some((o.shape(), fi));
     Some(fi)
 }
 
@@ -403,7 +402,7 @@ impl Vm {
         let exe = std::env::current_exe().map(|p| p.to_string_lossy().into_owned()).unwrap_or_else(|_| "rts".into());
         let mut argv = vec![Value::str(exe.clone())];
         argv.extend(self.args.iter().map(|a| Value::str(a.as_str())));
-        let obj = |keys: &[&str], vals: Vec<Value>| Value::Obj(Object::new(Shape::new(keys.iter().map(|k| Rc::from(*k)).collect()), vals, None));
+        let obj = |keys: &[&str], vals: Vec<Value>| Value::Obj(Object::new(Shape::new(keys.iter().map(|k| Rc::from(*k)).collect()), vals));
         let stdout = obj(&["write", "isTTY", "columns"], vec![Value::Native(Native::StdoutWrite), Value::Bool(false), Value::Num(80.0)]);
         let stderr = obj(&["write", "isTTY"], vec![Value::Native(Native::StderrWrite), Value::Bool(false)]);
         let env = call_native(self, Native::EnvObject, Value::Undef, &[]).unwrap_or(Value::Undef);
@@ -458,7 +457,7 @@ impl Vm {
         };
         let class = self.prog.classes[cid as usize].clone();
         let n = class.shape.keys.len();
-        let obj = Object::new(class.shape.clone(), vec![Value::Undef; n], Some(class.clone()));
+        let obj = Object::new(class.shape.clone(), vec![Value::Undef; n]);
         obj.set(&"message".into(), Value::str(msg));
         obj.set(&"name".into(), Value::Str(JsStr::new(&*class.name)));
         obj.set(&"stack".into(), Value::str(""));
@@ -602,8 +601,8 @@ impl Vm {
     /// `recv.<method in vtable slot>(…)`, as `CallTarget::Method`.
     pub(crate) fn jit_call_vslot(&mut self, slot: u32, recv: Value, args: &[Value]) -> Result<Value, Value> {
         match &recv {
-            Value::Obj(o) if o.class.is_some() => {
-                let fi = o.class.as_ref().unwrap().vtable[slot as usize];
+            Value::Obj(o) if o.class().is_some() => {
+                let fi = o.class().unwrap().vtable[slot as usize];
                 self.jit_call_func(fi, recv, args)
             }
             v => {
@@ -616,7 +615,7 @@ impl Vm {
     /// `recv.name(…)` with the method looked up by name, as `CallTarget::Property`.
     pub(crate) fn jit_call_named(&mut self, site: &PropertySite, recv: Value, args: &[Value]) -> Result<Value, Value> {
         if let Value::Obj(o) = &recv
-            && let Some(cls) = &o.class
+            && let Some(cls) = o.class()
         {
             if let Some(fi) = class_method(site, o, cls) {
                 return self.jit_call_func(fi, recv, args);
@@ -1118,8 +1117,8 @@ impl Vm {
                 }
             },
             CallTarget::Method { slot, .. } => match this.as_deref() {
-                Some(Value::Obj(o)) if o.class.is_some() => {
-                    let fi = o.class.as_ref().unwrap().vtable[*slot as usize];
+                Some(Value::Obj(o)) if o.class().is_some() => {
+                    let fi = o.class().unwrap().vtable[*slot as usize];
                     (self.code(fi), None)
                 }
                 Some(v) => {
@@ -1133,7 +1132,7 @@ impl Vm {
                 let recv = this_counted(&this);
                 // Method inline cache: same shape and class as last time → same method.
                 if let Value::Obj(o) = &recv
-                    && let Some(cls) = &o.class
+                    && let Some(cls) = o.class()
                 {
                     if let Some(fi) = class_method(site, o, cls) {
                         break 'prop (self.code(fi), None);
@@ -1279,7 +1278,7 @@ impl Vm {
                 if let Some(v) = o.get_chain(name) {
                     return Ok(v);
                 }
-                if let Some(fi) = o.class.as_ref().and_then(|c| c.find_method(name)) {
+                if let Some(fi) = o.class().and_then(|c| c.find_method(name)) {
                     return Ok(Value::Func(Gc::new(Closure { func: fi, caps: Box::new([]), props: Default::default() })));
                 }
                 Ok(method_by_name(recv, name).map_or(Value::Undef, Value::Native))
@@ -1298,7 +1297,7 @@ impl Vm {
 
     /// The getter or setter function for an accessor property, if the class has one.
     fn accessor(o: &Object, kind: &str, name: &str) -> Option<u32> {
-        let c = o.class.as_ref()?;
+        let c = o.class()?;
         let key = format!("{kind} {name}");
         c.methods.get(key.as_str()).copied()
     }
@@ -1319,8 +1318,8 @@ impl Vm {
                     return self.read_accessor(x, recv);
                 }
                 if name == "constructor" {
-                    return Ok(match &o.class {
-                        Some(c) => Value::Class(c.clone()),
+                    return Ok(match o.shape_ref().class_rc() {
+                        Some(c) => Value::Class(c),
                         None => Value::Undef,
                     });
                 }
@@ -1420,7 +1419,7 @@ impl Vm {
         if let Value::Obj(o) = v {
             let user = match o.get_chain("toString") {
                 Some(f) => Some(f),
-                None => match &o.class {
+                None => match o.class() {
                     Some(_) => self.lookup_method(v, "toString").ok().filter(|f| matches!(f, Value::Func(_))),
                     None => None,
                 },
@@ -1910,7 +1909,7 @@ impl Vm {
                         let r = match &value!(o) {
                             Value::Obj(ob) => {
                                 let key = value!(k).to_js_string();
-                                ob.get_chain(&key.s).is_some() || ob.class.as_ref().is_some_and(|c| c.find_method(&key.s).is_some())
+                                ob.get_chain(&key.s).is_some() || ob.class().is_some_and(|c| c.find_method(&key.s).is_some())
                             }
                             Value::Arr(a) => as_index(&value!(k)).is_some_and(|i| i < a.len()) || value!(k).to_display() == "length",
                             other => {
@@ -1921,7 +1920,7 @@ impl Vm {
                         scalar!(d) = r as u64
                     }
                     Instruction::InstanceOf { output, value, class } => {
-                        scalar!(output) = matches!(&value!(value), Value::Obj(ob) if ob.class.as_ref().is_some_and(|c| c.is_subclass_of(class)))
+                        scalar!(output) = matches!(&value!(value), Value::Obj(ob) if ob.class().is_some_and(|c| c.is_subclass_of(class)))
                             as u64
                     }
 
@@ -2235,7 +2234,7 @@ impl Vm {
 
                     Instruction::NewObject { output, shape } => {
                         let sh = self.prog.shapes[shape as usize].clone();
-                        value!(output) = Value::Obj(Object::blank(sh, None))
+                        value!(output) = Value::Obj(Object::blank(sh))
                     }
                     Instruction::SpreadIntoObject { object, source } => {
                         let src = value!(source).clone();
@@ -2342,7 +2341,7 @@ impl Vm {
                     }
                     Instruction::NewInstance { output, class } => {
                         let c = self.prog.classes[class as usize].clone();
-                        value!(output) = Value::Obj(Object::blank(c.shape.clone(), Some(c)))
+                        value!(output) = Value::Obj(Object::blank(c.shape.clone()))
                     }
                     Instruction::LoadClass { output, class } => value!(output) = Value::Class(self.prog.classes[class as usize].clone()),
 

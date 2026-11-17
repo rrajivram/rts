@@ -134,7 +134,7 @@ thread_local! {
 /// `{ value, done }`
 pub fn iter_result(value: Value, done: bool) -> Value {
     let sh = ITER_SHAPE.with(|s| s.clone());
-    Value::Obj(Object::new(sh, vec![value, Value::Bool(done)], None))
+    Value::Obj(Object::new(sh, vec![value, Value::Bool(done)]))
 }
 
 impl Vm {
@@ -711,7 +711,7 @@ impl Vm {
             (CombineKind::Any, false) => return self.resolve_promise(&agg.result, value),
             (CombineKind::AllSettled, _) => {
                 let (status, key) = if rejected { ("rejected", "reason") } else { ("fulfilled", "value") };
-                let o = Object::new(Shape::new(vec!["status".into(), key.into()]), vec![Value::str(status), value], None);
+                let o = Object::new(Shape::new(vec!["status".into(), key.into()]), vec![Value::str(status), value]);
                 agg.values.borrow_mut()[index] = Value::Obj(o);
             }
             _ => agg.values.borrow_mut()[index] = value,
@@ -1049,7 +1049,7 @@ pub fn call_task_native(vm: &mut Vm, n: Native, this: Value, args: &[Value]) -> 
             let p = Promise::new();
             let (res, rej) = vm.resolving_functions(&p);
             let sh = Shape::new(vec!["promise".into(), "resolve".into(), "reject".into()]);
-            Value::Obj(Object::new(sh, vec![Value::Promise(p), res, rej], None))
+            Value::Obj(Object::new(sh, vec![Value::Promise(p), res, rej]))
         }
         SetTimeout | SetInterval | SetImmediate => {
             let f = arg(0);
@@ -1168,16 +1168,16 @@ impl Vm {
             Instruction::NewInstanceIn { class, output, up } => {
                 let c = self.prog.classes[class as usize].clone();
                 let o = match self.alloc_region(fi, up) {
-                    Some(i) => Object::blank_in(c.shape.clone(), Some(c), &self.regions[i].arena),
-                    None => Object::blank(c.shape.clone(), Some(c)),
+                    Some(i) => Object::blank_in(c.shape.clone(), &self.regions[i].arena),
+                    None => Object::blank(c.shape.clone()),
                 };
                 self.values[vb + output.index()] = Value::Obj(o);
             }
             Instruction::NewObjectIn { shape, output, up } => {
                 let sh = self.prog.shapes[shape as usize].clone();
                 let o = match self.alloc_region(fi, up) {
-                    Some(i) => Object::blank_in(sh, None, &self.regions[i].arena),
-                    None => Object::blank(sh, None),
+                    Some(i) => Object::blank_in(sh, &self.regions[i].arena),
+                    None => Object::blank(sh),
                 };
                 self.values[vb + output.index()] = Value::Obj(o);
             }
@@ -1254,9 +1254,9 @@ pub fn func_prototype(f: &Gc<Closure>) -> Gc<Object> {
     {
         return o.clone();
     }
-    let proto = Object::new(Shape::prototype_of(Value::Func(f.clone())), vec![], None);
+    let proto = Object::new(Shape::prototype_of(Value::Func(f.clone())), vec![]);
     let mut props = f.props.borrow_mut();
-    props.get_or_insert_with(|| Object::new(Shape::new(vec![]), vec![], None)).set(&Rc::from(PROTOTYPE_KEY), Value::Obj(proto.clone()));
+    props.get_or_insert_with(|| Object::new(Shape::new(vec![]), vec![])).set(&Rc::from(PROTOTYPE_KEY), Value::Obj(proto.clone()));
     proto
 }
 
@@ -1266,13 +1266,13 @@ impl Vm {
     pub fn construct(&mut self, f: &Value, args: Vec<Value>) -> Result<Value, Value> {
         match f {
             Value::Class(c) => {
-                let o = Value::Obj(Object::blank(c.shape.clone(), Some(c.clone())));
+                let o = Value::Obj(Object::blank(c.shape.clone()));
                 self.call_fid(c.ctor, o.clone(), &args)?;
                 Ok(o)
             }
             Value::Func(cl) => {
                 let proto = func_prototype(cl);
-                let o = Value::Obj(Object::new(Shape::with_proto(proto), vec![], None));
+                let o = Value::Obj(Object::new(Shape::with_proto(proto), vec![]));
                 let r = self.call(f, o.clone(), args)?;
                 Ok(match r {
                     Value::Undef | Value::Null | Value::Bool(_) | Value::Num(_) | Value::Str(_) | Value::BigInt(_) | Value::Symbol(_) => o,
@@ -1293,7 +1293,7 @@ impl Vm {
     pub fn instance_of(&mut self, x: &Value, f: &Value) -> Result<bool, Value> {
         match f {
             Value::Class(c) => Ok(match x {
-                Value::Obj(o) => o.class.as_ref().is_some_and(|k| k.is_subclass_of(c.id)),
+                Value::Obj(o) => o.class().is_some_and(|k| k.is_subclass_of(c.id)),
                 _ => false,
             }),
             Value::Func(cl) => {

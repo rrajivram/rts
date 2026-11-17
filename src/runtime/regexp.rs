@@ -242,14 +242,13 @@ pub fn match_array(re: &RegExp, s: &Gc<JsStr>, m: &Match) -> Value {
                 vals.push(m.groups[i].map_or(Value::Undef, |(a, b)| Value::str(&s.s[a..b])));
             }
         }
-        Value::Obj(Object::new(Shape::new_null_proto(keys), vals, None))
+        Value::Obj(Object::new(Shape::new_null_proto(keys), vals))
     } else {
         Value::Undef
     };
     let props = Object::new(
         Shape::new(vec!["index".into(), "input".into(), "groups".into()]),
         vec![Value::Num(index as f64), Value::Str(s.clone()), groups],
-        None,
     );
     *arr.props.borrow_mut() = Some(props);
     Value::Arr(arr)

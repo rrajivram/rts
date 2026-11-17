@@ -609,3 +609,14 @@ Not part of the brief, listed because they surfaced.
   allocating a throwaway closure (`Vm::call_fid`/`call_function`, used by
   getters, setters, constructors and compiled code's calls); leftover
   placeholders, a dead block and a misplaced doc comment removed. Havlak −5%.
+- P7 (part 1): an object is two pointers (shape, optional boxed spill
+  vector); its class is its shape's (a non-counted pointer set on each
+  class's instance shape and carried along transitions), and its inline
+  slot count sits in the box header's upper flag bits. Header before the
+  first field 64 → 32 bytes; a two-field instance 96 → 64 bytes; one
+  count update fewer per object. By-name method caches (interpreter and
+  compiled) key on the shape alone. Havlak peak heap −13%, bytes
+  allocated −8%, time −2.5%; CD −2.9%; others within ±1.2%. Parts 2–3
+  (uncounted program-owned shapes, small arrays inline) remain open.
+  Under `RTS_CC_THRESHOLD=1` typed Havlak takes ~865 s, before and
+  after, past `compare.sh`'s 600 s limit; it completes and verifies.

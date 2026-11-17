@@ -97,6 +97,8 @@ pub(super) struct Layout {
     str_bytes: Option<(i32, i32)>,
     tag_str: i64,
     arr: Option<ArrLayout>,
+    /// An object's class pointer, from the bits of its shape's `Rc`.
+    shape_class: i32,
 }
 
 impl Layout {
@@ -107,7 +109,7 @@ impl Layout {
             tag_null: t(Value::Null),
             tag_bool: t(Value::Bool(false)),
             tag_num: t(Value::Num(0.0)),
-            tag_obj: t(Value::Obj(Object::new(crate::runtime::Shape::new(vec![]), vec![], None))),
+            tag_obj: t(Value::Obj(Object::new(crate::runtime::Shape::new(vec![]), vec![]))),
             tag_arr: t(Value::Arr(crate::runtime::Array::new_num(vec![]))),
             tag_func: t(Value::Func(Gc::new(Closure { func: 0, caps: Box::new([]), props: Default::default() }))),
             tag_first_gc: t(Value::BigInt(Gc::new(0))),
@@ -126,6 +128,11 @@ impl Layout {
                     .map(|i| ((at + 8 * i) as i32, (at + 8 * (1 - i)) as i32))
             },
             tag_str: t(Value::str("")),
+            shape_class: {
+                let s = crate::runtime::Shape::new(vec![]);
+                let bits: usize = unsafe { std::mem::transmute_copy(&s) };
+                (std::rc::Rc::as_ptr(&s) as usize - bits + crate::runtime::Shape::CLASS_OFFSET) as i32
+            },
             clo_func: (Gc::<Closure>::VALUE_OFFSET + std::mem::offset_of!(Closure, func)) as i32,
             clo_caps: {
                 // `Box<[T]>` is (pointer, length) in some order: find the pointer.
@@ -2748,9 +2755,9 @@ impl Lower<'_, '_> {
         } else {
             None
         };
-        // The receiver's class (an `Rc<ClassRt>`'s bits in the object).
-        let off = (Gc::<Object>::VALUE_OFFSET + std::mem::offset_of!(Object, class)) as i32;
-        let cls = self.b.ins().load(types::I64, mf(), this.v, off);
+        // The receiver's class (its shape's class pointer).
+        let shape = self.b.ins().load(types::I64, mf(), this.v, Object::SHAPE_OFFSET as i32);
+        let cls = self.b.ins().load(types::I64, mf(), shape, self.lay.shape_class);
         let merge = self.b.create_block();
         self.b.append_block_param(merge, types::I64);
         self.b.append_block_param(merge, types::I64);
@@ -3056,13 +3063,8 @@ impl Lower<'_, '_> {
         self.b.seal_block(check);
         self.b.switch_to_block(check);
         let shape = self.b.ins().load(types::I64, mf(), this.v, Object::SHAPE_OFFSET as i32);
-        let class_off = (Gc::<Object>::VALUE_OFFSET + std::mem::offset_of!(Object, class)) as i32;
-        let cls = self.b.ins().load(types::I64, mf(), this.v, class_off);
         let cs = self.b.ins().load(types::I64, mf(), cache_v, std::mem::offset_of!(NamedCache, shape) as i32);
-        let cc = self.b.ins().load(types::I64, mf(), cache_v, std::mem::offset_of!(NamedCache, class) as i32);
-        let s_ok = self.b.ins().icmp(IntCC::Equal, shape, cs);
-        let c_ok = self.b.ins().icmp(IntCC::Equal, cls, cc);
-        let hit = self.b.ins().band(s_ok, c_ok);
+        let hit = self.b.ins().icmp(IntCC::Equal, shape, cs);
         let fast = self.b.create_block();
         self.b.ins().brif(hit, fast, &[], slow, &[]);
         self.b.seal_block(fast);
@@ -3442,12 +3444,9 @@ fn value_key(hir: &HProgram, f: FuncId) -> Option<(Vec<JV>, JV)> {
     Some((hf.params.iter().map(|p| var_jv(hir, p.var)).collect(), ret_jv(hf)?))
 }
 
-/// The bits of a class's `Rc` as an object stores them in its `class`
-/// field (`Option<Rc<ClassRt>>`, a non-null pointer when set).
+/// A class's pointer as its instances' shapes hold it.
 fn class_bits(c: &std::rc::Rc<ClassRt>) -> i64 {
-    const _: () = assert!(std::mem::size_of::<Option<std::rc::Rc<ClassRt>>>() == 8);
-    // SAFETY: an `Rc` is one pointer; reading its bits takes no count.
-    unsafe { std::mem::transmute_copy::<std::rc::Rc<ClassRt>, i64>(c) }
+    std::rc::Rc::as_ptr(c) as i64
 }
 
 pub(super) fn strip_cast(e: &HExpr) -> &HExpr {

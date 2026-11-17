@@ -14,7 +14,7 @@ fn arg(args: &[Value], i: usize) -> Value {
 }
 
 fn obj(keys: &[&str], vals: Vec<Value>) -> Value {
-    Value::Obj(Object::new(Shape::new(keys.iter().map(|k| Rc::from(*k)).collect()), vals, None))
+    Value::Obj(Object::new(Shape::new(keys.iter().map(|k| Rc::from(*k)).collect()), vals))
 }
 
 fn s(v: &Value) -> String {
@@ -195,7 +195,7 @@ pub fn call(vm: &mut Vm, n: Native, _this: Value, args: &[Value]) -> Result<Valu
                 keys.push(Rc::from(k.as_str()));
                 vals.push(Value::str(v));
             }
-            Value::Obj(Object::new(Shape::new(keys), vals, None))
+            Value::Obj(Object::new(Shape::new(keys), vals))
         }
         _ => unreachable!("not a node native: {n:?}"),
     })
@@ -447,8 +447,8 @@ pub fn deep_equal(a: &Value, b: &Value) -> bool {
             if Gc::ptr_eq(x, y) {
                 return true;
             }
-            let same_class = match (&x.class, &y.class) {
-                (Some(c), Some(d)) => Rc::ptr_eq(c, d),
+            let same_class = match (x.class(), y.class()) {
+                (Some(c), Some(d)) => std::ptr::eq(c, d),
                 (None, None) => true,
                 _ => false,
             };
@@ -630,15 +630,15 @@ pub fn call_console_object(vm: &mut Vm, n: Native, args: &[Value]) -> Result<Val
             o
         }
         ObjCreate => match arg(args, 0) {
-            Value::Null => Value::Obj(Object::new(Shape::new_null_proto(vec![]), vec![], None)),
-            Value::Obj(ref p) => Value::Obj(Object::new(Shape::with_proto(p.clone()), vec![], None)),
-            _ => Value::Obj(Object::new(Shape::new(vec![]), vec![], None)),
+            Value::Null => Value::Obj(Object::new(Shape::new_null_proto(vec![]), vec![])),
+            Value::Obj(ref p) => Value::Obj(Object::new(Shape::with_proto(p.clone()), vec![])),
+            _ => Value::Obj(Object::new(Shape::new(vec![]), vec![])),
         },
         ObjGetPrototypeOf => match arg(args, 0) {
             Value::Obj(ref o) if o.null_proto() => Value::Null,
             Value::Obj(ref o) if o.proto().is_some() => Value::Obj(o.proto().unwrap()),
-            Value::Obj(ref o) if o.class.is_some() => Value::Class(o.class.clone().unwrap()),
-            _ => Value::Obj(Object::new(Shape::new(vec![]), vec![], None)),
+            Value::Obj(ref o) if o.class().is_some() => Value::Class(o.shape_ref().class_rc().unwrap()),
+            _ => Value::Obj(Object::new(Shape::new(vec![]), vec![])),
         },
         ObjSetPrototypeOf => {
             let o = arg(args, 0);
@@ -664,7 +664,7 @@ pub fn call_console_object(vm: &mut Vm, n: Native, args: &[Value]) -> Result<Val
         ObjGroupBy => {
             let items = crate::runtime::natives::iterate(vm, &arg(args, 0))?;
             let f = arg(args, 1);
-            let out = Object::new(Shape::new_null_proto(vec![]), vec![], None);
+            let out = Object::new(Shape::new_null_proto(vec![]), vec![]);
             for (i, x) in items.into_iter().enumerate() {
                 let k = vm.call(&f, Value::Undef, vec![x.clone(), Value::Num(i as f64)])?;
                 let key: Rc<str> = (&*k.to_js_string().s).into();

@@ -81,9 +81,6 @@ impl Trace for Object {
         for v in self.inline_slots().iter().chain(self.spilled()) {
             v.trace(t);
         }
-        if let Some(c) = &self.class {
-            trace_class(c, t);
-        }
     }
 }
 

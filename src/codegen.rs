@@ -113,6 +113,7 @@ pub fn compile(hir: &HProgram, escape: &crate::escape::EscapeInfo) -> Program {
             ctor: hc.ctor,
             acyclic: hc.acyclic,
         });
+        c.shape.set_class(&c);
         out[i] = Some(c.clone());
         c
     }

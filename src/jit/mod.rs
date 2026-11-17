@@ -331,7 +331,7 @@ impl JitFn {
     #[inline]
     pub fn arg_bits(k: JV, v: &Value) -> Option<u64> {
         match (k, v) {
-            (JV::Obj, Value::Obj(o)) if o.class.is_some() => Some(o.header_ptr().as_ptr() as u64),
+            (JV::Obj, Value::Obj(o)) if o.class().is_some() => Some(o.header_ptr().as_ptr() as u64),
             (JV::Arr, Value::Arr(a)) => Some(a.header_ptr().as_ptr() as u64),
             (JV::Obj | JV::Arr | JV::Nil, Value::Null) => Some(0),
             (JV::Obj | JV::Arr | JV::Nil, Value::Undef) => Some(1),

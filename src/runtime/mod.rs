@@ -16,7 +16,7 @@ pub use trace::trace_shape;
 
 pub use heap::Gc;
 
-use std::cell::{RefCell, UnsafeCell};
+use std::cell::{Cell, RefCell, UnsafeCell};
 use std::fmt::Write as _;
 use std::hash::{Hash, Hasher};
 use std::rc::Rc;
@@ -232,6 +232,10 @@ pub struct Shape {
     /// For a function's `prototype` object: the function, which is its
     /// (non-enumerable) `constructor` property.
     pub ctor: Option<Value>,
+    /// The class of objects of this shape (null for plain objects): set on
+    /// a class's instance shape and carried along its transitions. Not
+    /// counted: classes belong to the program, which outlives its objects.
+    class: Cell<*const ClassRt>,
 }
 
 impl Shape {
@@ -258,11 +262,41 @@ impl Shape {
             null_proto,
             proto,
             ctor,
+            class: Cell::new(std::ptr::null()),
         })
+    }
+    /// A shape like this one (same class) with other keys or prototype.
+    fn derive(&self, keys: Vec<Rc<str>>, null_proto: bool, proto: Option<Gc<Object>>) -> Rc<Shape> {
+        let s = Self::make(keys, null_proto, proto, self.ctor.clone());
+        s.class.set(self.class.get());
+        s
+    }
+    /// Where `class` (a `*const ClassRt`) is within a shape.
+    pub(crate) const CLASS_OFFSET: usize = std::mem::offset_of!(Shape, class);
+    /// Make this the instance shape of `class` (once, as the program loads).
+    pub fn set_class(&self, class: &Rc<ClassRt>) {
+        self.class.set(Rc::as_ptr(class));
+    }
+    #[inline(always)]
+    pub fn class(&self) -> Option<&ClassRt> {
+        // SAFETY: set from a class the program holds for as long as it runs.
+        unsafe { self.class.get().as_ref() }
+    }
+    /// The class as a counted reference (for `Value::Class`).
+    pub fn class_rc(&self) -> Option<Rc<ClassRt>> {
+        let p = self.class.get();
+        if p.is_null() {
+            return None;
+        }
+        // SAFETY: `p` came from `Rc::as_ptr` of a class that is still alive.
+        unsafe {
+            Rc::increment_strong_count(p);
+            Some(Rc::from_raw(p))
+        }
     }
     /// The same keys with a different prototype (`Object.setPrototypeOf`).
     pub fn reproto(&self, proto: Option<Gc<Object>>, null_proto: bool) -> Rc<Shape> {
-        Self::make(self.keys.clone(), null_proto, proto, self.ctor.clone())
+        self.derive(self.keys.clone(), null_proto, proto)
     }
     pub fn lookup(&self, name: &str) -> Option<u32> {
         if self.keys.len() <= 8 {
@@ -278,7 +312,7 @@ impl Shape {
         }
         let mut keys = self.keys.clone();
         keys.push(name.clone());
-        let s = Shape::make(keys, self.null_proto, self.proto.clone(), self.ctor.clone());
+        let s = self.derive(keys, self.null_proto, self.proto.clone());
         // Big (dictionary-like) objects don't cache transitions.
         if self.keys.len() < 64 {
             self.transitions.borrow_mut().insert(name.clone(), s.clone());
@@ -288,64 +322,72 @@ impl Shape {
     pub fn without_key(&self, idx: usize) -> Rc<Shape> {
         let mut keys = self.keys.clone();
         keys.remove(idx);
-        Shape::make(keys, self.null_proto, self.proto.clone(), self.ctor.clone())
+        self.derive(keys, self.null_proto, self.proto.clone())
     }
 }
 
 /// A JavaScript object. Its first `cap` fields are stored inline, right after
 /// this struct in the same box, at fixed offsets (compiled code reads a class
-/// instance's fields with one load); any further fields go to `spill`.
+/// instance's fields with one load); any further fields go to `spill`. The
+/// class is the shape's, and `cap` is kept in the box header's upper flag
+/// bits, so the object proper is two pointers.
 ///
 /// No `RefCell`: every accessor clones a field out or swaps one in, and none
 /// holds a reference into the object across code that could change it.
 #[derive(Debug)]
 pub struct Object {
-    pub class: Option<Rc<ClassRt>>,
     shape: UnsafeCell<Rc<Shape>>,
-    /// Fields from index `cap` on.
-    spill: UnsafeCell<Vec<Value>>,
-    /// Inline slots; those past the shape's length hold `undefined`.
-    cap: u32,
+    /// Fields from index `cap` on (none: no allocation). Boxed to keep the
+    /// object two pointers long.
+    #[allow(clippy::box_collection)]
+    spill: UnsafeCell<Option<Box<Vec<Value>>>>,
 }
 
 /// Inline slots for objects whose fields aren't known in advance.
 const MIN_INLINE: usize = 4;
+/// Where the inline slot count sits in the box header's flags.
+const CAP_SHIFT: u32 = 16;
+const MAX_INLINE: usize = (u32::MAX >> CAP_SHIFT) as usize;
 
 impl Object {
-    pub fn new(shape: Rc<Shape>, vals: Vec<Value>, class: Option<Rc<ClassRt>>) -> Gc<Object> {
+    /// An object with the given fields (`vals` in `shape`'s key order).
+    pub fn new(shape: Rc<Shape>, vals: Vec<Value>) -> Gc<Object> {
         let cap = vals.len().max(MIN_INLINE);
-        Self::alloc(shape, vals, cap, class, &std::alloc::Global, 0)
+        let flags = if shape.class().is_some_and(|c| c.acyclic) { heap::flag::ACYCLIC } else { 0 };
+        Self::alloc(shape, vals, cap, &std::alloc::Global, flags)
     }
     /// A class instance (or an object literal's shell) with every field undefined.
-    pub fn blank(shape: Rc<Shape>, class: Option<Rc<ClassRt>>) -> Gc<Object> {
-        let flags = if class.as_ref().is_some_and(|c| c.acyclic) { heap::flag::ACYCLIC } else { 0 };
-        let cap = Self::blank_cap(&shape, &class);
-        Self::alloc(shape, Vec::new(), cap, class, &std::alloc::Global, flags)
+    pub fn blank(shape: Rc<Shape>) -> Gc<Object> {
+        let flags = if shape.class().is_some_and(|c| c.acyclic) { heap::flag::ACYCLIC } else { 0 };
+        let cap = Self::blank_cap(&shape);
+        Self::alloc(shape, Vec::new(), cap, &std::alloc::Global, flags)
     }
     /// A blank object allocated in a scope arena.
-    pub fn blank_in(shape: Rc<Shape>, class: Option<Rc<ClassRt>>, arena: &arena::Arena) -> Gc<Object> {
+    pub fn blank_in(shape: Rc<Shape>, arena: &arena::Arena) -> Gc<Object> {
         let mut flags = heap::flag::ARENA;
-        if class.as_ref().is_some_and(|c| c.acyclic) {
+        if shape.class().is_some_and(|c| c.acyclic) {
             flags |= heap::flag::ACYCLIC;
         }
-        let cap = Self::blank_cap(&shape, &class);
-        let g = Self::alloc(shape, Vec::new(), cap, class, arena, flags);
+        let cap = Self::blank_cap(&shape);
+        let g = Self::alloc(shape, Vec::new(), cap, arena, flags);
         arena.track(g.header_ptr());
         g
     }
-    fn blank_cap(shape: &Shape, class: &Option<Rc<ClassRt>>) -> usize {
+    fn blank_cap(shape: &Shape) -> usize {
         // Class instances get exactly their declared fields.
-        if class.is_some() { shape.keys.len() } else { shape.keys.len().max(MIN_INLINE) }
+        if shape.class().is_some() { shape.keys.len() } else { shape.keys.len().max(MIN_INLINE) }
     }
     /// Allocate with `cap` inline slots: `vals` first, then `undefined` up to
     /// the shape's length (and beyond, in unused slots).
-    fn alloc<A: std::alloc::Allocator>(shape: Rc<Shape>, vals: Vec<Value>, cap: usize, class: Option<Rc<ClassRt>>, alloc: &A, flags: u32) -> Gc<Object> {
+    fn alloc<A: std::alloc::Allocator>(shape: Rc<Shape>, vals: Vec<Value>, cap: usize, alloc: &A, flags: u32) -> Gc<Object> {
+        let cap = cap.min(MAX_INLINE);
         let n = shape.keys.len();
         debug_assert!(vals.is_empty() || vals.len() == n);
         let mut it = vals.into_iter();
         let inline: Vec<Value> = it.by_ref().take(cap).collect();
-        let spill: Vec<Value> = if n > cap { if it.len() > 0 { it.collect() } else { vec![Value::Undef; n - cap] } } else { Vec::new() };
-        let obj = Object { class, shape: UnsafeCell::new(shape), spill: UnsafeCell::new(spill), cap: cap as u32 };
+        let spill = if n > cap { Some(Box::new(if it.len() > 0 { it.collect() } else { vec![Value::Undef; n - cap] })) } else { None };
+        let obj = Object { shape: UnsafeCell::new(shape), spill: UnsafeCell::new(spill) };
+        let flags = flags | (cap as u32) << CAP_SHIFT;
         unsafe {
             Gc::new_tail_in(
                 obj,
@@ -375,12 +417,25 @@ impl Object {
     fn inline_ptr(&self) -> *mut Value {
         unsafe { (self as *const Object as *mut u8).add(size_of::<Object>()) as *mut Value }
     }
+    /// Number of inline slots (from the box header; see `alloc`).
+    #[inline(always)]
+    fn cap(&self) -> usize {
+        // SAFETY: objects live only in `Gc` boxes, behind their header.
+        let h = unsafe { &*((self as *const Object as *const u8).sub(Gc::<Object>::VALUE_OFFSET) as *const heap::Header) };
+        (h.flags.get() >> CAP_SHIFT) as usize
+    }
+    /// The class of this object, if it is a class instance.
+    #[inline(always)]
+    pub fn class(&self) -> Option<&ClassRt> {
+        self.shape_ref().class()
+    }
     #[inline(always)]
     fn slot_ptr(&self, i: usize) -> *mut Value {
-        if i < self.cap as usize {
+        let cap = self.cap();
+        if i < cap {
             unsafe { self.inline_ptr().add(i) }
         } else {
-            unsafe { (*self.spill.get()).as_mut_ptr().add(i - self.cap as usize) }
+            unsafe { (*self.spill.get()).as_mut().unwrap_unchecked().as_mut_ptr().add(i - cap) }
         }
     }
     /// Number of fields.
@@ -457,10 +512,10 @@ impl Object {
         let n = self.len();
         let s = unsafe { &*self.shape.get() }.with_key(name);
         self.set_shape_unchecked(s);
-        if n < self.cap as usize {
+        if n < self.cap() {
             self.set_slot(n, val);
         } else {
-            unsafe { (*self.spill.get()).push(val) };
+            unsafe { (*self.spill.get()).get_or_insert_default().push(val) };
         }
     }
     fn set_shape_unchecked(&self, s: Rc<Shape>) {
@@ -484,8 +539,8 @@ impl Object {
             for j in i..n - 1 {
                 self.set_slot(j, self.slot(j + 1));
             }
-            if n - 1 >= self.cap as usize {
-                let last = unsafe { (*self.spill.get()).pop() };
+            if n > self.cap() {
+                let last = unsafe { (*self.spill.get()).as_mut().and_then(|s| s.pop()) };
                 drop(last);
             } else {
                 self.set_slot(n - 1, Value::Undef);
@@ -501,10 +556,10 @@ impl Object {
     }
     /// Inline slot count (for `Trace` and `Drop`).
     pub(crate) fn inline_slots(&self) -> &[Value] {
-        unsafe { std::slice::from_raw_parts(self.inline_ptr(), self.cap as usize) }
+        unsafe { std::slice::from_raw_parts(self.inline_ptr(), self.cap()) }
     }
     pub(crate) fn spilled(&self) -> &[Value] {
-        unsafe { &*self.spill.get() }
+        unsafe { (*self.spill.get()).as_deref().map_or(&[], |v| v.as_slice()) }
     }
     /// The prototype object, if this object has one.
     pub fn proto(&self) -> Option<Gc<Object>> {
@@ -535,7 +590,7 @@ impl Object {
 
 impl Drop for Object {
     fn drop(&mut self) {
-        unsafe { std::ptr::drop_in_place(std::ptr::slice_from_raw_parts_mut(self.inline_ptr(), self.cap as usize)) }
+        unsafe { std::ptr::drop_in_place(std::ptr::slice_from_raw_parts_mut(self.inline_ptr(), self.cap())) }
     }
 }
 
@@ -719,7 +774,7 @@ impl Drop for Value {
 
 /// Checks the layout `gc_header` relies on (run by the test suite and at start-up in debug builds).
 pub fn check_value_layout() {
-    let o = Object::blank(Shape::new(vec![]), None);
+    let o = Object::blank(Shape::new(vec![]));
     let p = Gc::as_ptr(&o) as usize;
     let v = Value::Obj(o.clone());
     let h = v.gc_header().expect("Obj is a Gc variant").as_ptr() as usize;
@@ -844,7 +899,7 @@ impl Value {
                 _ => f64::NAN,
             },
             // A Date is its time value.
-            Value::Obj(o) if o.class.as_ref().is_some_and(|c| &*c.name == "Date") => match o.get("t") {
+            Value::Obj(o) if o.class().is_some_and(|c| &*c.name == "Date") => match o.get("t") {
                 Some(Value::Num(t)) => t,
                 _ => f64::NAN,
             },
@@ -893,7 +948,7 @@ impl Value {
             Value::Obj(o) => {
                 // Error-like objects print as "Name: message".
                 if let (Some(n), Some(m)) = (o.get("name"), o.get("message"))
-                    && o.class.is_some()
+                    && o.class().is_some()
                 {
                     let m = m.to_display();
                     if m.is_empty() {
@@ -1134,7 +1189,7 @@ impl Insp<'_> {
 
     fn compound(&mut self, v: &Value, depth: usize) -> String {
         if let Value::Obj(o) = v
-            && let Some(c) = &o.class
+            && let Some(c) = o.class()
             && is_error_class(c)
         {
             let s = v.to_display();
@@ -1146,7 +1201,7 @@ impl Insp<'_> {
         }
         // A Date prints as its ISO time.
         if let Value::Obj(o) = v
-            && let Some(c) = &o.class
+            && let Some(c) = o.class()
             && &*c.name == "Date"
             && let Some(Value::Num(t)) = o.get("t")
         {
@@ -1155,7 +1210,7 @@ impl Insp<'_> {
         if depth > self.max_depth {
             return match v {
                 Value::Arr(_) => "[Array]".into(),
-                Value::Obj(o) => match &o.class {
+                Value::Obj(o) => match o.class() {
                     Some(c) => format!("[{}]", c.name),
                     None => "[Object]".into(),
                 },
@@ -1193,7 +1248,7 @@ impl Insp<'_> {
                 pairs.sort_by_key(|(k, _)| task::is_symbol_key(k));
                 let out: Vec<String> = pairs.into_iter().map(|(k, x)| format!("{}: {}", key_str(k), self.value(x, depth + 1))).collect();
                 self.indent -= 2;
-                let base = match &o.class {
+                let base = match o.class() {
                     Some(c) => c.name.to_string(),
                     None if o.null_proto() => "[Object: null prototype]".to_string(),
                     None => match o.get_inherited("constructor") {
@@ -1342,7 +1397,7 @@ pub struct PropCache {
     pub entry: RefCell<Option<(Rc<Shape>, u32)>>,
     /// Method-call sites: (receiver shape, receiver class) → function index,
     /// for a name that resolves to a class method rather than an own field.
-    pub method: RefCell<Option<(Rc<Shape>, Rc<ClassRt>, u32)>>,
+    pub method: RefCell<Option<(Rc<Shape>, u32)>>,
 }
 
 #[cfg(test)]

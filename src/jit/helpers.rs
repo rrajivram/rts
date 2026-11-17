@@ -40,7 +40,7 @@ pub(super) extern "C" fn h_new(class: *const ClassRt, arena: *const Arena) -> u6
             std::rc::Rc::increment_strong_count(class);
             std::rc::Rc::from_raw(class)
         };
-        return Gc::into_header(Object::blank_in(c.shape.clone(), Some(c), unsafe { &*arena })).as_ptr() as u64;
+        return Gc::into_header(Object::blank_in(c.shape.clone(), unsafe { &*arena })).as_ptr() as u64;
     }
     #[cfg(not(feature = "gc"))]
     if crate::runtime::cycles::wanted() {
@@ -50,7 +50,7 @@ pub(super) extern "C" fn h_new(class: *const ClassRt, arena: *const Arena) -> u6
         std::rc::Rc::increment_strong_count(class);
         std::rc::Rc::from_raw(class)
     };
-    Gc::into_header(Object::blank(c.shape.clone(), Some(c))).as_ptr() as u64
+    Gc::into_header(Object::blank(c.shape.clone())).as_ptr() as u64
 }
 
 /// The slow half of a decrement (the count may reach zero, or the box may
@@ -437,15 +437,15 @@ pub(super) extern "C" fn h_call(kind: u32, a: u64, b: u64, this_t: u64, this_p: 
 }
 
 /// A by-name method call site's cache in compiled code: the receiver's
-/// shape and class (as their `Rc`s' bits) and the method's adapter. The
-/// `Rc`s are kept, so a freed shape's address can't produce a false hit.
+/// shape (its `Rc`'s bits; the shape determines the class) and the
+/// method's adapter. The `Rc` is kept, so a freed shape's address can't
+/// produce a false hit.
 #[repr(C)]
 #[derive(Default)]
 pub(super) struct NamedCache {
     pub(super) shape: u64,
-    pub(super) class: u64,
     pub(super) adapter: u64,
-    keep: Option<(std::rc::Rc<crate::runtime::Shape>, std::rc::Rc<crate::runtime::ClassRt>)>,
+    keep: Option<std::rc::Rc<crate::runtime::Shape>>,
 }
 
 /// `recv.name(…)` missing its cache (`NamedCache`): the call as `h_call`
@@ -462,7 +462,7 @@ pub(super) extern "C" fn h_call_named(site: *const crate::bytecode::PropertySite
     // A method of the receiver's class (not shadowed by an own property):
     // cache it if it has an adapter, and call it without a second lookup.
     if let Value::Obj(o) = &this
-        && let Some(cls) = &o.class
+        && let Some(cls) = o.class()
         && o.lookup(&site.name).is_none()
     {
         if let Some(fi) = cls.find_method(&site.name) {
@@ -471,9 +471,8 @@ pub(super) extern "C" fn h_call_named(site: *const crate::bytecode::PropertySite
                 let shape = o.shape();
                 let c = unsafe { &mut *cache };
                 c.shape = unsafe { std::mem::transmute_copy::<_, u64>(&shape) };
-                c.class = unsafe { std::mem::transmute_copy::<_, u64>(cls) };
                 c.adapter = ad;
-                c.keep = Some((shape, cls.clone()));
+                c.keep = Some(shape);
             }
             return give_result(nested(|vm| vm.jit_call_func(fi, this, args)));
         }
