@@ -2,13 +2,13 @@
  {
   "bench": "Bounce",
   "config": "rc",
-  "wall": 0.084503,
-  "rss": 27.09375,
-  "heap": 0.16,
+  "wall": 0.080673,
+  "rss": 26.890625,
+  "heap": 0.07,
   "pauses": 0.0,
   "pause_max": 0.0,
   "pause_total": 0.0,
-  "arena": 0.0,
+  "arena": 3000.0,
   "collected": 0.0,
   "objects": 153689.0,
   "escaped": 0.0
@@ -16,8 +16,8 @@
  {
   "bench": "Bounce",
   "config": "rc-noarena",
-  "wall": 0.083004,
-  "rss": 26.640625,
+  "wall": 0.080839,
+  "rss": 26.609375,
   "heap": 0.16,
   "pauses": 0.0,
   "pause_max": 0.0,
@@ -30,13 +30,13 @@
  {
   "bench": "Bounce",
   "config": "rc-nocc",
-  "wall": 0.08434,
-  "rss": 28.03125,
-  "heap": 0.04,
+  "wall": 0.080399,
+  "rss": 26.921875,
+  "heap": 0.07,
   "pauses": 0.0,
   "pause_max": 0.0,
   "pause_total": 0.0,
-  "arena": 0.0,
+  "arena": 3000.0,
   "collected": 0.0,
   "objects": 153689.0,
   "escaped": 0.0
@@ -44,12 +44,12 @@
  {
   "bench": "Bounce",
   "config": "gc",
-  "wall": 0.071285,
-  "rss": 49.1875,
+  "wall": 0.068227,
+  "rss": 49.46875,
   "heap": 24.66,
   "pauses": 1.0,
-  "pause_max": 7.926,
-  "pause_total": 7.926,
+  "pause_max": 5.58,
+  "pause_total": 5.58,
   "arena": 0.0,
   "collected": 153032.0,
   "objects": 153689.0,
@@ -58,25 +58,25 @@
  {
   "bench": "Bounce",
   "config": "node",
-  "wall": 0.02103,
-  "rss": 54.484375
+  "wall": 0.021623,
+  "rss": 54.453125
  },
  {
   "bench": "Bounce",
   "config": "jitless",
-  "wall": 0.546263,
-  "rss": 51.734375
+  "wall": 0.54014,
+  "rss": 51.8125
  },
  {
   "bench": "CD",
   "config": "rc",
-  "wall": 0.288074,
-  "rss": 28.34375,
-  "heap": 2.07,
+  "wall": 0.278105,
+  "rss": 29.71875,
+  "heap": 2.29,
   "pauses": 78.0,
-  "pause_max": 0.899,
-  "pause_total": 58.323,
-  "arena": 0.0,
+  "pause_max": 0.863,
+  "pause_total": 57.298,
+  "arena": 1265543.0,
   "collected": 530576.0,
   "objects": 3339159.0,
   "escaped": 0.0
@@ -84,12 +84,12 @@
  {
   "bench": "CD",
   "config": "rc-noarena",
-  "wall": 0.291391,
-  "rss": 27.765625,
+  "wall": 0.285277,
+  "rss": 28.296875,
   "heap": 2.07,
   "pauses": 78.0,
-  "pause_max": 0.928,
-  "pause_total": 59.436,
+  "pause_max": 0.873,
+  "pause_total": 56.767,
   "arena": 0.0,
   "collected": 530576.0,
   "objects": 3339159.0,
@@ -98,13 +98,13 @@
  {
   "bench": "CD",
   "config": "rc-nocc",
-  "wall": 0.245155,
-  "rss": 127.046875,
-  "heap": 98.92,
+  "wall": 0.236252,
+  "rss": 127.125,
+  "heap": 99.14,
   "pauses": 0.0,
   "pause_max": 0.0,
   "pause_total": 0.0,
-  "arena": 0.0,
+  "arena": 1265543.0,
   "collected": 0.0,
   "objects": 3339159.0,
   "escaped": 0.0
@@ -112,12 +112,12 @@
  {
   "bench": "CD",
   "config": "gc",
-  "wall": 0.215132,
-  "rss": 454.90625,
+  "wall": 0.204173,
+  "rss": 456.46875,
   "heap": 409.08,
   "pauses": 1.0,
-  "pause_max": 67.622,
-  "pause_total": 67.622,
+  "pause_max": 65.038,
+  "pause_total": 65.038,
   "arena": 0.0,
   "collected": 3338502.0,
   "objects": 3339159.0,
@@ -126,25 +126,25 @@
  {
   "bench": "CD",
   "config": "node",
-  "wall": 0.047925,
-  "rss": 69.09375
+  "wall": 0.046761,
+  "rss": 69.109375
  },
  {
   "bench": "CD",
   "config": "jitless",
-  "wall": 0.772307,
-  "rss": 60.203125
+  "wall": 0.757151,
+  "rss": 60.25
  },
  {
   "bench": "DeltaBlue",
   "config": "rc",
-  "wall": 0.121294,
-  "rss": 47.21875,
-  "heap": 20.84,
+  "wall": 0.121766,
+  "rss": 47.75,
+  "heap": 20.87,
   "pauses": 11.0,
-  "pause_max": 5.794,
-  "pause_total": 13.115,
-  "arena": 0.0,
+  "pause_max": 5.46,
+  "pause_total": 12.513,
+  "arena": 1.0,
   "collected": 48004.0,
   "objects": 1081334.0,
   "escaped": 0.0
@@ -152,12 +152,12 @@
  {
   "bench": "DeltaBlue",
   "config": "rc-noarena",
-  "wall": 0.120621,
-  "rss": 47.125,
+  "wall": 0.119273,
+  "rss": 47.546875,
   "heap": 20.84,
   "pauses": 11.0,
-  "pause_max": 5.984,
-  "pause_total": 13.208,
+  "pause_max": 5.491,
+  "pause_total": 12.46,
   "arena": 0.0,
   "collected": 48004.0,
   "objects": 1081334.0,
@@ -166,13 +166,13 @@
  {
   "bench": "DeltaBlue",
   "config": "rc-nocc",
-  "wall": 0.112818,
-  "rss": 44.234375,
-  "heap": 18.99,
+  "wall": 0.116287,
+  "rss": 46.375,
+  "heap": 19.02,
   "pauses": 0.0,
   "pause_max": 0.0,
   "pause_total": 0.0,
-  "arena": 0.0,
+  "arena": 1.0,
   "collected": 0.0,
   "objects": 1081334.0,
   "escaped": 0.0
@@ -180,12 +180,12 @@
  {
   "bench": "DeltaBlue",
   "config": "gc",
-  "wall": 0.09559,
-  "rss": 120.734375,
+  "wall": 0.095083,
+  "rss": 121.125,
   "heap": 103.66,
   "pauses": 1.0,
-  "pause_max": 18.765,
-  "pause_total": 18.765,
+  "pause_max": 21.453,
+  "pause_total": 21.453,
   "arena": 0.0,
   "collected": 1080677.0,
   "objects": 1081334.0,
@@ -194,24 +194,24 @@
  {
   "bench": "DeltaBlue",
   "config": "node",
-  "wall": 0.036104,
-  "rss": 83.65625
+  "wall": 0.035004,
+  "rss": 88.9375
  },
  {
   "bench": "DeltaBlue",
   "config": "jitless",
-  "wall": 0.186181,
-  "rss": 78.953125
+  "wall": 0.183704,
+  "rss": 78.765625
  },
  {
   "bench": "Havlak",
   "config": "rc",
-  "wall": 0.731122,
-  "rss": 70.078125,
+  "wall": 0.714753,
+  "rss": 71.921875,
   "heap": 38.36,
   "pauses": 56.0,
-  "pause_max": 13.433,
-  "pause_total": 163.964,
+  "pause_max": 12.768,
+  "pause_total": 154.67,
   "arena": 0.0,
   "collected": 549195.0,
   "objects": 11695241.0,
@@ -220,12 +220,12 @@
  {
   "bench": "Havlak",
   "config": "rc-noarena",
-  "wall": 0.73551,
-  "rss": 73.8125,
+  "wall": 0.721045,
+  "rss": 74.875,
   "heap": 38.36,
   "pauses": 56.0,
-  "pause_max": 13.505,
-  "pause_total": 159.991,
+  "pause_max": 12.811,
+  "pause_total": 155.119,
   "arena": 0.0,
   "collected": 549195.0,
   "objects": 11695241.0,
@@ -234,8 +234,8 @@
  {
   "bench": "Havlak",
   "config": "rc-nocc",
-  "wall": 0.6254,
-  "rss": 118.9375,
+  "wall": 0.617322,
+  "rss": 119.859375,
   "heap": 91.22,
   "pauses": 0.0,
   "pause_max": 0.0,
@@ -248,12 +248,12 @@
  {
   "bench": "Havlak",
   "config": "gc",
-  "wall": 0.50946,
-  "rss": 1164.390625,
+  "wall": 0.49941,
+  "rss": 1164.203125,
   "heap": 1132.41,
   "pauses": 1.0,
-  "pause_max": 232.207,
-  "pause_total": 232.207,
+  "pause_max": 230.791,
+  "pause_total": 230.791,
   "arena": 0.0,
   "collected": 11694584.0,
   "objects": 11695241.0,
@@ -262,24 +262,24 @@
  {
   "bench": "Havlak",
   "config": "node",
-  "wall": 0.091376,
-  "rss": 132.796875
+  "wall": 0.089355,
+  "rss": 131.203125
  },
  {
   "bench": "Havlak",
   "config": "jitless",
-  "wall": 0.932189,
-  "rss": 118.0625
+  "wall": 0.917741,
+  "rss": 118.125
  },
  {
   "bench": "Json",
   "config": "rc",
-  "wall": 0.268202,
-  "rss": 27.609375,
+  "wall": 0.269931,
+  "rss": 29.046875,
   "heap": 1.48,
   "pauses": 49.0,
-  "pause_max": 0.078,
-  "pause_total": 3.224,
+  "pause_max": 0.083,
+  "pause_total": 3.168,
   "arena": 0.0,
   "collected": 0.0,
   "objects": 3417989.0,
@@ -288,12 +288,12 @@
  {
   "bench": "Json",
   "config": "rc-noarena",
-  "wall": 0.267532,
-  "rss": 29.078125,
+  "wall": 0.263959,
+  "rss": 27.671875,
   "heap": 1.48,
   "pauses": 49.0,
-  "pause_max": 0.074,
-  "pause_total": 3.149,
+  "pause_max": 0.072,
+  "pause_total": 3.159,
   "arena": 0.0,
   "collected": 0.0,
   "objects": 3417989.0,
@@ -302,8 +302,8 @@
  {
   "bench": "Json",
   "config": "rc-nocc",
-  "wall": 0.266705,
-  "rss": 27.109375,
+  "wall": 0.268095,
+  "rss": 27.296875,
   "heap": 0.7,
   "pauses": 0.0,
   "pause_max": 0.0,
@@ -316,12 +316,12 @@
  {
   "bench": "Json",
   "config": "gc",
-  "wall": 0.226456,
-  "rss": 291.34375,
+  "wall": 0.223131,
+  "rss": 293.234375,
   "heap": 231.92,
   "pauses": 1.0,
-  "pause_max": 64.254,
-  "pause_total": 64.254,
+  "pause_max": 62.278,
+  "pause_total": 62.278,
   "arena": 0.0,
   "collected": 3417332.0,
   "objects": 3417989.0,
@@ -330,25 +330,25 @@
  {
   "bench": "Json",
   "config": "node",
-  "wall": 0.029848,
-  "rss": 60.21875
+  "wall": 0.028944,
+  "rss": 60.28125
  },
  {
   "bench": "Json",
   "config": "jitless",
-  "wall": 0.354947,
-  "rss": 51.9375
+  "wall": 0.351467,
+  "rss": 51.734375
  },
  {
   "bench": "List",
   "config": "rc",
-  "wall": 0.07551,
-  "rss": 28.109375,
-  "heap": 1.14,
-  "pauses": 1.0,
-  "pause_max": 0.078,
-  "pause_total": 0.078,
-  "arena": 0.0,
+  "wall": 0.073398,
+  "rss": 26.75,
+  "heap": 0.06,
+  "pauses": 0.0,
+  "pause_max": 0.0,
+  "pause_total": 0.0,
+  "arena": 46500.0,
   "collected": 0.0,
   "objects": 47189.0,
   "escaped": 0.0
@@ -356,12 +356,12 @@
  {
   "bench": "List",
   "config": "rc-noarena",
-  "wall": 0.075634,
-  "rss": 27.1875,
+  "wall": 0.073902,
+  "rss": 27.265625,
   "heap": 1.14,
   "pauses": 1.0,
-  "pause_max": 0.079,
-  "pause_total": 0.079,
+  "pause_max": 0.086,
+  "pause_total": 0.086,
   "arena": 0.0,
   "collected": 0.0,
   "objects": 47189.0,
@@ -370,13 +370,13 @@
  {
   "bench": "List",
   "config": "rc-nocc",
-  "wall": 0.076747,
-  "rss": 26.546875,
-  "heap": 0.03,
+  "wall": 0.072885,
+  "rss": 26.84375,
+  "heap": 0.06,
   "pauses": 0.0,
   "pause_max": 0.0,
   "pause_total": 0.0,
-  "arena": 0.0,
+  "arena": 46500.0,
   "collected": 0.0,
   "objects": 47189.0,
   "escaped": 0.0
@@ -384,8 +384,8 @@
  {
   "bench": "List",
   "config": "gc",
-  "wall": 0.07289,
-  "rss": 26.765625,
+  "wall": 0.071704,
+  "rss": 26.875,
   "heap": 4.64,
   "pauses": 0.0,
   "pause_max": 0.0,
@@ -398,20 +398,20 @@
  {
   "bench": "List",
   "config": "node",
-  "wall": 0.025001,
-  "rss": 53.734375
+  "wall": 0.023764,
+  "rss": 53.625
  },
  {
   "bench": "List",
   "config": "jitless",
-  "wall": 0.340791,
-  "rss": 47.78125
+  "wall": 0.341642,
+  "rss": 47.734375
  },
  {
   "bench": "Mandelbrot",
   "config": "rc",
-  "wall": 0.021938,
-  "rss": 26.5625,
+  "wall": 0.022068,
+  "rss": 26.75,
   "heap": 0.03,
   "pauses": 0.0,
   "pause_max": 0.0,
@@ -424,8 +424,8 @@
  {
   "bench": "Mandelbrot",
   "config": "rc-noarena",
-  "wall": 0.022844,
-  "rss": 26.546875,
+  "wall": 0.022212,
+  "rss": 26.5,
   "heap": 0.03,
   "pauses": 0.0,
   "pause_max": 0.0,
@@ -438,8 +438,8 @@
  {
   "bench": "Mandelbrot",
   "config": "rc-nocc",
-  "wall": 0.022395,
-  "rss": 26.546875,
+  "wall": 0.02251,
+  "rss": 26.875,
   "heap": 0.03,
   "pauses": 0.0,
   "pause_max": 0.0,
@@ -452,8 +452,8 @@
  {
   "bench": "Mandelbrot",
   "config": "gc",
-  "wall": 0.022203,
-  "rss": 21.75,
+  "wall": 0.021854,
+  "rss": 21.71875,
   "heap": 0.03,
   "pauses": 0.0,
   "pause_max": 0.0,
@@ -466,24 +466,24 @@
  {
   "bench": "Mandelbrot",
   "config": "node",
-  "wall": 0.01846,
-  "rss": 51.96875
+  "wall": 0.018194,
+  "rss": 51.9375
  },
  {
   "bench": "Mandelbrot",
   "config": "jitless",
-  "wall": 0.275987,
-  "rss": 47.75
+  "wall": 0.274871,
+  "rss": 47.859375
  },
  {
   "bench": "NBody",
   "config": "rc",
-  "wall": 0.084814,
-  "rss": 57.140625,
+  "wall": 0.083662,
+  "rss": 57.4375,
   "heap": 30.73,
   "pauses": 1.0,
-  "pause_max": 4.27,
-  "pause_total": 4.27,
+  "pause_max": 4.344,
+  "pause_total": 4.344,
   "arena": 0.0,
   "collected": 0.0,
   "objects": 750701.0,
@@ -492,12 +492,12 @@
  {
   "bench": "NBody",
   "config": "rc-noarena",
-  "wall": 0.084612,
-  "rss": 59.6875,
+  "wall": 0.083961,
+  "rss": 57.140625,
   "heap": 30.73,
   "pauses": 1.0,
-  "pause_max": 4.243,
-  "pause_total": 4.243,
+  "pause_max": 4.035,
+  "pause_total": 4.035,
   "arena": 0.0,
   "collected": 0.0,
   "objects": 750701.0,
@@ -506,8 +506,8 @@
  {
   "bench": "NBody",
   "config": "rc-nocc",
-  "wall": 0.079901,
-  "rss": 26.53125,
+  "wall": 0.07937,
+  "rss": 26.828125,
   "heap": 0.03,
   "pauses": 0.0,
   "pause_max": 0.0,
@@ -520,12 +520,12 @@
  {
   "bench": "NBody",
   "config": "gc",
-  "wall": 0.063622,
-  "rss": 77.6875,
+  "wall": 0.063802,
+  "rss": 79.359375,
   "heap": 55.72,
   "pauses": 1.0,
-  "pause_max": 12.136,
-  "pause_total": 12.136,
+  "pause_max": 11.52,
+  "pause_total": 11.52,
   "arena": 0.0,
   "collected": 750044.0,
   "objects": 750701.0,
@@ -534,20 +534,20 @@
  {
   "bench": "NBody",
   "config": "node",
-  "wall": 0.074263,
-  "rss": 56.484375
+  "wall": 0.071837,
+  "rss": 56.515625
  },
  {
   "bench": "NBody",
   "config": "jitless",
-  "wall": 0.579803,
-  "rss": 47.890625
+  "wall": 0.567051,
+  "rss": 47.75
  },
  {
   "bench": "Permute",
   "config": "rc",
-  "wall": 0.072926,
-  "rss": 26.578125,
+  "wall": 0.071621,
+  "rss": 27.15625,
   "heap": 0.11,
   "pauses": 0.0,
   "pause_max": 0.0,
@@ -560,8 +560,8 @@
  {
   "bench": "Permute",
   "config": "rc-noarena",
-  "wall": 0.072552,
-  "rss": 26.578125,
+  "wall": 0.071714,
+  "rss": 26.390625,
   "heap": 0.11,
   "pauses": 0.0,
   "pause_max": 0.0,
@@ -574,8 +574,8 @@
  {
   "bench": "Permute",
   "config": "rc-nocc",
-  "wall": 0.072631,
-  "rss": 26.515625,
+  "wall": 0.071717,
+  "rss": 26.8125,
   "heap": 0.03,
   "pauses": 0.0,
   "pause_max": 0.0,
@@ -588,7 +588,7 @@
  {
   "bench": "Permute",
   "config": "gc",
-  "wall": 0.072354,
+  "wall": 0.071769,
   "rss": 21.75,
   "heap": 0.15,
   "pauses": 0.0,
@@ -602,24 +602,24 @@
  {
   "bench": "Permute",
   "config": "node",
-  "wall": 0.028967,
-  "rss": 51.46875
+  "wall": 0.029344,
+  "rss": 51.640625
  },
  {
   "bench": "Permute",
   "config": "jitless",
-  "wall": 0.655243,
-  "rss": 45.75
+  "wall": 0.648441,
+  "rss": 45.890625
  },
  {
   "bench": "Queens",
   "config": "rc",
-  "wall": 0.063757,
-  "rss": 30.78125,
+  "wall": 0.065245,
+  "rss": 30.0,
   "heap": 3.58,
   "pauses": 1.0,
-  "pause_max": 0.3,
-  "pause_total": 0.3,
+  "pause_max": 0.308,
+  "pause_total": 0.308,
   "arena": 0.0,
   "collected": 0.0,
   "objects": 40693.0,
@@ -628,12 +628,12 @@
  {
   "bench": "Queens",
   "config": "rc-noarena",
-  "wall": 0.063527,
-  "rss": 30.15625,
+  "wall": 0.065093,
+  "rss": 29.453125,
   "heap": 3.58,
   "pauses": 1.0,
-  "pause_max": 0.322,
-  "pause_total": 0.322,
+  "pause_max": 0.291,
+  "pause_total": 0.291,
   "arena": 0.0,
   "collected": 0.0,
   "objects": 40693.0,
@@ -642,8 +642,8 @@
  {
   "bench": "Queens",
   "config": "rc-nocc",
-  "wall": 0.06355,
-  "rss": 27.734375,
+  "wall": 0.065103,
+  "rss": 26.875,
   "heap": 0.03,
   "pauses": 0.0,
   "pause_max": 0.0,
@@ -656,12 +656,12 @@
  {
   "bench": "Queens",
   "config": "gc",
-  "wall": 0.059202,
-  "rss": 32.15625,
+  "wall": 0.061173,
+  "rss": 31.328125,
   "heap": 10.3,
   "pauses": 1.0,
-  "pause_max": 0.886,
-  "pause_total": 0.886,
+  "pause_max": 0.831,
+  "pause_total": 0.831,
   "arena": 0.0,
   "collected": 40036.0,
   "objects": 40693.0,
@@ -670,20 +670,20 @@
  {
   "bench": "Queens",
   "config": "node",
-  "wall": 0.020492,
-  "rss": 54.046875
+  "wall": 0.020462,
+  "rss": 54.078125
  },
  {
   "bench": "Queens",
   "config": "jitless",
-  "wall": 0.42024,
-  "rss": 47.671875
+  "wall": 0.416155,
+  "rss": 47.734375
  },
  {
   "bench": "Richards",
   "config": "rc",
-  "wall": 0.090749,
-  "rss": 26.5625,
+  "wall": 0.091103,
+  "rss": 27.828125,
   "heap": 0.12,
   "pauses": 0.0,
   "pause_max": 0.0,
@@ -696,8 +696,8 @@
  {
   "bench": "Richards",
   "config": "rc-noarena",
-  "wall": 0.092604,
-  "rss": 27.78125,
+  "wall": 0.088262,
+  "rss": 26.515625,
   "heap": 0.12,
   "pauses": 0.0,
   "pause_max": 0.0,
@@ -710,8 +710,8 @@
  {
   "bench": "Richards",
   "config": "rc-nocc",
-  "wall": 0.105602,
-  "rss": 26.546875,
+  "wall": 0.103101,
+  "rss": 26.90625,
   "heap": 0.12,
   "pauses": 0.0,
   "pause_max": 0.0,
@@ -724,8 +724,8 @@
  {
   "bench": "Richards",
   "config": "gc",
-  "wall": 0.068536,
-  "rss": 21.734375,
+  "wall": 0.069016,
+  "rss": 21.78125,
   "heap": 0.14,
   "pauses": 0.0,
   "pause_max": 0.0,
@@ -738,20 +738,20 @@
  {
   "bench": "Richards",
   "config": "node",
-  "wall": 0.013426,
-  "rss": 53.96875
+  "wall": 0.013199,
+  "rss": 54.0
  },
  {
   "bench": "Richards",
   "config": "jitless",
-  "wall": 0.280854,
-  "rss": 47.671875
+  "wall": 0.275151,
+  "rss": 47.78125
  },
  {
   "bench": "Sieve",
   "config": "rc",
-  "wall": 0.134188,
-  "rss": 26.734375,
+  "wall": 0.132377,
+  "rss": 27.078125,
   "heap": 0.34,
   "pauses": 0.0,
   "pause_max": 0.0,
@@ -764,8 +764,8 @@
  {
   "bench": "Sieve",
   "config": "rc-noarena",
-  "wall": 0.135288,
-  "rss": 26.875,
+  "wall": 0.133289,
+  "rss": 26.796875,
   "heap": 0.34,
   "pauses": 0.0,
   "pause_max": 0.0,
@@ -778,8 +778,8 @@
  {
   "bench": "Sieve",
   "config": "rc-nocc",
-  "wall": 0.135232,
-  "rss": 26.5625,
+  "wall": 0.133409,
+  "rss": 26.703125,
   "heap": 0.1,
   "pauses": 0.0,
   "pause_max": 0.0,
@@ -792,12 +792,12 @@
  {
   "bench": "Sieve",
   "config": "gc",
-  "wall": 0.139858,
+  "wall": 0.138924,
   "rss": 254.8125,
   "heap": 229.18,
   "pauses": 1.0,
-  "pause_max": 4.841,
-  "pause_total": 4.841,
+  "pause_max": 4.88,
+  "pause_total": 4.88,
   "arena": 0.0,
   "collected": 3032.0,
   "objects": 3689.0,
@@ -806,25 +806,25 @@
  {
   "bench": "Sieve",
   "config": "node",
-  "wall": 0.037422,
-  "rss": 56.34375
+  "wall": 0.037531,
+  "rss": 56.359375
  },
  {
   "bench": "Sieve",
   "config": "jitless",
-  "wall": 0.538367,
+  "wall": 0.533492,
   "rss": 47.59375
  },
  {
   "bench": "Storage",
   "config": "rc",
-  "wall": 0.47328,
-  "rss": 27.234375,
-  "heap": 0.83,
+  "wall": 0.386485,
+  "rss": 28.4375,
+  "heap": 0.86,
   "pauses": 0.0,
   "pause_max": 0.0,
   "pause_total": 0.0,
-  "arena": 0.0,
+  "arena": 1000.0,
   "collected": 0.0,
   "objects": 5462689.0,
   "escaped": 0.0
@@ -832,8 +832,8 @@
  {
   "bench": "Storage",
   "config": "rc-noarena",
-  "wall": 0.474348,
-  "rss": 27.171875,
+  "wall": 0.388835,
+  "rss": 27.140625,
   "heap": 0.83,
   "pauses": 0.0,
   "pause_max": 0.0,
@@ -846,13 +846,13 @@
  {
   "bench": "Storage",
   "config": "rc-nocc",
-  "wall": 0.472248,
-  "rss": 27.203125,
-  "heap": 0.83,
+  "wall": 0.383546,
+  "rss": 27.5,
+  "heap": 0.86,
   "pauses": 0.0,
   "pause_max": 0.0,
   "pause_total": 0.0,
-  "arena": 0.0,
+  "arena": 1000.0,
   "collected": 0.0,
   "objects": 5462689.0,
   "escaped": 0.0
@@ -860,12 +860,12 @@
  {
   "bench": "Storage",
   "config": "gc",
-  "wall": 0.380986,
-  "rss": 917.359375,
+  "wall": 0.292197,
+  "rss": 919.140625,
   "heap": 906.18,
   "pauses": 1.0,
-  "pause_max": 150.276,
-  "pause_total": 150.276,
+  "pause_max": 156.154,
+  "pause_total": 156.154,
   "arena": 0.0,
   "collected": 5462032.0,
   "objects": 5462689.0,
@@ -874,20 +874,20 @@
  {
   "bench": "Storage",
   "config": "node",
-  "wall": 0.036551,
-  "rss": 65.640625
+  "wall": 0.035287,
+  "rss": 65.65625
  },
  {
   "bench": "Storage",
   "config": "jitless",
-  "wall": 0.352291,
-  "rss": 59.96875
+  "wall": 0.343354,
+  "rss": 60.171875
  },
  {
   "bench": "Towers",
   "config": "rc",
-  "wall": 0.086337,
-  "rss": 27.0625,
+  "wall": 0.085971,
+  "rss": 27.40625,
   "heap": 0.92,
   "pauses": 0.0,
   "pause_max": 0.0,
@@ -900,8 +900,8 @@
  {
   "bench": "Towers",
   "config": "rc-noarena",
-  "wall": 0.086306,
-  "rss": 28.46875,
+  "wall": 0.085207,
+  "rss": 27.78125,
   "heap": 0.92,
   "pauses": 0.0,
   "pause_max": 0.0,
@@ -914,8 +914,8 @@
  {
   "bench": "Towers",
   "config": "rc-nocc",
-  "wall": 0.106177,
-  "rss": 26.484375,
+  "wall": 0.104422,
+  "rss": 27.75,
   "heap": 0.03,
   "pauses": 0.0,
   "pause_max": 0.0,
@@ -928,8 +928,8 @@
  {
   "bench": "Towers",
   "config": "gc",
-  "wall": 0.07073,
-  "rss": 22.578125,
+  "wall": 0.069604,
+  "rss": 22.625,
   "heap": 0.94,
   "pauses": 0.0,
   "pause_max": 0.0,
@@ -942,13 +942,13 @@
  {
   "bench": "Towers",
   "config": "node",
-  "wall": 0.026498,
-  "rss": 51.8125
+  "wall": 0.025815,
+  "rss": 51.71875
  },
  {
   "bench": "Towers",
   "config": "jitless",
-  "wall": 0.555005,
-  "rss": 46.125
+  "wall": 0.563082,
+  "rss": 46.0625
  }
 ]

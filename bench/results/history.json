@@ -62,5 +62,13 @@
   "rc_geomean_s": 0.1233,
   "gc_geomean_s": 0.1048,
   "jitless_geomean_s": 0.4439
+ },
+ {
+  "commit": "4d94a8f",
+  "date": "2026-11-16",
+  "step": "Native code: scope arenas; integer %",
+  "rc_geomean_s": 0.1204,
+  "gc_geomean_s": 0.1017,
+  "jitless_geomean_s": 0.439
  }
 ]
