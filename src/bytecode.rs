@@ -767,7 +767,7 @@ pub struct FunctionCode {
     /// parameters the function never reassigns. The caller's slots keep those
     /// values alive for the whole call, so the callee's copies are not counted:
     /// no increment at the call, no decrement at the return.
-    /// Native code for this function (see `jit.rs`).
+    /// Native code for this function (see `jit/`).
     pub jit: Option<Box<crate::jit::JitFn>>,
     pub borrowed: u64,
     pub constants: Vec<Value>,

@@ -326,7 +326,7 @@ the next experiments (see [Next steps](#next-steps)).
 ## Native code (in progress)
 
 Functions are compiled to machine code at start-up with
-[Cranelift](https://cranelift.dev) (`src/jit.rs`). Numbers, booleans and
+[Cranelift](https://cranelift.dev) (`src/jit/`). Numbers, booleans and
 class instances or arrays are held unboxed; any other value (`T`, strings,
 unions, `any`) as its two words (tag, payload). Bodies may use arithmetic,
 comparisons, control flow, `Math.*`, field and element access, properties by

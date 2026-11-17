@@ -546,7 +546,7 @@ impl Vm {
         Ok(std::mem::take(&mut self.native_ret))
     }
 
-    // ── entry points for compiled code (`jit.rs`) ──
+    // ── entry points for compiled code (`jit/`) ──
     //
     // Compiled code holds references the tracing GC can't see, so each of
     // these blocks it (as `call` does) while it runs.
@@ -702,7 +702,7 @@ impl Vm {
         r
     }
 
-    /// Call a function compiled to native code (`jit.rs`), if this call site
+    /// Call a function compiled to native code (`jit/`), if this call site
     /// passes exactly its parameters, as values compiled code can take.
     /// None: use the interpreter.
     #[inline(never)]
