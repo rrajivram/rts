@@ -222,7 +222,7 @@ fn dyn_num(op: NumOp, a: &Value, b: &Value) -> f64 {
         (Value::Num(x), Value::Num(y)) => (*x, *y),
         (a, b) => (a.to_number(), b.to_number()),
     };
-    if op == NumOp::Mod { fast_mod(x, y) } else { num_op(op, x, y) }
+    num_op(op, x, y)
 }
 
 /// `left op right` on two dynamic values, as a Value: numbers, or BigInts
@@ -259,11 +259,6 @@ fn dyn_compare(op: CmpOp, a: &Value, b: &Value) -> bool {
         (a, Value::BigInt(y)) => bigint::cmp_number(**y, a.to_number()).is_some_and(|o| holds(op, o.reverse())),
         (a, b) => cmp(op, a.to_number(), b.to_number()),
     }
-}
-
-/// `%` with an integer fast path (fmod is slow); same results as JS, including -0.
-fn fast_mod(x: f64, y: f64) -> f64 {
-    js_mod(x, y)
 }
 
 #[inline(always)]
@@ -1675,7 +1670,7 @@ impl Vm {
                     Instruction::Arithmetic { op: NumOp::Sub, output, left, right } => scalar!(output) = bits(number!(left) - number!(right)),
                     Instruction::Arithmetic { op: NumOp::Mul, output, left, right } => scalar!(output) = bits(number!(left) * number!(right)),
                     Instruction::Arithmetic { op: NumOp::Div, output, left, right } => scalar!(output) = bits(number!(left) / number!(right)),
-                    Instruction::Arithmetic { op: NumOp::Mod, output, left, right } => scalar!(output) = bits(fast_mod(number!(left), number!(right))),
+                    Instruction::Arithmetic { op: NumOp::Mod, output, left, right } => scalar!(output) = bits(js_mod(number!(left), number!(right))),
                     Instruction::AddConstant { output, left, constant } => scalar!(output) = bits(number!(left) + constant),
                     Instruction::Arithmetic { op, output, left, right } => scalar!(output) = bits(num_op(op, number!(left), number!(right))),
                     Instruction::Compare { op: CmpOp::Lt, output, left, right } => scalar!(output) = (number!(left) < number!(right)) as u64,

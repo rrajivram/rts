@@ -2558,61 +2558,6 @@ impl Lower<'_, '_> {
             }
             HStmt::Loop { label, .. } => self.loop_stmt(s, label.clone()),
             HStmt::Labeled(name, s) if matches!(&**s, HStmt::Loop { label: None, .. }) => self.loop_stmt(s, Some(name.clone())),
-            _ => self.stmt2(s),
-        }
-    }
-
-    /// `while`/`for`/`do` (`label` names it).
-    fn loop_stmt(&mut self, s: &HStmt, label: Option<Name>) {
-        let HStmt::Loop { test, body, update, test_after, fresh, .. } = s else { unreachable!() };
-        {
-            {
-                let (tb, bb, ub, xb) = (self.b.create_block(), self.b.create_block(), self.b.create_block(), self.b.create_block());
-                self.b.ins().jump(if *test_after { bb } else { tb }, &[]);
-                self.b.switch_to_block(tb);
-                match test {
-                    Some(t) => {
-                        let cv = self.truthy(t);
-                        self.b.ins().brif(cv, bb, &[], xb, &[]);
-                    }
-                    None => {
-                        self.b.ins().jump(bb, &[]);
-                    }
-                }
-                self.b.switch_to_block(bb);
-                self.loops.push(LoopT { label: label.clone(), brk: xb, cont: Some(ub), switch: false, regions: self.regions.len() });
-                self.stmts(body);
-                self.loops.pop();
-                self.b.ins().jump(ub, &[]);
-                self.b.switch_to_block(ub);
-                self.b.seal_block(ub);
-                // Each iteration's closures keep their own copy of a captured loop variable.
-                for v in fresh {
-                    if let Some(x) = self.cells.get(v).copied() {
-                        let old = self.b.use_var(x);
-                        let r = self.load_slot(old, self.lay.cell_value, JV::Val, [0; 3]);
-                        self.inc_rv(r);
-                        let call = self.b.ins().call(self.h.new_cell, &[]);
-                        let c = self.b.inst_results(call)[0];
-                        self.b.def_var(x, c);
-                        self.store_slot(c, self.lay.cell_value, JV::Val, r);
-                        self.dec(old);
-                    }
-                }
-                if let Some(u) = update {
-                    self.discard(u);
-                }
-                self.b.ins().jump(tb, &[]);
-                self.b.seal_block(tb);
-                self.b.seal_block(bb);
-                self.b.seal_block(xb);
-                self.b.switch_to_block(xb);
-            }
-        }
-    }
-
-    fn stmt2(&mut self, s: &HStmt) {
-        match s {
             HStmt::Labeled(name, s) if matches!(&**s, HStmt::ForOf { .. }) => self.for_of(s, Some(name.clone())),
             HStmt::Labeled(name, s) if !matches!(&**s, HStmt::Loop { .. }) => {
                 let xb = self.b.create_block();
@@ -2710,6 +2655,51 @@ impl Lower<'_, '_> {
             }
             _ => unreachable!("checked by Elig"),
         }
+    }
+
+    /// `while`/`for`/`do` (`label` names it).
+    fn loop_stmt(&mut self, s: &HStmt, label: Option<Name>) {
+        let HStmt::Loop { test, body, update, test_after, fresh, .. } = s else { unreachable!() };
+        let (tb, bb, ub, xb) = (self.b.create_block(), self.b.create_block(), self.b.create_block(), self.b.create_block());
+        self.b.ins().jump(if *test_after { bb } else { tb }, &[]);
+        self.b.switch_to_block(tb);
+        match test {
+            Some(t) => {
+                let cv = self.truthy(t);
+                self.b.ins().brif(cv, bb, &[], xb, &[]);
+            }
+            None => {
+                self.b.ins().jump(bb, &[]);
+            }
+        }
+        self.b.switch_to_block(bb);
+        self.loops.push(LoopT { label: label.clone(), brk: xb, cont: Some(ub), switch: false, regions: self.regions.len() });
+        self.stmts(body);
+        self.loops.pop();
+        self.b.ins().jump(ub, &[]);
+        self.b.switch_to_block(ub);
+        self.b.seal_block(ub);
+        // Each iteration's closures keep their own copy of a captured loop variable.
+        for v in fresh {
+            if let Some(x) = self.cells.get(v).copied() {
+                let old = self.b.use_var(x);
+                let r = self.load_slot(old, self.lay.cell_value, JV::Val, [0; 3]);
+                self.inc_rv(r);
+                let call = self.b.ins().call(self.h.new_cell, &[]);
+                let c = self.b.inst_results(call)[0];
+                self.b.def_var(x, c);
+                self.store_slot(c, self.lay.cell_value, JV::Val, r);
+                self.dec(old);
+            }
+        }
+        if let Some(u) = update {
+            self.discard(u);
+        }
+        self.b.ins().jump(tb, &[]);
+        self.b.seal_block(tb);
+        self.b.seal_block(bb);
+        self.b.seal_block(xb);
+        self.b.switch_to_block(xb);
     }
 
     /// `switch`: the cases' tests in order (`===`), then the bodies, each
