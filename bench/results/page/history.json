@@ -54,5 +54,13 @@
   "rc_geomean_s": 0.1352,
   "gc_geomean_s": 0.1162,
   "jitless_geomean_s": 0.4391
+ },
+ {
+  "commit": "419475f",
+  "date": "2026-11-16",
+  "step": "Native code: switch, for-of, throw, static methods",
+  "rc_geomean_s": 0.1233,
+  "gc_geomean_s": 0.1048,
+  "jitless_geomean_s": 0.4439
  }
 ]
