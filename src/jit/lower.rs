@@ -88,6 +88,10 @@ pub(super) struct Layout {
     tag_first_gc: i64,
     /// Where a cell's value is, from the start of its box.
     cell_value: i32,
+    /// A closure's function id (u32) and its cells' data pointer, from the
+    /// start of its box (None: the cells' pointer couldn't be found).
+    clo_func: i32,
+    clo_caps: Option<i32>,
     arr: Option<ArrLayout>,
 }
 
@@ -108,6 +112,14 @@ impl Layout {
                 (c.as_ptr() as usize - c.header_ptr().as_ptr() as usize) as i32
             },
             arr: if std::env::var_os("RTS_JIT_NO_INLINE_ARRAYS").is_some() { None } else { ArrLayout::probe() },
+            clo_func: (Gc::<Closure>::VALUE_OFFSET + std::mem::offset_of!(Closure, func)) as i32,
+            clo_caps: {
+                // `Box<[T]>` is (pointer, length) in some order: find the pointer.
+                let c = Gc::new(Closure { func: 0, caps: Box::new([Gc::new(RefCell::new(Value::Undef))]), props: Default::default() });
+                let at = std::mem::offset_of!(Closure, caps);
+                let w: [usize; 2] = unsafe { std::mem::transmute_copy(&c.caps) };
+                w.iter().position(|x| *x == c.caps.as_ptr() as usize).filter(|&i| w[1 - i] == 1).map(|i| (Gc::<Closure>::VALUE_OFFSET + at + 8 * i) as i32)
+            },
         };
         assert!(l.tag_undef < l.tag_first_gc && l.tag_null < l.tag_first_gc && l.tag_bool < l.tag_first_gc && l.tag_num < l.tag_first_gc);
         l
@@ -223,6 +235,12 @@ pub(super) struct Lower<'a, 'b> {
     funcs: FxHashMap<FuncId, FuncRef>,
     /// Every compiled function's id and signature (for importing it).
     fdecls: &'a FxHashMap<FuncId, (ClFuncId, Signature)>,
+    /// Calls through function values: the kinds keys, and the table of
+    /// entries by function id (see `NativeEntry`).
+    keys: &'a RefCell<FxHashMap<(Vec<JV>, JV), u32>>,
+    entries: *const NativeEntry,
+    /// An empty signature with the module's calling convention.
+    sig0: &'a Signature,
     h: Helpers,
     lay: &'a Layout,
     classes: &'a [std::rc::Rc<ClassRt>],
@@ -2568,6 +2586,11 @@ impl Lower<'_, '_> {
         if let Some(t) = self.el.virt_targets(self.fid, c) {
             return self.call_virtual(e, c, &t, want);
         }
+        if self.lay.clo_caps.is_some()
+            && let Some(k) = self.el.value_call(self.fid, c)
+        {
+            return self.call_value(c, k, want);
+        }
         match &c.callee {
             Callee::Native(Native::ArrPush) if self.el.inline_push(self.fid, c, want.jk()) => {
                 let (t, [HElem::Expr(x)]) = (c.this.as_ref().unwrap(), &c.args[..]) else { unreachable!() };
@@ -2743,6 +2766,144 @@ impl Lower<'_, '_> {
         self.coerce(r, JV::Val, want)
     }
 
+    /// A call through a function value whose type fixes the kinds (`key`):
+    /// a compiled callee taking exactly those kinds is called directly
+    /// (found in the entry table by the closure's function id); anything
+    /// else goes through the interpreter.
+    fn call_value(&mut self, c: &HCall, key: (Vec<JV>, JV), want: JV) -> RV {
+        let Callee::Value(fv) = &c.callee else { unreachable!() };
+        let (pjs, rj) = key.clone();
+        let id = {
+            let n = self.keys.borrow().len() as u32 + 1;
+            *self.keys.borrow_mut().entry(key).or_insert(n)
+        };
+        let mut held = Vec::new();
+        // As `call_interp` evaluates them: receiver, function, arguments.
+        let this = c.this.as_ref().map(|t| {
+            let r = self.value_as(t, JV::Val);
+            let r = self.hold(r);
+            held.push(r);
+            r
+        });
+        let f = self.value_as(fv, JV::Val);
+        let f = if self.must_hold(&f, fv, &c.args, false) { self.hold(f) } else { f };
+        held.push(f);
+        let mut args: Vec<(JV, RV)> = Vec::new();
+        for (i, a) in c.args.iter().enumerate() {
+            let HElem::Expr(x) = a else { unreachable!() };
+            let r = self.value_as(x, pjs[i]);
+            let r = if pjs[i].jk().counted() && self.must_hold(&r, x, &c.args[i + 1..], false) { self.hold(r) } else { r };
+            if pjs[i].jk().counted() {
+                held.push(r);
+            }
+            args.push((pjs[i], r));
+        }
+        let merge = self.b.create_block();
+        self.b.append_block_param(merge, types::I64);
+        self.b.append_block_param(merge, types::I64);
+        let slow = self.b.create_block();
+        // A closure whose function is compiled with these kinds?
+        let is_func = self.b.ins().icmp_imm_u(IntCC::Equal, f.t.unwrap(), self.lay.tag_func);
+        let check = self.b.create_block();
+        self.b.ins().brif(is_func, check, &[], slow, &[]);
+        self.b.seal_block(check);
+        self.b.switch_to_block(check);
+        let fid = self.b.ins().load(types::I32, mf(), f.v, self.lay.clo_func);
+        let fid = self.b.ins().uextend(types::I64, fid);
+        let off = self.b.ins().imul_imm_u(fid, std::mem::size_of::<NativeEntry>() as i64);
+        let base = self.b.ins().iconst(types::I64, self.entries as i64);
+        let ent = self.b.ins().iadd(base, off);
+        let k = self.b.ins().load(types::I32, mf(), ent, std::mem::offset_of!(NativeEntry, key) as i32);
+        let ok = self.b.ins().icmp_imm_u(IntCC::Equal, k, id as i64);
+        let fast = self.b.create_block();
+        self.b.ins().brif(ok, fast, &[], slow, &[]);
+        self.b.seal_block(fast);
+        self.b.switch_to_block(fast);
+        let ptr = self.b.ins().load(types::I64, mf(), ent, std::mem::offset_of!(NativeEntry, entry) as i32);
+        let flags = self.b.ins().load(types::I32, mf(), ent, std::mem::offset_of!(NativeEntry, flags) as i32);
+        let env = self.b.ins().load(types::I64, mf(), f.v, self.lay.clo_caps.unwrap());
+        let zero = self.b.ins().iconst(types::I64, 0);
+        let mut words: Vec<CV> = Vec::new();
+        let mut tys: Vec<types::Type> = Vec::new();
+        for (pj, r) in &args {
+            if pj.jk().counted() {
+                words.extend(r.words());
+            } else {
+                words.push(r.v);
+            }
+            tys.extend(cl_tys(pj.jk()));
+        }
+        let ptr_ty = types::I64;
+        // One call per combination of the hidden arguments (cells, result arena).
+        let blocks: Vec<_> = (0..4).map(|_| self.b.create_block()).collect();
+        let mut table = cranelift_frontend::Switch::new();
+        for (i, blk) in blocks.iter().enumerate().skip(1) {
+            table.set_entry(i as u128, *blk);
+        }
+        table.emit(&mut self.b, flags, blocks[0]);
+        for (i, blk) in blocks.iter().enumerate() {
+            self.b.seal_block(*blk);
+            self.b.switch_to_block(*blk);
+            let mut sig = self.sig0.clone();
+            let mut vals = vec![self.ctx];
+            sig.params.push(AbiParam::new(ptr_ty));
+            if i & 1 != 0 {
+                vals.push(env);
+                sig.params.push(AbiParam::new(ptr_ty));
+            }
+            if i & 2 != 0 {
+                // The result goes to the heap.
+                vals.push(zero);
+                sig.params.push(AbiParam::new(ptr_ty));
+            }
+            vals.extend(&words);
+            sig.params.extend(tys.iter().map(|t| AbiParam::new(*t)));
+            sig.returns.extend(cl_tys(rj.jk()).into_iter().map(AbiParam::new));
+            let sref = self.b.import_signature(sig);
+            let call = self.b.ins().call_indirect(sref, ptr, &vals);
+            let res = RV::of_words(&self.b.inst_results(call).to_vec());
+            let (rt, rp) = self.value_words(rj, res);
+            self.b.ins().jump(merge, &[rt.into(), rp.into()]);
+        }
+        // Anything else: through the interpreter, with the values.
+        self.b.seal_block(slow);
+        self.b.switch_to_block(slow);
+        {
+            use cranelift_codegen::ir::{StackSlotData, StackSlotKind};
+            let n = args.len();
+            let argv = if n > 0 {
+                let slot = self.b.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, (16 * n) as u32, 4));
+                self.b.ins().stack_addr(types::I64, slot, 0)
+            } else {
+                self.b.ins().iconst(types::I64, 0)
+            };
+            for (i, (pj, r)) in args.clone().into_iter().enumerate() {
+                let (wt, wp) = self.value_words(pj, r);
+                self.b.ins().store(mf(), wt, argv, (16 * i) as i32);
+                self.b.ins().store(mf(), wp, argv, (16 * i + 8) as i32);
+            }
+            let (tt, tp) = match this {
+                Some(r) => (r.t.unwrap(), r.v),
+                None => (self.b.ins().iconst(types::I64, self.lay.tag_undef), self.b.ins().iconst(types::I64, 0)),
+            };
+            let kind = self.b.ins().iconst(types::I32, CALL_VALUE as i64);
+            let argc = self.b.ins().iconst(types::I32, n as i64);
+            let call = self.b.ins().call(self.h.call, &[kind, f.t.unwrap(), f.v, tt, tp, argv, argc]);
+            let p = self.b.inst_results(call)[0];
+            let t = self.b.ins().load(types::I64, mf(), self.ctx, CTX_RET_TAG);
+            self.b.ins().jump(merge, &[t.into(), p.into()]);
+        }
+        self.b.seal_block(merge);
+        self.b.switch_to_block(merge);
+        let ps = self.b.block_params(merge).to_vec();
+        let r = self.fresh(RV::val(ps[0], ps[1]));
+        self.check_status();
+        for h in held {
+            self.release(h);
+        }
+        self.coerce(r, JV::Val, want)
+    }
+
     /// A call through the interpreter (`h_call`): an owned value.
     fn call_interp(&mut self, c: &HCall) -> RV {
         if std::env::var_os("RTS_JIT_DEBUG").is_some() {
@@ -2872,6 +3033,27 @@ impl Lower<'_, '_> {
     }
 }
 
+/// A compiled function, for calls through function values: its typed
+/// entry point, the key of the kinds it takes and returns (0: none), and
+/// whether it takes cells (1) and a result arena (2).
+#[derive(Clone, Copy, Default)]
+#[repr(C)]
+pub(super) struct NativeEntry {
+    entry: u64,
+    key: u32,
+    flags: u32,
+}
+
+/// The kinds a function without `this` takes and returns, as a call
+/// through a function value would pass them (None: not callable that way).
+fn value_key(hir: &HProgram, f: FuncId) -> Option<(Vec<JV>, JV)> {
+    let hf = &hir.funcs[f as usize];
+    if hf.this_var.is_some() || hf.params.iter().any(|p| p.rest || p.default.is_some()) {
+        return None;
+    }
+    Some((hf.params.iter().map(|p| var_jv(hir, p.var)).collect(), ret_jv(hf)?))
+}
+
 /// The bits of a class's `Rc` as an object stores them in its `class`
 /// field (`Option<Rc<ClassRt>>`, a non-null pointer when set).
 fn class_bits(c: &std::rc::Rc<ClassRt>) -> i64 {
@@ -2997,6 +3179,11 @@ pub fn compile(hir: &HProgram, prog: &mut Program, esc: &crate::escape::EscapeIn
         fsigs.insert(f, s);
         ids.push((f, id, eid));
     }
+    // Calls through function values find a compiled callee here (filled
+    // in once the code is finalized; key 0 = not callable this way).
+    let entries: *mut NativeEntry = Box::leak(vec![NativeEntry::default(); hir.funcs.len()].into_boxed_slice()).as_mut_ptr();
+    let keys: RefCell<FxHashMap<(Vec<JV>, JV), u32>> = RefCell::default();
+    let sig0 = m.make_signature();
     let fdecls: FxHashMap<FuncId, (ClFuncId, Signature)> = ids.iter().map(|(f, id, _)| (*f, (*id, fsigs[f].clone()))).collect();
     // Each function's variables.
     let mut vars_of: FxHashMap<FuncId, Vec<VarId>> = FxHashMap::default();
@@ -3100,6 +3287,9 @@ pub fn compile(hir: &HProgram, prog: &mut Program, esc: &crate::escape::EscapeIn
                 iters: FxHashMap::default(),
                 funcs: FxHashMap::default(),
                 fdecls: &fdecls,
+                keys: &keys,
+                entries,
+                sig0: &sig0,
                 h,
                 lay: &lay,
                 classes: &prog.classes,
@@ -3251,6 +3441,20 @@ pub fn compile(hir: &HProgram, prog: &mut Program, esc: &crate::escape::EscapeIn
         names.sort();
         eprintln!("rts jit: {} functions compiled: {}", ids.len(), names.join(" "));
         eprintln!("rts jit: count updates emitted: {} increments, {} decrements; {} borrowed uses needed none", stats.incs, stats.decs, stats.borrowed);
+    }
+    for &(f, id, _) in &ids {
+        if let Some(key) = value_key(hir, f) {
+            let n = keys.borrow().len() as u32 + 1;
+            let key = *keys.borrow_mut().entry(key).or_insert(n);
+            let hf = &hir.funcs[f as usize];
+            unsafe {
+                *entries.add(f as usize) = NativeEntry {
+                    entry: m.get_finalized_function(id) as u64,
+                    key,
+                    flags: (!hf.free.is_empty()) as u32 | (takes_rarena.contains(&f) as u32) << 1,
+                }
+            };
+        }
     }
     for &(f, _, eid) in &ids {
         let p = m.get_finalized_function(eid);

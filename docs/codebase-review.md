@@ -556,3 +556,15 @@ Not part of the brief, listed because they surfaced.
   new `Vm` methods with the interpreter); `set_prop` tries its cache
   first. Untyped JS suite vs. the interpreter: every benchmark faster,
   −14% (NBody) to −58% (Mandelbrot), CD −33%, Havlak −18%.
+- `5a63afe`: virtual calls with several compiled implementations dispatch
+  on the receiver's class in compiled code (DeltaBlue −22%, Havlak −4%).
+  `cargo clippy` passes again. `RTS_JIT_DEBUG` lists call sites that still
+  go through the interpreter.
+- Next commit: calls through function values whose type fixes the kinds
+  find a compiled callee in a table by function id and call it directly
+  (Richards a further −23%; −46% since the review). New test
+  `jit_calls.ts`. Gaps found while writing it (front end, not changed):
+  `this:` parameter annotations don't parse; an arrow function whose body
+  only throws is inferred as `void` instead of `never`; a method call on a
+  plain object cast to a class type throws instead of calling the
+  object's property (interpreter and compiled code agree).

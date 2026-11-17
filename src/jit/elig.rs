@@ -540,6 +540,27 @@ impl Elig<'_> {
         (self.fits(f, t, JK::Ref) && self.args(f, g0, &c.args)).then_some(out)
     }
 
+    /// A call through a function value whose static type fixes the kinds
+    /// of its arguments and result (compiled code can then call a compiled
+    /// callee taking exactly those directly): the parameter and result kinds.
+    pub(super) fn value_call(&self, f: FuncId, c: &HCall) -> Option<(Vec<JV>, JV)> {
+        let Callee::Value(fv) = &c.callee else { return None };
+        if c.opt {
+            return None;
+        }
+        let Type::Func(ft) = fv.ty.non_null() else { return None };
+        if ft.params.len() != c.args.len() || ft.params.iter().any(|p| p.rest || p.optional) {
+            return None;
+        }
+        let pjs: Vec<JV> = ft.params.iter().map(|p| jv(&p.ty)).collect::<Option<_>>()?;
+        // A `void` function returns undefined (what a compiled one returns as `Nil`).
+        let rj = if ft.ret == Type::Void { JV::Nil } else { jv(&ft.ret)? };
+        let fits = self.fits(f, fv, JK::Val)
+            && c.this.as_ref().is_none_or(|t| self.fits(f, t, JK::Val))
+            && c.args.iter().zip(&pjs).all(|(a, pj)| matches!(a, HElem::Expr(x) if self.fits(f, x, pj.jk())));
+        fits.then_some((pjs, rj))
+    }
+
     /// The compiled function a call goes to directly, if any.
     pub(super) fn direct_target(&self, c: &HCall) -> Option<FuncId> {
         let g = match &c.callee {

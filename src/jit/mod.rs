@@ -233,7 +233,7 @@ impl JK {
 }
 
 /// What a value is, in more detail than `JK`: which kind of reference.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum JV {
     Num,
     Bool,
