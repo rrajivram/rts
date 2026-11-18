@@ -620,3 +620,15 @@ Not part of the brief, listed because they surfaced.
   (uncounted program-owned shapes, small arrays inline) remain open.
   Under `RTS_CC_THRESHOLD=1` typed Havlak takes ~865 s, before and
   after, past `compare.sh`'s 600 s limit; it completes and verifies.
+- Fair GC baseline (thesis): the tracing-GC build could collect only at
+  interpreter function entries with no native code active (every
+  compiled-code path into the VM blocked it), so with native code it
+  collected about once per run (Havlak peak heap 950 MB). It now scans
+  the machine stack and callee-saved registers conservatively for box
+  addresses, checks for collection at compiled function entries and at
+  the heads of loops that can allocate, and calls from compiled code into
+  the interpreter no longer block it (built-ins still do). `RTS_GC_GROW`
+  sets the heap growth factor; bench/modes.py adds gc-1.25, gc-1.5 and
+  gc-3. Result: GC time ÷ RC 0.98× at 2× growth, 1.00× at 1.5×, 1.01× at
+  1.25×; peak RSS 0.97×, 0.89×, 0.87×. Earlier history entries with
+  native code overstate the GC.

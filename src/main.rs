@@ -45,6 +45,10 @@ fn main() -> ExitCode {
     if let Some(n) = std::env::var("RTS_GC_MIN_HEAP").ok().and_then(|v| v.parse().ok()) {
         rts::runtime::gc::set_min_heap(n);
     }
+    #[cfg(feature = "gc")]
+    if let Some(g) = std::env::var("RTS_GC_GROW").ok().and_then(|v| v.parse().ok()) {
+        rts::runtime::gc::set_grow(g);
+    }
     let Some(path) = path else {
         eprintln!("usage: rts [--dump] [--no-types] [--no-cycles] [--no-arena] [--mem-stats] [--profile] [--no-jit] <file.ts>");
         return ExitCode::from(2);

@@ -94,5 +94,13 @@
   "rc_geomean_s": 0.1052,
   "gc_geomean_s": 0.0857,
   "jitless_geomean_s": 0.4373
+ },
+ {
+  "commit": "0cc010b",
+  "date": "2026-11-17",
+  "step": "Tracing GC collects in compiled code (conservative stack scan); was ~never collecting",
+  "rc_geomean_s": 0.1048,
+  "gc_geomean_s": 0.1022,
+  "jitless_geomean_s": 0.4356
  }
 ]

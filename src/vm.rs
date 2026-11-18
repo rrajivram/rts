@@ -484,6 +484,12 @@ impl Vm {
     /// Run the program's main function. Returns the uncaught exception, if any.
     pub fn run_main(&mut self) -> Result<(), Value> {
         crate::runtime::heap::start_run();
+        // Frames below this one hold program values: the tracing GC scans them.
+        #[cfg(feature = "gc")]
+        {
+            let marker = 0usize;
+            crate::runtime::gc::set_stack_top(std::hint::black_box(&marker) as *const usize as usize + 4096);
+        }
         let main = self.prog.funcs[self.prog.main as usize].clone();
         self.ensure(0, 0, &main)?;
         self.frames.push(Frame {
@@ -523,12 +529,18 @@ impl Vm {
     /// Call function `fid` (one that captures nothing) from native code.
     pub fn call_fid(&mut self, fid: u32, this: Value, args: &[Value]) -> Result<Value, Value> {
         self.gc_block += 1;
-        let r = match self.call_native_values(fid, None, &this, args) {
-            Some(r) => r,
-            None => self.call_function(fid, None, this, args),
-        };
+        let r = self.call_fid_unblocked(fid, this, args);
         self.gc_block -= 1;
         r
+    }
+
+    /// `call_fid` for callers whose values are all on the stack (compiled
+    /// code: the tracing GC finds them by scanning it).
+    fn call_fid_unblocked(&mut self, fid: u32, this: Value, args: &[Value]) -> Result<Value, Value> {
+        match self.call_native_values(fid, None, &this, args) {
+            Some(r) => r,
+            None => self.call_function(fid, None, this, args),
+        }
     }
 
     /// Call from native code with arguments borrowed from the caller (no allocation
@@ -549,7 +561,13 @@ impl Vm {
         }
         match callee {
             Value::Func(c) => self.call_function(c.func, Some(c.clone()), this, args),
-            Value::Native(n) => call_native(self, *n, this, args),
+            // Built-ins may hold values where the GC can't see them.
+            Value::Native(n) => {
+                self.gc_block += 1;
+                let r = call_native(self, *n, this, args);
+                self.gc_block -= 1;
+                r
+            }
             Value::Bound(_) => self.call(callee, this, args.to_vec()),
             v => Err(self.type_error(format!("{} is not a function", describe(v)))),
         }
@@ -590,12 +608,21 @@ impl Vm {
 
     // ── entry points for compiled code (`jit/`) ──
     //
-    // Compiled code holds references the tracing GC can't see, so each of
-    // these blocks it (as `call` does) while it runs.
+    // Compiled code's values are on the stack, where the tracing GC finds
+    // them; calls into the interpreter don't block it. Paths through
+    // built-ins or Rust code that holds values in heap temporaries do.
+
+    /// Collect if the heap has grown enough (a compiled-code safepoint).
+    #[cfg(feature = "gc")]
+    pub(crate) fn gc_poll(&mut self) {
+        if self.gc_block == 0 {
+            self.collect_garbage();
+        }
+    }
 
     /// Call function `fid` (one that captures nothing), as `CallTarget::Direct`.
     pub(crate) fn jit_call_func(&mut self, fid: u32, this: Value, args: &[Value]) -> Result<Value, Value> {
-        self.call_fid(fid, this, args)
+        self.call_fid_unblocked(fid, this, args)
     }
 
     /// `recv.<method in vtable slot>(…)`, as `CallTarget::Method`.
@@ -625,7 +652,7 @@ impl Vm {
         let m = self.lookup_method(&recv, &site.name);
         self.gc_block -= 1;
         match m? {
-            f @ (Value::Func(_) | Value::Native(_) | Value::Bound(_)) => self.call_slice(&f, recv, args),
+            f @ (Value::Func(_) | Value::Native(_) | Value::Bound(_)) => self.call_slice_unblocked(&f, recv, args),
             v => {
                 let d = describe(&v);
                 Err(self.type_error(format!("{}.{} is not a function (it is {d})", recv.type_of(), site.name)))
@@ -641,10 +668,10 @@ impl Vm {
                 let fid = c.func;
                 match self.call_native_values(fid, Some(c), &this, args) {
                     Some(r) => r,
-                    None => self.call_slice(f, this, args),
+                    None => self.call_slice_unblocked(f, this, args),
                 }
             }
-            Value::Func(_) | Value::Native(_) | Value::Bound(_) => self.call_slice(f, this, args),
+            Value::Func(_) | Value::Native(_) | Value::Bound(_) => self.call_slice_unblocked(f, this, args),
             v => {
                 let d = describe(v);
                 Err(self.type_error(format!("{d} is not a function")))

@@ -11,7 +11,10 @@ target/gc/release = `cargo build --release --features gc --target-dir target/gc`
     rc         reference counting + cycle collector + scope arenas (the default)
     rc-noarena reference counting + cycle collector, no scope arenas
     rc-nocc    reference counting only (cycles leak)
-    gc         tracing mark-sweep GC
+    gc         tracing mark-sweep GC (heap grows 2x the survivors between collections)
+    gc-1.25, gc-1.5, gc-3
+               the same GC with another growth factor (RTS_GC_GROW): smaller
+               factors collect more often in less memory (a time-space curve)
     node       Node.js (V8, JIT)
     jitless    node --jitless (V8's interpreter)
 """
@@ -29,6 +32,9 @@ CONFIGS = {
     "rc-noarena": [RC, "--mem-stats", "--no-arena"],
     "rc-nocc": [RC, "--mem-stats", "--no-cycles"],
     "gc": [GC, "--mem-stats"],
+    "gc-1.25": ["env", "RTS_GC_GROW=1.25", GC, "--mem-stats"],
+    "gc-1.5": ["env", "RTS_GC_GROW=1.5", GC, "--mem-stats"],
+    "gc-3": ["env", "RTS_GC_GROW=3", GC, "--mem-stats"],
     "node": ["node"],
     "jitless": ["node", "--jitless"],
 }

@@ -73,6 +73,7 @@ helpers! {
     iter_array = h_iter_array(I64, I64) -> I64;
     region_enter = h_region_enter() -> I64;
     region_exit = h_region_exit();
+    gc_poll = h_gc_poll();
     region_unwind = h_region_unwind(I64);
 }
 
@@ -989,11 +990,40 @@ impl Lower<'_, '_> {
     }
 
     /// `while`/`for`/`do` (`label` names it).
+    /// A tracing-GC safepoint: collect if the heap has grown enough. Values
+    /// live across it are on the stack or in callee-saved registers, which
+    /// the collector scans.
+    fn gc_poll(&mut self) {
+        #[cfg(not(feature = "gc"))]
+        let _ = self.h.gc_poll;
+        #[cfg(feature = "gc")]
+        {
+            let live = self.b.ins().iconst(types::I64, (&raw const crate::runtime::heap::LIVE_BYTES) as i64);
+            let next = self.b.ins().iconst(types::I64, (&raw const crate::runtime::gc::NEXT) as i64);
+            let l = self.b.ins().load(types::I64, mf(), live, 0);
+            let n = self.b.ins().load(types::I64, mf(), next, 0);
+            let due = self.b.ins().icmp(IntCC::UnsignedGreaterThanOrEqual, l, n);
+            let (call_b, cont) = (self.b.create_block(), self.b.create_block());
+            self.b.ins().brif(due, call_b, &[], cont, &[]);
+            self.b.set_cold_block(call_b);
+            self.b.seal_block(call_b);
+            self.b.switch_to_block(call_b);
+            self.b.ins().call(self.h.gc_poll, &[]);
+            self.b.ins().jump(cont, &[]);
+            self.b.seal_block(cont);
+            self.b.switch_to_block(cont);
+        }
+    }
+
     fn loop_stmt(&mut self, s: &HStmt, label: Option<Name>) {
         let HStmt::Loop { test, body, update, test_after, fresh, .. } = s else { unreachable!() };
+        let poll = !fresh.is_empty() || loop_may_allocate(body, test.iter().chain(update.iter()));
         let (tb, bb, ub, xb) = (self.b.create_block(), self.b.create_block(), self.b.create_block(), self.b.create_block());
         self.b.ins().jump(if *test_after { bb } else { tb }, &[]);
         self.b.switch_to_block(tb);
+        if poll {
+            self.gc_poll();
+        }
         match test {
             Some(t) => {
                 let cv = self.truthy(t);
@@ -1130,6 +1160,9 @@ impl Lower<'_, '_> {
         let (tb, bb, ub, xb) = (self.b.create_block(), self.b.create_block(), self.b.create_block(), self.b.create_block());
         self.b.ins().jump(tb, &[]);
         self.b.switch_to_block(tb);
+        if self.cells.contains_key(elem) || loop_may_allocate(body, std::iter::empty()) {
+            self.gc_poll();
+        }
         let a = self.b.use_var(held);
         let len = self.arr_len(a);
         let i = self.b.use_var(iv);
@@ -3444,6 +3477,25 @@ fn value_key(hir: &HProgram, f: FuncId) -> Option<(Vec<JV>, JV)> {
     Some((hf.params.iter().map(|p| var_jv(hir, p.var)).collect(), ret_jv(hf)?))
 }
 
+/// Whether a loop can allocate (so the heap can grow while it runs): it
+/// calls, builds objects, arrays, closures or strings. A loop that only
+/// does arithmetic, comparisons and reads needs no GC safepoint.
+fn loop_may_allocate<'a>(body: &[HStmt], exprs: impl Iterator<Item = &'a HExpr>) -> bool {
+    fn allocates(e: &HExpr) -> bool {
+        let scalar = matches!(jv(&e.ty), Some(JV::Num | JV::Bool));
+        match &e.kind {
+            HK::Num(_) | HK::Bool(_) | HK::Null | HK::Undefined | HK::Read(_) | HK::Logical(..) | HK::Cond(..) | HK::Cast(_) | HK::Seq(_)
+            | HK::InstanceOf(..) | HK::ClassRef(_) | HK::Assign(..) => false,
+            HK::Unary(..) | HK::Binary(..) | HK::Compound(..) | HK::Update { .. } => !scalar,
+            _ => true,
+        }
+    }
+    fn any(e: &HExpr) -> bool {
+        allocates(e) || children(e).into_iter().any(any)
+    }
+    exprs.into_iter().any(any) || any_expr(body, &mut allocates) || any_block(body, &mut |ss| ss.iter().any(|s| matches!(s, HStmt::MakeClosure(..) | HStmt::Try { .. })))
+}
+
 /// A class's pointer as its instances' shapes hold it.
 fn class_bits(c: &std::rc::Rc<ClassRt>) -> i64 {
     std::rc::Rc::as_ptr(c) as i64
@@ -3873,6 +3925,7 @@ impl Jit {
                 globals: &self.globals,
                 stats: &mut self.stats,
             };
+            lw.gc_poll();
             // Parameters (borrowed, unless assigned: then owned).
             let mut assigned = FxHashSet::default();
             assigned_vars(&hf.body, &mut assigned);

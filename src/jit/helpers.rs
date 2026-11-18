@@ -406,6 +406,13 @@ pub(super) fn nested<T>(f: impl FnOnce(&mut crate::vm::Vm) -> T) -> T {
     r
 }
 
+/// A safepoint of compiled code found the heap grown: collect (tracing-GC
+/// build; never called otherwise).
+pub(super) extern "C" fn h_gc_poll() {
+    #[cfg(feature = "gc")]
+    vm().gc_poll();
+}
+
 /// What `h_call` calls.
 pub(super) const CALL_FUNC: u32 = 0;
 pub(super) const CALL_VSLOT: u32 = 1;

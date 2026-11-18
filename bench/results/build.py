@@ -11,7 +11,9 @@ import html, json, math, os, subprocess, sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 LABEL = {"rc": "RC + arenas", "rc-noarena": "RC, no arenas", "rc-nocc": "RC, no cycle collector",
-         "gc": "tracing GC", "node": "node (JIT)", "jitless": "node --jitless"}
+         "gc": "tracing GC", "gc-1.25": "GC, grow 1.25×", "gc-1.5": "GC, grow 1.5×", "gc-3": "GC, grow 3×",
+         "node": "node (JIT)", "jitless": "node --jitless"}
+GROW = [("gc-1.25", 1.25), ("gc-1.5", 1.5), ("gc", 2.0), ("gc-3", 3.0)]
 
 
 def load(name):
@@ -80,6 +82,41 @@ def ratio_bars(items, title):
                    f'<text x="{(x1 + 4) if v >= 1 else (x0 - 4):.1f}" y="{y + 13}" text-anchor="{"start" if v >= 1 else "end"}" class="val">{v:.2f}×</text>')
     out.append("</svg>")
     return "".join(out)
+
+
+def tradeoff():
+    """The GC at each growth factor against RC: suite geomean time and
+    peak-RSS ratios, as a scatter (RC at 1×, 1×)."""
+    pts = [(f, geo_ratio(c, "rc"), geo_ratio(c, "rc", "rss"), geo_ratio(c, "rc", "heap")) for c, f in GROW if any(r["config"] == c for r in modes)]
+    if len(pts) < 2:
+        return ""
+    W, H, L, B = 640, 300, 60, 40
+    xs = [p[2] for p in pts] + [1.0]
+    ys = [p[1] for p in pts] + [1.0]
+    x0, x1 = min(xs) * 0.9, max(xs) * 1.1
+    y0, y1 = min(ys) * 0.9, max(ys) * 1.1
+    X = lambda v: L + (v - x0) / (x1 - x0) * (W - L - 20)
+    Y = lambda v: H - B - (v - y0) / (y1 - y0) * (H - B - 20)
+    o = [f'<svg viewBox="0 0 {W} {H}" role="img" aria-label="GC time-space tradeoff">']
+    o.append(f'<line x1="{X(1):.1f}" x2="{X(1):.1f}" y1="10" y2="{H - B}" class="one"/><line x1="{L}" x2="{W - 10}" y1="{Y(1):.1f}" y2="{Y(1):.1f}" class="one"/>')
+    o.append(f'<text x="{(L + W) / 2}" y="{H - 6}" text-anchor="middle" class="tick">peak RSS ÷ RC (geomean)</text>')
+    o.append(f'<text x="14" y="{(H - B) / 2}" text-anchor="middle" class="tick" transform="rotate(-90 14 {(H - B) / 2})">time ÷ RC (geomean)</text>')
+    for v in sorted(set(round(t, 1) for t in (x0, (x0 + x1) / 2, x1))):
+        o.append(f'<text x="{X(v):.1f}" y="{H - B + 16}" text-anchor="middle" class="tick">{v:.1f}×</text>')
+    for v in sorted(set(round(t, 2) for t in (y0, (y0 + y1) / 2, y1))):
+        o.append(f'<text x="{L - 6}" y="{Y(v) + 4:.1f}" text-anchor="end" class="tick">{v:.2f}×</text>')
+    line = " ".join(f"{X(p[2]):.1f},{Y(p[1]):.1f}" for p in pts)
+    o.append(f'<polyline points="{line}" fill="none" class="gcline"/>')
+    for f, t, m, _ in pts:
+        o.append(f'<circle cx="{X(m):.1f}" cy="{Y(t):.1f}" r="5" class="lose"><title>GC grow {f:g}×: time {t:.2f}×, RSS {m:.2f}× RC</title></circle>'
+                 f'<text x="{X(m) + 8:.1f}" y="{Y(t) - 6:.1f}" class="lbl">grow {f:g}×</text>')
+    o.append(f'<circle cx="{X(1):.1f}" cy="{Y(1):.1f}" r="6" class="win"><title>RC + arenas</title></circle><text x="{X(1) + 8:.1f}" y="{Y(1) + 16:.1f}" class="lbl">RC</text>')
+    o.append("</svg>")
+    rows = [[f"GC, grow {f:g}×", fmt(t, 2) + "×", fmt(m, 2) + "×", fmt(h, 2) + "×"] for f, t, m, h in pts]
+    return ("<section><h2>Time–space tradeoff</h2><p>The tracing GC at several heap growth factors "
+            "(collect when the heap reaches that multiple of what survived the last collection), "
+            "against RC + arenas at 1×, 1×. Below and left of RC: the GC is better on both.</p>"
+            + "".join(o) + table(["configuration", "time ÷ RC", "peak RSS ÷ RC", "peak heap ÷ RC"], rows) + "</section>")
 
 
 def rel(b, c, key):
@@ -156,7 +193,7 @@ th:first-child, td:first-child {{ text-align:left; }} th {{ color:var(--muted); 
 .w {{ color:var(--win); font-weight:600; }} .l {{ color:var(--lose); font-weight:600; }}
 svg {{ width:100%; max-width:640px; display:block; }} svg text {{ fill:var(--muted); font-size:12px; }}
 svg .lbl {{ fill:var(--fg); }} svg .grid {{ stroke:var(--grid); }} svg .one {{ stroke:var(--muted); }}
-svg .win {{ fill:var(--win); }} svg .lose {{ fill:var(--lose); }}
+svg .win {{ fill:var(--win); }} svg .lose {{ fill:var(--lose); }} svg .gcline {{ stroke:var(--lose); stroke-width:1.5; }}
 code {{ font-size:12px; }} footer {{ font-size:12px; color:var(--muted); }}
 </style></head><body><main>
 <header><h1>rts: reference counting vs tracing GC</h1>
@@ -172,8 +209,10 @@ code {{ font-size:12px; }} footer {{ font-size:12px; color:var(--muted); }}
 <section><h2>Time, RC ÷ GC</h2><p>Below 1×: reference counting is faster. Log scale.</p>
 {ratio_bars([(b, rel(b, "rc", "wall")) for b in benches], "time ratio")}</section>
 
-<section><h2>Peak memory, RC ÷ GC</h2><p>Process peak RSS. Below 1×: reference counting uses less. The GC collects only once the heap reaches 8 MB, then at a multiple of the live heap.</p>
+<section><h2>Peak memory, RC ÷ GC</h2><p>Process peak RSS. Below 1×: reference counting uses less. The GC collects once the heap reaches 8 MB, then each time it doubles what survived.</p>
 {ratio_bars([(b, rel(b, "rc", "rss")) for b in benches], "memory ratio")}</section>
+
+{tradeoff()}
 
 <section><h2>Per benchmark</h2><p>Seconds (each harness's own measurement, start-up excluded, median of runs), peak RSS in MB, longest collector pause in ms.</p>
 {table(["benchmark", "RC s", "GC s", "time RC÷GC", "RC MB", "GC MB", "RSS RC÷GC", "RC pause", "GC pause"], thesis_rows)}</section>

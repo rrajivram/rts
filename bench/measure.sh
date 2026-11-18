@@ -7,7 +7,7 @@ cd "$(dirname "$0")/.."
 SNAP=$(mktemp -d)
 cp target/release/rts "$SNAP/rts"; cp target/gc/release/rts "$SNAP/rts-gc"; cp target/profile/release/rts "$SNAP/rts-profile"
 export RTS="$SNAP/rts" RTS_GC="$SNAP/rts-gc" RTS_PROFILE="$SNAP/rts-profile"
-SUITE=ts RUNS=3 CONFIGS=rc,rc-noarena,rc-nocc,gc,node,jitless OUT=bench/results/modes_ts.json python3 bench/modes.py > /dev/null 2>&1
+SUITE=ts RUNS=3 CONFIGS=rc,rc-noarena,rc-nocc,gc,gc-1.25,gc-1.5,gc-3,node,jitless OUT=bench/results/modes_ts.json python3 bench/modes.py > /dev/null 2>&1
 OUT=bench/results/profile.json python3 bench/profile.py > /dev/null 2>&1
 python3 bench/latency.py > /dev/null 2>&1
 python3 bench/results/build.py --step "$1"

@@ -200,7 +200,20 @@ where scope can't be proven, beats a tracing garbage collector.
 
 Results: open `bench/results/report.html` (self-contained, opens from disk). It is
 regenerated after every step by `bench/measure.sh "what changed"` (`bench/modes.py`,
-`bench/latency.py`, `bench/profile.py`, then `bench/results/build.py --step "…"`). The numbers below are from the first measurement.
+`bench/latency.py`, `bench/profile.py`, then `bench/results/build.py --step "…"`).
+
+**Current standing (typed AWFY, native code on, 2026-11-17):** RC + arenas and
+the tracing GC are at parity on time. The GC's geomean time is 0.98× RC's at its
+default heap growth (2×), 1.00× at 1.5× and 1.01× at 1.25×, with peak RSS
+0.97×, 0.89× and 0.87× RC's. RC's worst pauses are shorter. The GC wins
+where little is allocated and RC's cost is pure count traffic (Richards, Towers,
+Bounce: GC 15–27% faster). RC wins on allocation-heavy code when the GC has a
+tight heap (Havlak, DeltaBlue, Json, Sieve, Storage). Measurements before this
+date that used native code are not a fair baseline: the GC build could not
+collect while compiled code was on the stack, so it barely collected at all
+(950 MB peak on Havlak). It now scans the stack conservatively and checks for
+collection in compiled code. The numbers below are from the first,
+interpreter-only measurement.
 
 ### Method
 
