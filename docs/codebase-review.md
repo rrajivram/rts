@@ -632,3 +632,18 @@ Not part of the brief, listed because they surfaced.
   gc-3. Result: GC time ÷ RC 0.98× at 2× growth, 1.00× at 1.5×, 1.01× at
   1.25×; peak RSS 0.97×, 0.89×, 0.87×. Earlier history entries with
   native code overstate the GC.
+- Thesis measurements: `RTS_MEM_TRACE` samples live heap every 250 µs and
+  logs every pause with its cause (cycle collection, GC, deferred settle,
+  or an RC free of 20 µs or more); bench/memory.py runs it per strategy,
+  including a GC tuned for small memory (1 MB minimum, 1.5× growth);
+  bench/latency.py compiles up front (RC's 8.6 ms worst request was
+  compilation). The report leads with memory and pauses. RC wins on both
+  except where garbage is cyclic (Havlak, DeltaBlue): there the cycle
+  collector pauses as long as the GC.
+- Deferred RC (`--deferred-rc`, src/runtime/zct.rs): compiled code's
+  stack references (locals read from fields/variables, held arguments)
+  aren't counted; zero counts go on a list settled at safepoints after a
+  conservative stack scan (src/runtime/stack.rs, shared with the GC) and
+  when the heap grows 25% (min 4 MB). Throughput about equal to plain RC
+  (Richards −13%, Havlak/Json +13%); worse tail latency (request p99 113
+  vs 25 µs), so it does not serve the thesis; kept as a configuration.

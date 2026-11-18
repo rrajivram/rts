@@ -11,6 +11,10 @@ target/gc/release = `cargo build --release --features gc --target-dir target/gc`
     rc         reference counting + cycle collector + scope arenas (the default)
     rc-noarena reference counting + cycle collector, no scope arenas
     rc-nocc    reference counting only (cycles leak)
+    rc-deferred
+               deferred reference counting (--deferred-rc): compiled code's
+               stack references aren't counted; zero-count boxes are freed at
+               safepoints after a stack scan
     gc         tracing mark-sweep GC (heap grows 2x the survivors between collections)
     gc-1.25, gc-1.5, gc-3
                the same GC with another growth factor (RTS_GC_GROW): smaller
@@ -31,6 +35,7 @@ CONFIGS = {
     "rc-noarena-nocc": [RC, "--mem-stats", "--no-arena", "--no-cycles"],
     "rc-noarena": [RC, "--mem-stats", "--no-arena"],
     "rc-nocc": [RC, "--mem-stats", "--no-cycles"],
+    "rc-deferred": [RC, "--mem-stats", "--deferred-rc"],
     "gc": [GC, "--mem-stats"],
     "gc-1.25": ["env", "RTS_GC_GROW=1.25", GC, "--mem-stats"],
     "gc-1.5": ["env", "RTS_GC_GROW=1.5", GC, "--mem-stats"],

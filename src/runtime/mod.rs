@@ -9,9 +9,12 @@ pub mod cycles;
 pub mod gc;
 pub mod heap;
 pub mod natives;
+pub mod memtrace;
 pub mod regexp;
+pub mod stack;
 pub mod task;
 mod trace;
+pub mod zct;
 pub use trace::trace_shape;
 
 pub use heap::Gc;

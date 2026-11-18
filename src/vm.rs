@@ -484,12 +484,10 @@ impl Vm {
     /// Run the program's main function. Returns the uncaught exception, if any.
     pub fn run_main(&mut self) -> Result<(), Value> {
         crate::runtime::heap::start_run();
-        // Frames below this one hold program values: the tracing GC scans them.
-        #[cfg(feature = "gc")]
-        {
-            let marker = 0usize;
-            crate::runtime::gc::set_stack_top(std::hint::black_box(&marker) as *const usize as usize + 4096);
-        }
+        // Frames below this one hold program values: the tracing GC
+        // (and deferred reference counting) scan them.
+        let marker = 0usize;
+        crate::runtime::stack::set_top(std::hint::black_box(&marker) as *const usize as usize + 4096);
         let main = self.prog.funcs[self.prog.main as usize].clone();
         self.ensure(0, 0, &main)?;
         self.frames.push(Frame {
@@ -502,6 +500,11 @@ impl Vm {
         });
         let r = self.run(0).and_then(|()| self.run_event_loop());
         self.flush();
+        // Deferred counting: settle what the program left on the list.
+        #[cfg(not(feature = "gc"))]
+        if crate::runtime::zct::deferred() {
+            self.settle();
+        }
         r
     }
 
@@ -612,12 +615,15 @@ impl Vm {
     // them; calls into the interpreter don't block it. Paths through
     // built-ins or Rust code that holds values in heap temporaries do.
 
-    /// Collect if the heap has grown enough (a compiled-code safepoint).
-    #[cfg(feature = "gc")]
+    /// A compiled-code safepoint found work due: collect (tracing GC) or
+    /// settle deferred counts.
     pub(crate) fn gc_poll(&mut self) {
+        #[cfg(feature = "gc")]
         if self.gc_block == 0 {
             self.collect_garbage();
         }
+        #[cfg(not(feature = "gc"))]
+        self.safepoint();
     }
 
     /// Call function `fid` (one that captures nothing), as `CallTarget::Direct`.
@@ -939,8 +945,13 @@ impl Vm {
     #[inline(always)]
     pub(crate) fn safepoint(&mut self) {
         #[cfg(not(feature = "gc"))]
-        if crate::runtime::cycles::wanted() {
-            Self::collect_cycles();
+        {
+            if crate::runtime::zct::wanted() {
+                self.settle();
+            }
+            if crate::runtime::cycles::wanted() {
+                self.collect_cycles();
+            }
         }
         #[cfg(feature = "gc")]
         if crate::runtime::gc::wanted() && self.gc_block == 0 {
@@ -948,11 +959,41 @@ impl Vm {
         }
     }
 
+    /// Collect garbage cycles (settling deferred counts first: the
+    /// collector must see what the stack refers to).
     #[cfg(not(feature = "gc"))]
     #[cold]
     #[inline(never)]
-    fn collect_cycles() {
-        crate::runtime::cycles::collect();
+    pub(crate) fn collect_cycles(&mut self) {
+        if crate::runtime::zct::deferred() {
+            let extra = self.slot_roots();
+            crate::runtime::memtrace::nest(|| {
+                let roots = crate::runtime::zct::reconcile(&extra, true);
+                crate::runtime::cycles::collect(&roots);
+            });
+        } else {
+            crate::runtime::memtrace::nest(|| crate::runtime::cycles::collect(&[]));
+        }
+    }
+
+    /// Deferred reference counting: free the zero-count boxes nothing on
+    /// the stack or in the interpreter's slots refers to.
+    #[cfg(not(feature = "gc"))]
+    #[cold]
+    #[inline(never)]
+    pub(crate) fn settle(&mut self) {
+        let extra = self.slot_roots();
+        crate::runtime::memtrace::nest(|| {
+            crate::runtime::zct::reconcile(&extra, false);
+        });
+    }
+
+    /// The boxes the interpreter's slots refer to (some uncounted:
+    /// borrowed parameters).
+    #[cfg(not(feature = "gc"))]
+    fn slot_roots(&self) -> Vec<usize> {
+        let extent = self.frames.last().map_or(0, |f| f.value_base + f.func.get().value_slots);
+        self.values[..extent].iter().filter_map(|v| v.gc_header()).map(|h| h.as_ptr() as usize).collect()
     }
 
     /// Mark from every root and sweep (tracing-GC build).

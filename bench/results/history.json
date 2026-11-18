@@ -102,5 +102,21 @@
   "rc_geomean_s": 0.1048,
   "gc_geomean_s": 0.1022,
   "jitless_geomean_s": 0.4356
+ },
+ {
+  "commit": "5952804",
+  "date": "2026-11-17",
+  "step": "Deferred RC (--deferred-rc): stack references uncounted, zero-count list settled at safepoints",
+  "rc_geomean_s": 0.1099,
+  "gc_geomean_s": 0.1071,
+  "jitless_geomean_s": 0.4528
+ },
+ {
+  "commit": "5952804",
+  "date": "2026-11-17",
+  "step": "Memory and pause measurements (bench/memory.py); latency with eager compile",
+  "rc_geomean_s": 0.1043,
+  "gc_geomean_s": 0.102,
+  "jitless_geomean_s": 0.4356
  }
 ]

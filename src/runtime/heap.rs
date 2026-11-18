@@ -74,6 +74,8 @@ pub mod flag {
     pub const COLOR_MASK: u32 = 3 << COLOR_SHIFT;
     /// Tracing GC mark bit.
     pub const MARK: u32 = 1 << 6;
+    /// On the zero-count list (deferred reference counting).
+    pub const ZCT: u32 = 1 << 7;
 }
 
 /// Count given to arena boxes. Far above any real count, so reference-count
@@ -353,7 +355,11 @@ fn dec(p: NonNull<Header>) {
     let c = h.rc.get() - 1;
     h.rc.set(c);
     if c == 0 {
-        release(p);
+        if crate::runtime::zct::deferred() {
+            crate::runtime::zct::push(p);
+        } else {
+            release(p);
+        }
     } else if h.flags.get() & (flag::ACYCLIC | flag::BUFFERED | flag::ARENA) == 0 {
         crate::runtime::cycles::possible_root(p);
     }
@@ -368,6 +374,15 @@ fn dec(_: NonNull<Header>) {}
 #[cold]
 #[inline(never)]
 pub fn release(p: NonNull<Header>) {
+    // Tracing memory: time each outermost release (with everything it
+    // frees in turn), as a pause if long.
+    if crate::runtime::memtrace::on() {
+        return crate::runtime::memtrace::timed_release(p, release_now);
+    }
+    release_now(p);
+}
+
+fn release_now(p: NonNull<Header>) {
     let h = unsafe { p.as_ref() };
     let vt = h.vt;
     if h.has(flag::BUFFERED) {
@@ -452,11 +467,12 @@ pub static STATS: SyncStats = SyncStats(UnsafeCell::new(Stats {
 }));
 
 impl Stats {
-    pub fn pause(&self, d: std::time::Duration) {
+    pub fn pause(&self, d: std::time::Duration, kind: crate::runtime::memtrace::Kind) {
         let ns = d.as_nanos() as u64;
         self.pauses.set(self.pauses.get() + 1);
         self.pause_total_ns.set(self.pause_total_ns.get() + ns);
         self.pause_max_ns.set(self.pause_max_ns.get().max(ns));
+        crate::runtime::memtrace::pause(d, kind);
     }
 }
 

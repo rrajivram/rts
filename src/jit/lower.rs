@@ -718,11 +718,25 @@ impl Lower<'_, '_> {
     /// `r`, owned while other code runs.
     #[track_caller]
     fn hold(&mut self, r: RV) -> RV {
-        if r.owned {
+        // Deferred counting: the stack reference keeps it (see `zct`).
+        if r.owned || crate::runtime::zct::deferred() {
             return r;
         }
         self.inc_rv(r);
         self.fresh(r)
+    }
+
+    /// `r` without a count of its own (a borrowed variable's value): an
+    /// owned temporary is released now. Only deferred counting borrows
+    /// owned values; otherwise they are borrowed already.
+    #[track_caller]
+    fn disown(&mut self, r: RV) -> RV {
+        debug_assert!(!r.owned || crate::runtime::zct::deferred());
+        if r.owned {
+            self.unpend(r);
+            self.dec_rv(r);
+        }
+        RV { owned: false, ..r }
     }
 
     /// Done with `r`.
@@ -833,7 +847,7 @@ impl Lower<'_, '_> {
                 let val = match e {
                     Some(e) if self.borrowed.contains(v) => {
                         let r = self.value_as(e, vj);
-                        debug_assert!(!r.owned);
+                        let r = self.disown(r);
                         self.stats.borrowed += 1;
                         r
                     }
@@ -994,12 +1008,13 @@ impl Lower<'_, '_> {
     /// live across it are on the stack or in callee-saved registers, which
     /// the collector scans.
     fn gc_poll(&mut self) {
-        #[cfg(not(feature = "gc"))]
-        let _ = self.h.gc_poll;
         #[cfg(feature = "gc")]
-        {
-            let live = self.b.ins().iconst(types::I64, (&raw const crate::runtime::heap::LIVE_BYTES) as i64);
-            let next = self.b.ins().iconst(types::I64, (&raw const crate::runtime::gc::NEXT) as i64);
+        let (live, next) = ((&raw const crate::runtime::heap::LIVE_BYTES) as i64, (&raw const crate::runtime::gc::NEXT) as i64);
+        #[cfg(not(feature = "gc"))]
+        let (live, next) = ((&raw const crate::runtime::heap::LIVE_BYTES) as i64, (&raw const crate::runtime::zct::NEXT) as i64);
+        if cfg!(feature = "gc") || crate::runtime::zct::deferred() {
+            let live = self.b.ins().iconst(types::I64, live);
+            let next = self.b.ins().iconst(types::I64, next);
             let l = self.b.ins().load(types::I64, mf(), live, 0);
             let n = self.b.ins().load(types::I64, mf(), next, 0);
             let due = self.b.ins().icmp(IntCC::UnsignedGreaterThanOrEqual, l, n);
@@ -1175,7 +1190,7 @@ impl Lower<'_, '_> {
         if self.cells.contains_key(elem) {
             self.new_cell(*elem);
         }
-        let r = if ej.jk().counted() && !self.borrowed.contains(elem) { self.own(r) } else { r };
+        let r = if ej.jk().counted() && !self.borrowed.contains(elem) { self.own(r) } else { self.disown(r) };
         self.write_var(*elem, r);
         self.loops.push(LoopT { label, brk: xb, cont: Some(ub), switch: false, regions: self.regions.len() });
         self.stmts(body);
@@ -2570,7 +2585,7 @@ impl Lower<'_, '_> {
             Place::Var(v) if self.borrowed.contains(v) => {
                 let vj = var_jv(self.hir, *v);
                 let r = self.value_as(x, vj);
-                debug_assert!(!r.owned);
+                let r = self.disown(r);
                 self.stats.borrowed += 1;
                 self.set_var(*v, r);
                 self.coerce(r, vj, want)
@@ -3496,6 +3511,18 @@ fn loop_may_allocate<'a>(body: &[HStmt], exprs: impl Iterator<Item = &'a HExpr>)
     exprs.into_iter().any(any) || any_expr(body, &mut allocates) || any_block(body, &mut |ss| ss.iter().any(|s| matches!(s, HStmt::MakeClosure(..) | HStmt::Try { .. })))
 }
 
+/// An expression whose value is read from somewhere that holds it (a
+/// variable, field or element), not made or handed over by a call.
+fn borrowed_source(x: &HExpr) -> bool {
+    match &x.kind {
+        HK::Null | HK::Undefined | HK::Num(_) | HK::Bool(_) => true,
+        HK::Cast(y) => borrowed_source(y),
+        HK::Cond(_, a, b) | HK::Logical(_, a, b) => borrowed_source(a) && borrowed_source(b),
+        HK::Read(p) => matches!(**p, Place::Var(_) | Place::Field { .. } | Place::Index { .. }),
+        _ => false,
+    }
+}
+
 /// A class's pointer as its instances' shapes hold it.
 fn class_bits(c: &std::rc::Rc<ClassRt>) -> i64 {
     std::rc::Rc::as_ptr(c) as i64
@@ -3925,14 +3952,29 @@ impl Jit {
                 globals: &self.globals,
                 stats: &mut self.stats,
             };
-            lw.gc_poll();
+            // The tracing GC's safepoint at entry (deferred counting
+            // settles at allocations instead: see `h_new`).
+            if cfg!(feature = "gc") {
+                lw.gc_poll();
+            }
             // Parameters (borrowed, unless assigned: then owned).
             let mut assigned = FxHashSet::default();
             assigned_vars(&hf.body, &mut assigned);
             let pvars: Vec<VarId> = hf.this_var.iter().chain(hf.params.iter().map(|p| &p.var)).copied().collect();
             let mine: &[VarId] = self.vars_of.get(&f).map(|v| v.as_slice()).unwrap_or(&[]);
             let all: Vec<VarId> = pvars.iter().chain(mine).copied().collect();
-            lw.borrowed = el.borrowed_vars(f, &all);
+            lw.borrowed = if crate::runtime::zct::deferred() {
+                // Deferred counting: locals that only ever hold values read
+                // from elsewhere take no counts (the stack keeps them; see
+                // `zct`). Those given new values keep counting: borrowing
+                // them would put every new value on the zero-count list.
+                let mut assigns = Vec::new();
+                collect_ref_assigns(&hf.body, &mut assigns);
+                let given: FxHashSet<VarId> = assigns.iter().filter(|(_, x)| !borrowed_source(x)).map(|(v, _)| *v).collect();
+                all.iter().copied().filter(|v| lw.el.vjk(*v).is_some_and(|k| k.counted()) && !hir.vars[*v as usize].captured && !lw.is_global(*v) && !given.contains(v)).collect()
+            } else {
+                el.borrowed_vars(f, &all)
+            };
             // Captured variables: no cell yet (a block or `Init` makes it).
             for &v in mine {
                 if hir.vars[v as usize].captured {

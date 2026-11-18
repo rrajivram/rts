@@ -110,7 +110,10 @@ fn each_child(p: NonNull<Header>, mut f: impl FnMut(NonNull<Header>)) {
 /// Run a collection. Call only at a safepoint: no `RefCell` of a heap value
 /// may be mutably borrowed (those that are, are treated as opaque, which is
 /// safe: their children just look externally referenced).
-pub fn collect() {
+///
+/// `uncounted`: sorted addresses that refer to boxes without counting
+/// (deferred reference counting's stack words; empty otherwise).
+pub fn collect(uncounted: &[usize]) {
     let start = Instant::now();
     let s = st();
     let roots = std::mem::take(&mut s.roots);
@@ -135,7 +138,7 @@ pub fn collect() {
     // not. If few live candidates remain, keep them buffered and wait.
     if !s.fixed && live_roots.len() < s.threshold / 2 {
         s.roots = live_roots;
-        STATS.pause(start.elapsed());
+        STATS.pause(start.elapsed(), super::memtrace::Kind::Cycles);
         return;
     }
     for &p in &live_roots {
@@ -166,7 +169,7 @@ pub fn collect() {
             if color(h) != GRAY {
                 continue;
             }
-            if h.rc.get() > 0 {
+            if h.rc.get() > 0 || (!uncounted.is_empty() && super::stack::refers(uncounted, n.as_ptr() as usize)) {
                 set_color(h, BLACK);
                 black.push(n);
                 while let Some(m) = black.pop() {
@@ -235,7 +238,7 @@ pub fn collect() {
     if !s.fixed {
         s.threshold = if garbage.len() * 4 < live_roots.len() { (s.threshold * 2).min(1 << 18) } else { s.threshold.max(10_000) };
     }
-    STATS.pause(start.elapsed());
+    STATS.pause(start.elapsed(), super::memtrace::Kind::Cycles);
 }
 
 /// Candidates currently buffered.

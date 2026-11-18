@@ -29,9 +29,7 @@ use super::heap::{drop_header_value, flag, free_box, trace_header, Header, Trace
 
 /// Don't collect before the heap reaches this size.
 const MIN_HEAP: usize = 8 << 20;
-/// A stack word this far past a box's address (header and value start,
-/// whatever the value's alignment) keeps the box.
-const SLACK: usize = 48;
+
 
 struct State {
     head: Option<NonNull<Header>>,
@@ -43,8 +41,7 @@ struct State {
 
 /// Collect when live bytes reach this (compiled code reads it at safepoints).
 pub static NEXT: AtomicUsize = AtomicUsize::new(MIN_HEAP);
-/// The highest stack address that can hold roots (set as the program starts).
-static STACK_TOP: AtomicUsize = AtomicUsize::new(0);
+
 
 struct Global(UnsafeCell<State>);
 // SAFETY: the VM, and so every user of this state, runs on one thread.
@@ -63,47 +60,6 @@ pub fn set_grow(g: f64) {
     st().grow = g.max(1.0);
 }
 
-/// Record where the stack starts (an address in a frame that outlives
-/// every frame holding program values).
-pub fn set_stack_top(addr: usize) {
-    if STACK_TOP.load(Relaxed) < addr {
-        STACK_TOP.store(addr, Relaxed);
-    }
-}
-
-/// Every word on the stack from here up to `STACK_TOP`, callee-saved
-/// registers included (stored into this frame first).
-#[inline(never)]
-fn stack_words() -> Vec<usize> {
-    let mut regs = [0usize; 12];
-    #[cfg(target_arch = "aarch64")]
-    unsafe {
-        std::arch::asm!(
-            "stp x19, x20, [{0}]", "stp x21, x22, [{0}, #16]", "stp x23, x24, [{0}, #32]",
-            "stp x25, x26, [{0}, #48]", "stp x27, x28, [{0}, #64]", "stp x29, x30, [{0}, #80]",
-            in(reg) regs.as_mut_ptr(), options(nostack, preserves_flags),
-        );
-    }
-    #[cfg(target_arch = "x86_64")]
-    unsafe {
-        std::arch::asm!(
-            "mov [{0}], rbx", "mov [{0} + 8], rbp", "mov [{0} + 16], r12",
-            "mov [{0} + 24], r13", "mov [{0} + 32], r14", "mov [{0} + 40], r15",
-            in(reg) regs.as_mut_ptr(), options(nostack, preserves_flags),
-        );
-    }
-    let lo = regs.as_ptr() as usize;
-    let hi = STACK_TOP.load(Relaxed);
-    let mut out = Vec::new();
-    let mut p = lo;
-    while p + 8 <= hi {
-        // SAFETY: between this frame and the recorded top: mapped stack.
-        out.push(unsafe { std::ptr::read_volatile(p as *const usize) });
-        p += 8;
-    }
-    std::hint::black_box(&regs);
-    out
-}
 
 #[allow(clippy::mut_from_ref)]
 fn st() -> &'static mut State {
@@ -140,18 +96,13 @@ pub fn collect(roots: &mut dyn FnMut(&mut Tracer)) {
         roots(&mut Tracer { visit: &mut visit, shared: true });
         // Conservative roots: stack words equal to, or a little past, a
         // box's address (its header, or its value just after).
-        let mut words = stack_words();
-        words.sort_unstable();
-        words.dedup();
+        let words = super::stack::words();
         if let (Some(&lo), Some(&hi)) = (words.first(), words.last()) {
             let mut cur = st().head;
             while let Some(h) = cur {
                 let a = h.as_ptr() as usize;
-                if a >= lo.saturating_sub(SLACK) && a <= hi {
-                    let i = words.partition_point(|&w| w < a);
-                    if words.get(i).is_some_and(|&w| w < a + SLACK) {
-                        visit(h);
-                    }
+                if a + super::stack::SLACK > lo && a <= hi && super::stack::refers(&words, a) {
+                    visit(h);
                 }
                 cur = unsafe { h.as_ref() }.next.get();
             }
@@ -197,5 +148,5 @@ pub fn collect(roots: &mut dyn FnMut(&mut Tracer)) {
     }
     STATS.collected.set(STATS.collected.get() + dead.len() as u64);
     NEXT.store(if s.min == 0 { 0 } else { ((LIVE_BYTES.load(Relaxed) as f64 * s.grow) as usize).max(s.min) }, Relaxed);
-    STATS.pause(start.elapsed());
+    STATS.pause(start.elapsed(), super::memtrace::Kind::Gc);
 }

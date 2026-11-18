@@ -10,9 +10,11 @@ RC = os.environ.get("RTS", os.path.join(ROOT, "target/release/rts"))
 GC = os.environ.get("RTS_GC", os.path.join(ROOT, "target/gc/release/rts"))
 CONFIGS = {
     "RC + arenas": [RC],
+    "RC, deferred": [RC, "--deferred-rc"],
     "RC, no arenas": [RC, "--no-arena"],
     "RC, no cycle collector": [RC, "--no-cycles"],
     "tracing GC": [GC],
+    "tracing GC, tuned small": ["env", "RTS_GC_MIN_HEAP=1048576", "RTS_GC_GROW=1.5", GC],
     "node (JIT)": ["node"],
 }
 N = os.environ.get("REQUESTS", "100000")
@@ -20,7 +22,9 @@ RUNS = int(os.environ.get("RUNS", "3"))
 
 
 def run(cmd):
-    p = subprocess.run(["/usr/bin/time", "-l"] + cmd + [W, N], capture_output=True, text=True, check=True)
+    # Native code compiled up front: compilation isn't a memory-management pause.
+    env = dict(os.environ, RTS_JIT_EAGER="1")
+    p = subprocess.run(["/usr/bin/time", "-l"] + cmd + [W, N], capture_output=True, text=True, check=True, env=env)
     m = re.search(r"mean ([\d.]+) p50 ([\d.]+) p99 ([\d.]+) p99.9 ([\d.]+) max ([\d.]+)", p.stderr)
     rss = int(re.search(r"(\d+)\s+maximum resident set size", p.stderr).group(1)) / 1048576
     return [float(x) for x in m.groups()] + [rss]

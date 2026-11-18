@@ -44,7 +44,9 @@ pub(super) extern "C" fn h_new(class: *const ClassRt, arena: *const Arena) -> u6
     }
     #[cfg(not(feature = "gc"))]
     if crate::runtime::cycles::wanted() {
-        crate::runtime::cycles::collect();
+        vm().collect_cycles();
+    } else if crate::runtime::zct::wanted() {
+        vm().settle();
     }
     let c = unsafe {
         std::rc::Rc::increment_strong_count(class);
@@ -218,7 +220,9 @@ pub(super) extern "C" fn h_arr_new(numbers: u32, arena: *const Arena) -> u64 {
     }
     #[cfg(not(feature = "gc"))]
     if crate::runtime::cycles::wanted() {
-        crate::runtime::cycles::collect();
+        vm().collect_cycles();
+    } else if crate::runtime::zct::wanted() {
+        vm().settle();
     }
     let a = if numbers != 0 { crate::runtime::Array::new_num(Vec::new()) } else { crate::runtime::Array::new_val(Vec::new()) };
     Gc::into_header(a).as_ptr() as u64
@@ -409,7 +413,6 @@ pub(super) fn nested<T>(f: impl FnOnce(&mut crate::vm::Vm) -> T) -> T {
 /// A safepoint of compiled code found the heap grown: collect (tracing-GC
 /// build; never called otherwise).
 pub(super) extern "C" fn h_gc_poll() {
-    #[cfg(feature = "gc")]
     vm().gc_poll();
 }
 
@@ -425,6 +428,11 @@ pub(super) const CALL_CONSTRUCT: u32 = 5;
 /// and the `argc` arguments at `argv` are borrowed values. The result is
 /// owned (see `give`).
 pub(super) extern "C" fn h_call(kind: u32, a: u64, b: u64, this_t: u64, this_p: u64, argv: *const Value, argc: u32) -> u64 {
+    // Deferred counting settles at helpers that allocate (see `h_new`).
+    #[cfg(not(feature = "gc"))]
+    if crate::runtime::zct::wanted() {
+        vm().settle();
+    }
     if unsafe { (*ctx()).depth } >= MAX_DEPTH {
         unsafe { (*ctx()).status = STATUS_OVERFLOW };
         return give(Value::Undef);
@@ -517,6 +525,11 @@ pub(super) const OP_STR_CMP: u32 = 8;
 /// An operation on one or two borrowed values: a boolean (0/1), or an owned
 /// value (see `give`).
 pub(super) extern "C" fn h_op(op: u32, at: u64, ap: u64, bt: u64, bp: u64) -> u64 {
+    // Deferred counting settles at helpers that allocate (see `h_new`).
+    #[cfg(not(feature = "gc"))]
+    if crate::runtime::zct::wanted() {
+        vm().settle();
+    }
     let (a, b) = (peek_value(at, ap), peek_value(bt, bp));
     match op {
         OP_STRICT_EQ => a.strict_eq(&b) as u64,

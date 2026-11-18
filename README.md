@@ -202,18 +202,24 @@ Results: open `bench/results/report.html` (self-contained, opens from disk). It 
 regenerated after every step by `bench/measure.sh "what changed"` (`bench/modes.py`,
 `bench/latency.py`, `bench/profile.py`, then `bench/results/build.py --step "…"`).
 
-**Current standing (typed AWFY, native code on, 2026-11-17):** RC + arenas and
-the tracing GC are at parity on time. The GC's geomean time is 0.98× RC's at its
-default heap growth (2×), 1.00× at 1.5× and 1.01× at 1.25×, with peak RSS
-0.97×, 0.89× and 0.87× RC's. RC's worst pauses are shorter. The GC wins
-where little is allocated and RC's cost is pure count traffic (Richards, Towers,
-Bounce: GC 15–27% faster). RC wins on allocation-heavy code when the GC has a
-tight heap (Havlak, DeltaBlue, Json, Sieve, Storage). Measurements before this
-date that used native code are not a fair baseline: the GC build could not
-collect while compiled code was on the stack, so it barely collected at all
-(950 MB peak on Havlak). It now scans the stack conservatively and checks for
-collection in compiled code. The numbers below are from the first,
-interpreter-only measurement.
+**Current standing (2026-11-17).** The thesis is about memory and pauses, not
+throughput. `bench/memory.py` samples live heap every 250 µs and logs every pause
+by cause; `bench/latency.py` times each request of a request loop.
+
+- Memory: RC's average live heap is 1.0–8× below the GC's at its default setting
+  and 1.3–6× below a GC tuned for small memory (Json 0.7 vs 4.2 MB, Storage 0.5
+  vs 2.7, CD 1.3 vs 2.8, requests 2.3 vs 3.2), except on cyclic graphs (Havlak
+  24 vs 24, DeltaBlue 11.6 vs 12.1).
+- Pauses: RC freeing a dead structure never took more than 0.5 ms; the GC's
+  pauses run 0.8–10 ms. Request latency p99.9: RC 27 µs, GC 1,983 µs (272 µs
+  tuned small).
+- The exception is cyclic garbage: RC's cycle collector pauses up to 11.6 ms on
+  Havlak and 6.0 ms on DeltaBlue, as long as the GC's. That is the open problem.
+- Throughput is about equal (GC 0.98× RC's time at default growth).
+
+Measurements before 2026-11-17 that used native code are not a fair baseline:
+the GC build barely collected while compiled code ran (950 MB peak on Havlak).
+The numbers below are from the first, interpreter-only measurement.
 
 ### Method
 
