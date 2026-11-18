@@ -86,5 +86,13 @@
   "rc_geomean_s": 0.1077,
   "gc_geomean_s": 0.0876,
   "jitless_geomean_s": 0.4407
+ },
+ {
+  "commit": "7aa079f",
+  "date": "2026-11-17",
+  "step": "Smaller objects (P7 part 1)",
+  "rc_geomean_s": 0.1052,
+  "gc_geomean_s": 0.0857,
+  "jitless_geomean_s": 0.4373
  }
 ]

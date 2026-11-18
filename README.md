@@ -198,9 +198,9 @@ The last one is the 2.9× on `closures`.
 **The thesis:** freeing memory by scope, falling back to reference counting
 where scope can't be proven, beats a tracing garbage collector.
 
-Live results: the [rts Bench page](https://claude.ai/artifact/B8kQ6jdvrkrEdoqK1oodGD) is updated after every
-step, from `bench/results/` (`bench/modes.py`, `bench/latency.py`, `bench/profile.py`, then
-`bench/results/build.py --step "…"`). The numbers below are from the first measurement.
+Results: open `bench/results/report.html` (self-contained, opens from disk). It is
+regenerated after every step by `bench/measure.sh "what changed"` (`bench/modes.py`,
+`bench/latency.py`, `bench/profile.py`, then `bench/results/build.py --step "…"`). The numbers below are from the first measurement.
 
 ### Method
 

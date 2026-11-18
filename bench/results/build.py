@@ -1,50 +1,42 @@
-"""Turn raw results into the bench page's data files (bench/results/page/*.json).
+"""Turn raw results into a self-contained local report (bench/results/report.html).
 
     python3 bench/results/build.py [--step "what changed"]
 
 Inputs: modes_ts.json (bench/modes.py), profile.json (bench/profile.py),
 latency.json (bench/latency.py). With --step, appends the current suite
-geometric means to history.json under the current commit.
+geometric means to history.json under the current commit. The report has
+its data built in and loads nothing: open it straight from disk.
 """
-import json, math, os, subprocess, sys
+import html, json, math, os, subprocess, sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-OUT = os.path.join(HERE, "page")
-os.makedirs(OUT, exist_ok=True)
 LABEL = {"rc": "RC + arenas", "rc-noarena": "RC, no arenas", "rc-nocc": "RC, no cycle collector",
          "gc": "tracing GC", "node": "node (JIT)", "jitless": "node --jitless"}
 
 
 def load(name):
-    return json.load(open(os.path.join(HERE, name)))
+    p = os.path.join(HERE, name)
+    return json.load(open(p)) if os.path.exists(p) else None
 
 
 modes = load("modes_ts.json")
-rows = []
-for r in modes:
-    rows.append({
-        "benchmark": r["bench"], "config": LABEL.get(r["config"], r["config"]),
-        "time_s": round(r["wall"], 4), "rss_mb": round(r["rss"], 1),
-        "peak_heap_mb": r.get("heap"), "max_pause_ms": r.get("pause_max"),
-        "objects": int(r["objects"]) if "objects" in r else None,
-        "arena_objects": int(r["arena"]) if "arena" in r else None,
-    })
-json.dump(rows, open(os.path.join(OUT, "modes.json"), "w"), indent=1)
-
 benches = sorted({r["bench"] for r in modes})
+configs = [c for c in LABEL if any(r["config"] == c for r in modes)]
 by = {(r["bench"], r["config"]): r for r in modes}
-geo = lambda c: math.exp(sum(math.log(by[(b, c)]["wall"]) for b in benches) / len(benches))
 
-prof = load("profile.json")
-prow = [{"instruction": s["instruction"], "time_share_pct": round(100 * s["share"], 2), "count": s["count"],
-         "allocs": s["allocs"], "rc_ops_per_op": round(s["rc"] / s["count"], 3) if s["count"] else 0}
-        for s in prof["suite"] if s["instruction"] != "<outside>"]
-json.dump(prow, open(os.path.join(OUT, "profile.json"), "w"), indent=1)
 
-if os.path.exists(os.path.join(HERE, "latency.json")):
-    json.dump(load("latency.json"), open(os.path.join(OUT, "latency.json"), "w"), indent=1)
+def geo(c, key="wall"):
+    xs = [by[(b, c)][key] for b in benches if (b, c) in by and by[(b, c)].get(key)]
+    return math.exp(sum(map(math.log, xs)) / len(xs)) if xs else None
 
-hist = load("history.json")
+
+def geo_ratio(a, b, key="wall"):
+    xs = [by[(x, a)][key] / by[(x, b)][key] for x in benches
+          if (x, a) in by and (x, b) in by and by[(x, a)].get(key) and by[(x, b)].get(key)]
+    return math.exp(sum(map(math.log, xs)) / len(xs)) if xs else None
+
+
+hist = load("history.json") or []
 if "--step" in sys.argv:
     step = sys.argv[sys.argv.index("--step") + 1]
     commit = subprocess.run(["git", "rev-parse", "--short", "HEAD"], capture_output=True, text=True).stdout.strip()
@@ -53,5 +45,154 @@ if "--step" in sys.argv:
     hist.append({"commit": commit, "date": date, "step": step, "rc_geomean_s": round(geo("rc"), 4),
                  "gc_geomean_s": round(geo("gc"), 4), "jitless_geomean_s": round(geo("jitless"), 4)})
     json.dump(hist, open(os.path.join(HERE, "history.json"), "w"), indent=1)
-json.dump(hist, open(os.path.join(OUT, "history.json"), "w"), indent=1)
-print({c: round(geo(c), 4) for c in LABEL})
+
+esc = html.escape
+
+
+def fmt(x, d=3):
+    return "—" if x is None else f"{x:.{d}f}"
+
+
+def table(head, rows, cls=""):
+    h = "".join(f"<th>{esc(c)}</th>" for c in head)
+    b = "".join("<tr>" + "".join(f"<td>{c}</td>" for c in r) + "</tr>" for r in rows)
+    return f'<div class="wrap"><table class="{cls}"><thead><tr>{h}</tr></thead><tbody>{b}</tbody></table></div>'
+
+
+def ratio_bars(items, title):
+    """Horizontal bars of RC/GC ratios on a log scale centred at 1."""
+    W, row, left, mid = 640, 22, 110, 375
+    lo, hi = math.log(0.25), math.log(4)
+    x = lambda v: mid + (math.log(max(0.25, min(4, v))) / (hi if v >= 1 else -lo)) * (W - 20 - mid if v >= 1 else mid - left)
+    H = row * len(items) + 30
+    out = [f'<svg viewBox="0 0 {W} {H}" role="img" aria-label="{esc(title)}">']
+    for t in (0.25, 0.5, 1, 2, 4):
+        out.append(f'<line x1="{x(t):.1f}" x2="{x(t):.1f}" y1="0" y2="{H - 20}" class="grid{" one" if t == 1 else ""}"/>'
+                   f'<text x="{x(t):.1f}" y="{H - 5}" text-anchor="middle" class="tick">{t:g}×</text>')
+    for i, (name, v) in enumerate(items):
+        y = i * row + 4
+        if v is None:
+            continue
+        x0, x1 = sorted((x(1), x(v)))
+        c = "win" if v < 1 else "lose"
+        out.append(f'<text x="{left - 8}" y="{y + 13}" text-anchor="end" class="lbl">{esc(name)}</text>'
+                   f'<rect x="{x0:.1f}" y="{y}" width="{max(1, x1 - x0):.1f}" height="{row - 6}" class="{c}"><title>{esc(name)}: {v:.2f}×</title></rect>'
+                   f'<text x="{(x1 + 4) if v >= 1 else (x0 - 4):.1f}" y="{y + 13}" text-anchor="{"start" if v >= 1 else "end"}" class="val">{v:.2f}×</text>')
+    out.append("</svg>")
+    return "".join(out)
+
+
+def rel(b, c, key):
+    r, g = by.get((b, "rc")), by.get((b, "gc"))
+    return r[key] / g[key] if r and g and r.get(key) and g.get(key) else None
+
+
+# Thesis section: RC + arenas against the tracing GC.
+time_r = geo_ratio("rc", "gc")
+rss_r = geo_ratio("rc", "gc", "rss")
+pause_rc = max((by[(b, "rc")].get("pause_max") or 0) for b in benches if (b, "rc") in by)
+pause_gc = max((by[(b, "gc")].get("pause_max") or 0) for b in benches if (b, "gc") in by)
+wins_t = sum(1 for b in benches if (rel(b, "rc", "wall") or 9) < 1)
+wins_m = sum(1 for b in benches if (rel(b, "rc", "rss") or 9) < 1)
+
+thesis_rows = []
+for b in benches:
+    r, g = by.get((b, "rc"), {}), by.get((b, "gc"), {})
+    tr, mr = rel(b, "rc", "wall"), rel(b, "rc", "rss")
+    thesis_rows.append([esc(b), fmt(r.get("wall")), fmt(g.get("wall")),
+                        f'<span class="{"w" if tr and tr < 1 else "l"}">{fmt(tr, 2)}×</span>',
+                        fmt(r.get("rss"), 0), fmt(g.get("rss"), 0),
+                        f'<span class="{"w" if mr and mr < 1 else "l"}">{fmt(mr, 2)}×</span>',
+                        fmt(r.get("pause_max"), 2), fmt(g.get("pause_max"), 2)])
+
+all_rows = []
+for b in benches:
+    all_rows.append([esc(b)] + [fmt(by[(b, c)]["wall"]) if (b, c) in by else "—" for c in configs])
+all_rows.append(["<b>geomean</b>"] + [f"<b>{fmt(geo(c))}</b>" for c in configs])
+
+mem_rows = []
+for b in benches:
+    mem_rows.append([esc(b)] + [fmt(by[(b, c)]["rss"], 0) if (b, c) in by else "—" for c in configs]
+                    + [fmt(by.get((b, "rc"), {}).get("heap"), 2), fmt(by.get((b, "gc"), {}).get("heap"), 2)])
+
+lat = load("latency.json") or []
+lat_rows = [[esc(l["config"]), fmt(l["mean_us"], 1), fmt(l["p50_us"], 1), fmt(l["p99_us"], 1), fmt(l["p999_us"], 1),
+             fmt(l["max_us"], 1), fmt(l["rss_mb"], 1)] for l in lat]
+
+hist_rows = [[esc(h["date"]), f'<code>{esc(h["commit"])}</code>', esc(h["step"]), fmt(h["rc_geomean_s"], 4),
+              fmt(h["gc_geomean_s"], 4), fmt(h["rc_geomean_s"] / h["gc_geomean_s"], 2) + "×",
+              fmt(h.get("jitless_geomean_s"), 4)] for h in reversed(hist)]
+
+prof = load("profile.json")
+prof_rows = []
+if prof:
+    top = sorted((s for s in prof["suite"] if s["instruction"] != "<outside>"), key=lambda s: -s["share"])[:20]
+    prof_rows = [[f'<code>{esc(s["instruction"])}</code>', fmt(100 * s["share"], 1), f'{s["count"]:,}', f'{s["allocs"]:,}',
+                  fmt(s["rc"] / s["count"] if s["count"] else 0, 2)] for s in top]
+
+commit = subprocess.run(["git", "rev-parse", "--short", "HEAD"], capture_output=True, text=True).stdout.strip()
+date = subprocess.run(["git", "log", "-1", "--format=%cs"], capture_output=True, text=True).stdout.strip()
+verdict_time = "faster" if time_r < 1 else "slower"
+
+page = f"""<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>rts: RC vs GC</title>
+<style>
+:root {{ --bg:#fbfaf7; --fg:#1d1c1a; --muted:#6b6862; --line:#e4e1da; --panel:#fff; --win:#2f7d5b; --lose:#b5523b; --grid:#d8d4cc; }}
+@media (prefers-color-scheme: dark) {{ :root {{ --bg:#191816; --fg:#ece9e3; --muted:#a29e96; --line:#34322e; --panel:#22211e; --win:#5cbf8e; --lose:#e07a60; --grid:#3d3a35; }} }}
+body {{ background:var(--bg); color:var(--fg); font:15px/1.5 -apple-system, system-ui, sans-serif; margin:0; padding:32px 16px; }}
+main {{ max-width:980px; margin:0 auto; display:grid; gap:36px; }}
+h1 {{ font:400 30px/1.2 Georgia, serif; margin:0; }} h2 {{ font-size:18px; margin:0 0 6px; }}
+p {{ margin:0 0 8px; color:var(--muted); max-width:72ch; }}
+.tiles {{ display:grid; grid-template-columns:repeat(auto-fit,minmax(170px,1fr)); gap:12px; }}
+.tile {{ background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:14px 16px; }}
+.tile .k {{ font-size:12px; color:var(--muted); }} .tile .v {{ font:400 26px Georgia, serif; font-variant-numeric:tabular-nums; }}
+.tile .n {{ font-size:12px; color:var(--muted); }}
+.wrap {{ overflow-x:auto; }}
+table {{ border-collapse:collapse; width:100%; font-size:13px; font-variant-numeric:tabular-nums; }}
+th, td {{ padding:6px 10px; border-bottom:1px solid var(--line); text-align:right; white-space:nowrap; }}
+th:first-child, td:first-child {{ text-align:left; }} th {{ color:var(--muted); font-weight:500; }}
+.hist td:nth-child(3) {{ white-space:normal; text-align:left; min-width:260px; }}
+.w {{ color:var(--win); font-weight:600; }} .l {{ color:var(--lose); font-weight:600; }}
+svg {{ width:100%; max-width:640px; display:block; }} svg text {{ fill:var(--muted); font-size:12px; }}
+svg .lbl {{ fill:var(--fg); }} svg .grid {{ stroke:var(--grid); }} svg .one {{ stroke:var(--muted); }}
+svg .win {{ fill:var(--win); }} svg .lose {{ fill:var(--lose); }}
+code {{ font-size:12px; }} footer {{ font-size:12px; color:var(--muted); }}
+</style></head><body><main>
+<header><h1>rts: reference counting vs tracing GC</h1>
+<p>The same engine and the same compiled code, built two ways: reference counting with scope arenas and a cycle collector (the default), and a tracing mark-sweep GC (<code>--features gc</code>) that keeps no counts. Typed Are-We-Fast-Yet ports; output matches Node byte for byte. Commit <code>{esc(commit)}</code>, {esc(date)}.</p></header>
+
+<section class="tiles">
+<div class="tile"><div class="k">Time, RC ÷ GC (geomean)</div><div class="v">{time_r:.2f}×</div><div class="n">RC {verdict_time}; RC wins {wins_t} of {len(benches)}</div></div>
+<div class="tile"><div class="k">Peak RSS, RC ÷ GC (geomean)</div><div class="v">{rss_r:.2f}×</div><div class="n">RC smaller on {wins_m} of {len(benches)}</div></div>
+<div class="tile"><div class="k">Longest pause</div><div class="v">{pause_rc:.1f} / {pause_gc:.0f} ms</div><div class="n">RC / GC, worst benchmark</div></div>
+<div class="tile"><div class="k">Suite geomean time</div><div class="v">{geo("rc"):.3f} / {geo("gc"):.3f} s</div><div class="n">RC / GC</div></div>
+</section>
+
+<section><h2>Time, RC ÷ GC</h2><p>Below 1×: reference counting is faster. Log scale.</p>
+{ratio_bars([(b, rel(b, "rc", "wall")) for b in benches], "time ratio")}</section>
+
+<section><h2>Peak memory, RC ÷ GC</h2><p>Process peak RSS. Below 1×: reference counting uses less. The GC collects only once the heap reaches 8 MB, then at a multiple of the live heap.</p>
+{ratio_bars([(b, rel(b, "rc", "rss")) for b in benches], "memory ratio")}</section>
+
+<section><h2>Per benchmark</h2><p>Seconds (each harness's own measurement, start-up excluded, median of runs), peak RSS in MB, longest collector pause in ms.</p>
+{table(["benchmark", "RC s", "GC s", "time RC÷GC", "RC MB", "GC MB", "RSS RC÷GC", "RC pause", "GC pause"], thesis_rows)}</section>
+
+<section><h2>Every configuration: time (s)</h2>
+{table(["benchmark"] + [LABEL[c] for c in configs], all_rows)}</section>
+
+<section><h2>Every configuration: peak RSS (MB)</h2><p>Last two columns: peak live heap (MB) as rts counts it.</p>
+{table(["benchmark"] + [LABEL[c] for c in configs] + ["RC heap", "GC heap"], mem_rows)}</section>
+
+{"<section><h2>Latency</h2><p>Request-style workload (bench/latency.py): per-operation time in µs.</p>" + table(["config", "mean", "p50", "p99", "p99.9", "max", "RSS MB"], lat_rows) + "</section>" if lat_rows else ""}
+
+<section><h2>History</h2><p>Suite geometric means at each recorded step (newest first).</p>
+{table(["date", "commit", "step", "RC s", "GC s", "RC÷GC", "node --jitless s"], hist_rows, "hist")}</section>
+
+{"<section><h2>Instruction profile (interpreter, profiling build)</h2><p>Share of sampled time, executions, allocations and reference-count updates per execution.</p>" + table(["instruction", "time %", "count", "allocs", "rc ops/op"], prof_rows) + "</section>" if prof_rows else ""}
+
+<footer>Generated by bench/results/build.py from bench/modes.py, bench/latency.py and bench/profile.py (bench/measure.sh runs all three).</footer>
+</main></body></html>
+"""
+open(os.path.join(HERE, "report.html"), "w").write(page)
+print({c: round(geo(c), 4) for c in configs}, "->", os.path.join(HERE, "report.html"))
