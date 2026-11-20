@@ -118,5 +118,13 @@
   "rc_geomean_s": 0.1043,
   "gc_geomean_s": 0.102,
   "jitless_geomean_s": 0.4356
+ },
+ {
+  "commit": "2f42f2f",
+  "date": "2026-11-20",
+  "step": "Ownership RC prototype (--features owners) measured alongside",
+  "rc_geomean_s": 0.1101,
+  "gc_geomean_s": 0.1078,
+  "jitless_geomean_s": 0.4524
  }
 ]

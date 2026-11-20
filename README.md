@@ -223,6 +223,13 @@ by cause; `bench/latency.py` times each request of a request loop.
   memory within 6% on every program, with no tracing. The proposal is to replace
   the cycle collector with ownership: an orphan check whose cost is proportional
   to the garbage being freed, plus budgeted incremental freeing.
+- Prototype (`cargo build --release --features owners --target-dir
+  target/owners`, 2026-11-20). On the cyclic programs it has the lowest memory
+  of any strategy, 1.3–3.8× below the GC tuned for small memory: Havlak 13.4
+  MB mean / 15.7 peak, against 24.2 / 38.3 for today's RC and 20.8 / 35.6 for
+  the GC. It ties today's RC on the acyclic ones. Longest pauses fall (Havlak
+  14.7 → 3.7 ms), but DeltaBlue's is still 6.1 ms. Throughput costs 1.31×.
+  Details in [docs/memory-model.md](docs/memory-model.md).
 
 Measurements before 2026-11-17 that used native code are not a fair baseline:
 the GC build barely collected while compiled code ran (950 MB peak on Havlak).

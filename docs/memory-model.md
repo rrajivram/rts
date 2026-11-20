@@ -202,10 +202,12 @@ sizes. Only the memory strategy differs.
 | Storage | 0.55 / 1.04, 0.25 | **0.56 / 1.09, 0.21** | 4.89 / 9.34, 1.8 | 2.59 / 4.97, 3.6 |
 | requests | 2.33 / 13.8, 0.10 | **2.22 / 13.3, 0.60** | 5.58 / 18.4, 3.7 | 3.27 / 16.3, 1.5 |
 
-- **Memory: ownership wins everywhere.** It's 1.3–2.4× below the GC tuned
-  for small memory and 2–12× below the default GC. On the cyclic programs
-  it's 25–75% below today's RC: Havlak's peak falls from 38 to 16 MB.
-  These figures include the 8 extra header bytes.
+- **Memory: lowest of every strategy on the cyclic programs.** On
+  Havlak, DeltaBlue, CD, churn and Richards, ownership is 25–75% below
+  today's RC (Havlak's peak falls from 38 to 16 MB) and 1.3–3.8× below the
+  GC tuned for small memory. On the acyclic ones (Json, Storage, requests)
+  it ties today's RC (Json's peak is 0.3 MB higher) and stays 1.5–6× below
+  the tuned GC. These figures include the 8 extra header bytes.
 - **Pauses: much shorter, not yet gone.** Havlak's longest falls from 14.7
   to 3.7 ms (the GC's: 9.8–16.6). DeltaBlue's is still 6.1 ms: a check of a
   dead 96 000-object constraint graph, traced and freed in one go. The cost
