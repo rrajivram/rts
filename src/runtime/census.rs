@@ -139,6 +139,10 @@ struct Snap {
     /// What an exact collector would hold.
     reachable: u64,
     rules: [RuleSnap; RULES],
+    /// `owners` build: boxes with an owner; owner links to a box that
+    /// doesn't hold them (or isn't a live heap box) — must stay 0.
+    owned: u64,
+    stale_owners: u64,
 }
 
 #[derive(Default)]
@@ -616,7 +620,53 @@ pub fn snapshot() {
         snap.floating = floating;
         snap.design = reachable + floating;
     }
-    s.snaps.push(Snap { at_alloc, live: s.live_bytes, reachable, rules: snaps });
+    #[allow(unused_mut)]
+    let (mut owned, mut stale_owners) = (0u64, 0u64);
+    #[cfg(feature = "owners")]
+    for a in 0..n {
+        let o = unsafe { (*(g.addrs[a] as *const Header)).owner.get() };
+        if o == 0 {
+            continue;
+        }
+        owned += 1;
+        let holds = index.get(&o).is_some_and(|&oi| g.kids[oi as usize].contains(&(a as u32)));
+        if !holds {
+            stale_owners += 1;
+            if stale_owners <= 5 {
+                let ok = index.get(&o).map(|&oi| s.kinds[g.kind[oi as usize] as usize].as_str()).unwrap_or("(not a live heap box)");
+                eprintln!("census: stale owner: {} owned by {}", s.kinds[g.kind[a] as usize], ok);
+            }
+        }
+    }
+    // Garbage this build holds: how it's owned (`RTS_CENSUS_WHY=1`).
+    #[cfg(feature = "owners")]
+    if std::env::var_os("RTS_CENSUS_WHY").is_some() {
+        let mut why: FxHashMap<(String, &str), u64> = FxHashMap::default();
+        for a in 0..n {
+            if reach[a] {
+                continue;
+            }
+            let h = unsafe { &*(g.addrs[a] as *const Header) };
+            let o = h.owner.get();
+            let state = if o == 0 {
+                if h.has(flag::BUFFERED) { "unowned, buffered" } else { "unowned, not buffered" }
+            } else {
+                match index.get(&o) {
+                    Some(&oi) if reach[oi as usize] => "owned by live",
+                    Some(_) => "owned by garbage",
+                    None => "owned by untracked",
+                }
+            };
+            *why.entry((s.kinds[g.kind[a] as usize].clone(), state)).or_default() += 1;
+        }
+        let mut v: Vec<_> = why.into_iter().collect();
+        v.sort_by_key(|x| std::cmp::Reverse(x.1));
+        let line: Vec<String> = v.iter().take(8).map(|((k, st), c)| format!("{k} {st}: {c}")).collect();
+        if !line.is_empty() {
+            eprintln!("census: garbage held at {at_alloc}: {}", line.join("; "));
+        }
+    }
+    s.snaps.push(Snap { at_alloc, live: s.live_bytes, reachable, rules: snaps, owned, stale_owners });
     let every = s.every.unwrap_or((s.boxes.len() as u64 / 2).max(10_000));
     s.next = STATS.allocated.get() + every;
 }
@@ -707,6 +757,7 @@ pub fn finish() {
     j.push_str("],\n\"snapshots\": [");
     for (n, x) in s.snaps.iter().enumerate() {
         j.push_str(&format!("{}[{},{},{}", sep(n), x.at_alloc, x.live, x.reachable));
+        j.push_str(&format!(",{},{}", x.owned, x.stale_owners));
         for r in &x.rules {
             j.push_str(&format!(",{},{},{},{},{}", r.design, r.floating, r.largest, r.largest_members, r.regions));
         }
@@ -751,4 +802,11 @@ pub fn finish() {
         );
     }
     eprintln!("  cyclic-kind boxes freed before any snapshot: {} ({:.2} MB)", s.unseen_cyclic, mb(s.unseen_cyclic_bytes as f64));
+    if cfg!(feature = "owners") {
+        eprintln!(
+            "  owners: up to {} owned boxes at a snapshot; stale owner links: {} (must be 0)",
+            s.snaps.iter().map(|x| x.owned).max().unwrap_or(0),
+            s.snaps.iter().map(|x| x.stale_owners).sum::<u64>()
+        );
+    }
 }

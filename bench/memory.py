@@ -20,8 +20,11 @@ import json, os, statistics, subprocess, sys, tempfile
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 RC = os.environ.get("RTS", os.path.join(ROOT, "target/release/rts"))
 GC = os.environ.get("RTS_GC", os.path.join(ROOT, "target/gc/release/rts"))
+# Ownership reference counting (docs/memory-model.md): `--features owners`.
+OWN = os.environ.get("RTS_OWNERS", os.path.join(ROOT, "target/owners/release/rts"))
 CONFIGS = {
     "rc": [RC],
+    "rc-owners": [OWN],
     "rc-deferred": [RC, "--deferred-rc"],
     "gc": [GC],
     "gc-1.5": ["env", "RTS_GC_GROW=1.5", GC],
@@ -38,6 +41,7 @@ PROGRAMS = {
     "Storage": (AWFY, ["harness.ts", "Storage", "5", "1000"]),
     "Richards": (AWFY, ["harness.ts", "Richards", "5", "100"]),
     "requests": (ROOT, [os.path.join(ROOT, "bench/workloads/requests.ts"), "300000"]),
+    "churn": (ROOT, [os.path.join(ROOT, "bench/workloads/churn.ts"), "20000"]),
 }
 POINTS = 300
 

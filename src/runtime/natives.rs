@@ -1265,20 +1265,11 @@ pub fn call_native(vm: &mut Vm, n: Native, this: Value, args: &[Value]) -> NResu
         }
         ArrPop => {
             let a = arr_of(&this).or_else(|m| te(vm, m))?;
-            let mut st = a.store.borrow_mut();
-            match &mut *st {
-                ArrStore::Num(v) => v.pop().map_or(Value::Undef, Value::Num),
-                ArrStore::Val(v) => v.pop().unwrap_or(Value::Undef),
-            }
+            a.pop()
         }
         ArrShift => {
             let a = arr_of(&this).or_else(|m| te(vm, m))?;
-            let mut st = a.store.borrow_mut();
-            match &mut *st {
-                ArrStore::Num(v) if !v.is_empty() => Value::Num(v.remove(0)),
-                ArrStore::Val(v) if !v.is_empty() => v.remove(0),
-                _ => Value::Undef,
-            }
+            a.shift()
         }
         ArrUnshift => {
             let a = arr_of(&this).or_else(|m| te(vm, m))?;
@@ -1511,7 +1502,7 @@ pub fn call_native(vm: &mut Vm, n: Native, this: Value, args: &[Value]) -> NResu
             let s = rel_index(int_arg(args, 1, 0.0), len);
             let e = rel_index(int_arg(args, 2, len as f64), len);
             if let (Value::Num(v), true) = (&x, s == 0 && e == len) {
-                *a.store.borrow_mut() = ArrStore::Num(vec![*v; len]);
+                a.replace_store(ArrStore::Num(vec![*v; len]));
             } else {
                 for i in s..e {
                     a.set(i, x.clone());
@@ -1977,13 +1968,13 @@ pub fn make_array(vals: Vec<Value>) -> Gc<Array> {
 }
 
 fn replace_contents(a: &Array, vals: Vec<Value>) {
-    let mut st = a.store.borrow_mut();
-    *st = match &*st {
+    let new = match &*a.store.borrow() {
         ArrStore::Num(_) if vals.iter().all(|v| matches!(v, Value::Num(_))) => {
             ArrStore::Num(vals.iter().map(|v| v.to_number()).collect())
         }
         _ => ArrStore::Val(vals),
     };
+    a.replace_store(new);
 }
 
 /// Index key as an array index, if it is one.

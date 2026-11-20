@@ -67,6 +67,27 @@ pub(super) fn peek_value(tag: u64, payload: u64) -> std::mem::ManuallyDrop<Value
 }
 
 /// Drop a value overwritten in a field.
+/// Ownership (`owners` build): `holder` (a box address) stored the value.
+pub(super) extern "C" fn h_own(holder: u64, tag: u64, payload: u64) {
+    #[cfg(feature = "owners")]
+    crate::runtime::heap::own_value(unsafe { NonNull::new_unchecked(holder as *mut Header) }, &peek_value(tag, payload));
+    let _ = (holder, tag, payload);
+}
+
+/// Ownership: `holder` was read for the value.
+pub(super) extern "C" fn h_adopt(holder: u64, tag: u64, payload: u64) {
+    #[cfg(feature = "owners")]
+    crate::runtime::heap::adopt_value(unsafe { NonNull::new_unchecked(holder as *mut Header) }, &peek_value(tag, payload));
+    let _ = (holder, tag, payload);
+}
+
+/// Ownership: `holder` is about to release the value.
+pub(super) extern "C" fn h_disown(holder: u64, tag: u64, payload: u64) {
+    #[cfg(feature = "owners")]
+    crate::runtime::heap::disown_value(unsafe { NonNull::new_unchecked(holder as *mut Header) }, &peek_value(tag, payload));
+    let _ = (holder, tag, payload);
+}
+
 pub(super) extern "C" fn h_drop_val(tag: u64, payload: u64) {
     drop(std::mem::ManuallyDrop::into_inner(peek_value(tag, payload)));
 }

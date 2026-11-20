@@ -151,10 +151,59 @@ impl Array {
         })
     }
     pub fn new_val(v: Vec<Value>) -> Gc<Array> {
-        Gc::new(Array {
+        let a = Gc::new(Array {
             store: RefCell::new(ArrStore::Val(v)),
             props: RefCell::new(None),
-        })
+        });
+        #[cfg(feature = "owners")]
+        if let ArrStore::Val(vs) = &*a.store.borrow() {
+            for x in vs {
+                heap::own_value(a.header_ptr(), x);
+            }
+        }
+        a
+    }
+    /// Replace the elements (the old ones are released after). Elements
+    /// kept keep their owner; removed ones lose it.
+    pub fn replace_store(&self, new: ArrStore) {
+        #[cfg(feature = "owners")]
+        let me = heap::header_of(self);
+        let old = std::mem::replace(&mut *self.store.borrow_mut(), new);
+        #[cfg(feature = "owners")]
+        {
+            if let ArrStore::Val(vs) = &old {
+                for x in vs {
+                    heap::disown_value(me, x);
+                }
+            }
+            if let ArrStore::Val(vs) = &*self.store.borrow() {
+                for x in vs {
+                    heap::own_value(me, x);
+                }
+            }
+        }
+        drop(old);
+    }
+    /// The last element, removed.
+    pub fn pop(&self) -> Value {
+        let v = match &mut *self.store.borrow_mut() {
+            ArrStore::Num(v) => v.pop().map_or(Value::Undef, Value::Num),
+            ArrStore::Val(v) => v.pop().unwrap_or(Value::Undef),
+        };
+        #[cfg(feature = "owners")]
+        heap::disown_value(heap::header_of(self), &v);
+        v
+    }
+    /// The first element, removed.
+    pub fn shift(&self) -> Value {
+        let v = match &mut *self.store.borrow_mut() {
+            ArrStore::Num(v) if !v.is_empty() => Value::Num(v.remove(0)),
+            ArrStore::Val(v) if !v.is_empty() => v.remove(0),
+            _ => Value::Undef,
+        };
+        #[cfg(feature = "owners")]
+        heap::disown_value(heap::header_of(self), &v);
+        v
     }
     pub fn len(&self) -> usize {
         match &*self.store.borrow() {
@@ -165,7 +214,12 @@ impl Array {
     pub fn get(&self, i: usize) -> Value {
         match &*self.store.borrow() {
             ArrStore::Num(v) => v.get(i).map_or(Value::Undef, |n| Value::Num(*n)),
-            ArrStore::Val(v) => v.get(i).cloned().unwrap_or(Value::Undef),
+            ArrStore::Val(v) => {
+                let x = v.get(i).cloned().unwrap_or(Value::Undef);
+                #[cfg(feature = "owners")]
+                heap::adopt_value(heap::header_of(self), &x);
+                x
+            }
         }
     }
     pub fn to_vec(&self) -> Vec<Value> {
@@ -200,7 +254,15 @@ impl Array {
         if i >= v.len() {
             v.resize(i + 1, Value::Undef);
         }
-        v[i] = val;
+        #[cfg(feature = "owners")]
+        {
+            let me = heap::header_of(self);
+            heap::disown_value(me, &v[i]);
+            heap::own_value(me, &val);
+        }
+        let old = std::mem::replace(&mut v[i], val);
+        drop(st);
+        drop(old);
     }
     pub fn push(&self, val: Value) {
         let len = self.len();
@@ -215,9 +277,27 @@ impl Array {
                     v.resize(n, f64::NAN)
                 }
             }
-            ArrStore::Val(v) => v.resize(n, Value::Undef),
+            ArrStore::Val(v) => {
+                #[cfg(feature = "owners")]
+                for x in v.iter().skip(n) {
+                    heap::disown_value(heap::header_of(self), x);
+                }
+                v.resize(n, Value::Undef)
+            }
         }
     }
+}
+
+/// Store into a captured variable's cell.
+pub fn cell_set(cell: &Gc<RefCell<Value>>, x: Value) {
+    #[cfg(feature = "owners")]
+    {
+        let me = cell.header_ptr();
+        heap::disown_value(me, &cell.borrow());
+        heap::own_value(me, &x);
+    }
+    let old = std::mem::replace(&mut *cell.borrow_mut(), x);
+    drop(old);
 }
 
 /// An ordered list of property names. Objects built the same way share a
@@ -392,7 +472,7 @@ impl Object {
         let spill = if n > cap { Some(Box::new(if it.len() > 0 { it.collect() } else { vec![Value::Undef; n - cap] })) } else { None };
         let obj = Object { shape: UnsafeCell::new(shape), spill: UnsafeCell::new(spill) };
         let flags = flags | (cap as u32) << CAP_SHIFT;
-        unsafe {
+        let g = unsafe {
             Gc::new_tail_in(
                 obj,
                 cap * size_of::<Value>(),
@@ -409,7 +489,12 @@ impl Object {
                 alloc,
                 flags,
             )
+        };
+        #[cfg(feature = "owners")]
+        for x in g.inline_slots().iter().chain(g.spilled()) {
+            heap::own_value(g.header_ptr(), x);
         }
+        g
     }
     /// Where the shape (an `Rc<Shape>`) is, from the start of the object's box.
     pub const SHAPE_OFFSET: usize = Gc::<Object>::VALUE_OFFSET + std::mem::offset_of!(Object, shape);
@@ -483,7 +568,10 @@ impl Object {
     #[inline(always)]
     pub fn slot(&self, i: usize) -> Value {
         debug_assert!(i < self.len());
-        unsafe { (*self.slot_ptr(i)).clone() }
+        let x = unsafe { (*self.slot_ptr(i)).clone() };
+        #[cfg(feature = "owners")]
+        heap::adopt_value(heap::header_of(self), &x);
+        x
     }
     /// Field `i` if it holds a number.
     #[inline(always)]
@@ -502,6 +590,12 @@ impl Object {
     #[inline(always)]
     pub fn set_slot(&self, i: usize, v: Value) {
         debug_assert!(i < self.len());
+        #[cfg(feature = "owners")]
+        {
+            let me = heap::header_of(self);
+            heap::disown_value(me, unsafe { &*self.slot_ptr(i) });
+            heap::own_value(me, &v);
+        }
         let old = unsafe { std::mem::replace(&mut *self.slot_ptr(i), v) };
         drop(old);
     }
@@ -519,6 +613,8 @@ impl Object {
         if n < self.cap() {
             self.set_slot(n, val);
         } else {
+            #[cfg(feature = "owners")]
+            heap::own_value(heap::header_of(self), &val);
             unsafe { (*self.spill.get()).get_or_insert_default().push(val) };
         }
     }
@@ -545,6 +641,10 @@ impl Object {
             }
             if n > self.cap() {
                 let last = unsafe { (*self.spill.get()).as_mut().and_then(|s| s.pop()) };
+                #[cfg(feature = "owners")]
+                if let Some(x) = &last {
+                    heap::disown_value(heap::header_of(self), x);
+                }
                 drop(last);
             } else {
                 self.set_slot(n - 1, Value::Undef);

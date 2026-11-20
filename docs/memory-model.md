@@ -1,8 +1,8 @@
 # Memory model: ownership instead of a cycle collector
 
-Status: proposal, backed by the heap census (`RTS_CENSUS`, `bench/census.py`,
-results in `bench/results/census.json`). Nothing here changes how memory is
-managed yet.
+Status: prototype. The heap census (`RTS_CENSUS`, `bench/census.py`, results
+in `bench/results/census.json` and `census-owners.json`) motivated the design.
+It is built as `--features owners`, measured below, and isn't the default yet.
 
 ## The thesis, and why the current design can't show it
 
@@ -139,6 +139,80 @@ ownership forest is in the spirit of Lobster's inferred ownership and of
 Rust/Vale owner-plus-borrow, but inferred dynamically and never rejected.
 Programs keep full JavaScript semantics.
 
+## Prototype: `--features owners`
+
+Built as a separate binary (`cargo build --release --features owners
+--target-dir target/owners`), so the default build is unchanged. The global
+cycle collector doesn't run in it.
+
+- `heap.rs`: an `owner` word in the box header (+8 bytes, so the header is
+  24 bytes, the same as the tracing GC's), and `OWNED`/`OWNS` flags.
+  - `own` on a store, `disown` before a reference leaves its holder, `adopt`
+    on a load, and `orphan_children` when a holder is freed.
+  - With `OWNED` in the quiet mask, a decrement of an owned box never
+    queues it as a candidate, even from inline compiled code.
+- Hooks in every store and remove path for object fields, array elements
+  and captured-variable cells: interpreter, natives (`pop`, `shift`,
+  `splice`, `sort`, `fill`, …), and compiled code's `store_slot`, field and
+  element loads.
+- `cycles::collect_owned`: trial deletion over the candidates, what they
+  own, and the unowned roots they borrow. Never over owned boxes reached by
+  a borrow. Checks run at 10 000 candidates, or once the program's heap has
+  grown by a quarter (at least 512 KB) while candidates wait.
+- The census verifies the invariant: in the owners build it counts owner
+  links that don't match a real reference. It found none on any program.
+
+The prototype changed the design in three places. Each came from
+measurement, and all three are in the code:
+
+1. **Demote on cycle.** Structures are often built bottom-up: `grow()`
+   makes a child with `parent = n` before `n` holds the child, so the child
+   became the parent's owner and the parent's array couldn't own the child.
+   Now, when a store would close an ownership cycle, the store wins and the
+   older link becomes a borrow. The census simulation had hidden this: it
+   assigned owners after construction, top-down.
+2. **Adopt on load.** When a `Vector` grows, it copies its elements into a
+   new array and drops the old one, which orphans them. The new array
+   already holds them, so nothing re-owned them, and Havlak's 5 213 blocks
+   were queued as candidates 349 842 times. Reading an unowned object out of
+   a holder proves the holder holds it, so the holder adopts it. A load never
+   demotes a link.
+3. **Checks follow borrows to unowned roots.** DeltaBlue's graph is many
+   small trees (each Variable owns its constraint vector) linked by borrows
+   (constraints point at other Variables). A middle Variable was checked
+   while a loop variable still held it, survived, and nothing ever queued it
+   again. A check now also takes in the unowned roots its members borrow, so
+   a dead structure of linked trees is checked as one. Owned boxes reached
+   by a borrow stay out of the check, so a large live structure is never
+   pulled in.
+
+### Results (`bench/memory.py`: live heap every 250 µs, every pause)
+
+Memory MB, mean / peak, and the longest pause in ms; 5 iterations at standard
+sizes. Only the memory strategy differs.
+
+| program | RC today | **RC, ownership** | tracing GC, default | tracing GC, tuned small |
+|---|---|---|---|---|
+| Havlak | 24.2 / 38.3, 14.7 | **13.4 / 15.7, 3.7** | 30.8 / 60.0, 16.6 | 20.8 / 35.6, 9.8 |
+| DeltaBlue | 11.7 / 19.7, 6.5 | **8.6 / 14.0, 6.1** | 17.1 / 37.7, 9.9 | 12.4 / 25.7, 11.2 |
+| CD | 1.26 / 2.09, 0.71 | **0.90 / 1.58, 0.36** | 5.47 / 10.3, 2.8 | 2.80 / 5.25, 1.29 |
+| churn | 4.00 / 5.70, 2.8 | **1.00 / 1.29, 0.35** | 4.74 / 7.79, 1.6 | 1.25 / 1.67, 0.35 |
+| Richards | 0.56 / 1.19, 0.48 | **0.32 / 0.76, 0.24** | 0.84 / 2.01, 0.52 | 1.21 / 2.38, 0.04 |
+| Json | 0.69 / 1.06, 0.28 | **0.64 / 1.33, 0.19** | 7.88 / 14.6, 4.7 | 4.22 / 7.46, 2.5 |
+| Storage | 0.55 / 1.04, 0.25 | **0.56 / 1.09, 0.21** | 4.89 / 9.34, 1.8 | 2.59 / 4.97, 3.6 |
+| requests | 2.33 / 13.8, 0.10 | **2.22 / 13.3, 0.60** | 5.58 / 18.4, 3.7 | 3.27 / 16.3, 1.5 |
+
+- **Memory: ownership wins everywhere.** It's 1.3–2.4× below the GC tuned
+  for small memory and 2–12× below the default GC. On the cyclic programs
+  it's 25–75% below today's RC: Havlak's peak falls from 38 to 16 MB.
+  These figures include the 8 extra header bytes.
+- **Pauses: much shorter, not yet gone.** Havlak's longest falls from 14.7
+  to 3.7 ms (the GC's: 9.8–16.6). DeltaBlue's is still 6.1 ms: a check of a
+  dead 96 000-object constraint graph, traced and freed in one go. The cost
+  is proportional to the garbage, as intended, but still a single pause.
+- The census confirms it: DeltaBlue holds within 9% of exact, and Havlak,
+  Json, Storage and requests hold exactly what an exact collector would.
+
 ## Risks and open questions
 
 - **Ownership churn.** An object moved between containers (popped from one
@@ -162,14 +236,18 @@ Programs keep full JavaScript semantics.
 
 ## Plan
 
-1. **Prototype owners and the orphan check, with the cycle collector still
-   running as a cross-check.** Measure: garbage the collector still finds
-   (target ≈ 0), checks per second, objects traced per check, the longest
-   check.
-2. **Unowned-root checks, then the cycle collector off by default.** Rerun
-   `bench/memory.py` and `bench/latency.py`. Target: on every program, memory
-   within 10% of exact and no pause above 1 ms (today 11.6 ms on Havlak, 6.0
-   ms on DeltaBlue).
-3. **Budgeted incremental freeing** for counts and checks alike.
-4. **Fold the census into the report**, so the "exact vs held" gap is tracked
-   with every step.
+1. ~~Prototype owners and the orphan check.~~ Done (above). The census
+   replaced the cycle collector as the cross-check: it compares what's held
+   with what's reachable and verifies every owner link.
+2. ~~Unowned-root checks, cycle collector off.~~ Done in the owners build.
+   Memory target met. The pause target (≤ 1 ms everywhere) is not: Havlak
+   3.7 ms, DeltaBlue 6.1 ms.
+3. **Bound each check.** The remaining pauses are single checks over large
+   sets: a dead constraint graph, or unowned roots with large trees. Options:
+   - free the garbage incrementally (the freeing half of the pause);
+   - cap a check's size and split it, which needs to know that nothing
+     mutated the part already traced;
+   - find why Havlak still has unowned roots with large trees (ownership
+     missed somewhere).
+4. **Make ownership the default build**, once throughput is measured
+   (`bench/modes.py`, config `rc-owners`).

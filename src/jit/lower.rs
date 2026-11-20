@@ -75,6 +75,17 @@ helpers! {
     region_exit = h_region_exit();
     gc_poll = h_gc_poll();
     region_unwind = h_region_unwind(I64);
+    own = h_own(I64, I64, I64);
+    adopt = h_adopt(I64, I64, I64);
+    disown = h_disown(I64, I64, I64);
+}
+
+/// What `own_word` does.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Own {
+    Own,
+    Adopt,
+    Disown,
 }
 
 /// Layout facts compiled code relies on.
@@ -385,7 +396,7 @@ impl Lower<'_, '_> {
             }
             _ => {
                 let base = self.b.ins().load(types::I64, mf(), self.ctx, CTX_GLOBAL_VALUES);
-                self.load_slot(base, i * 16, vj, [ERR_UNBOX_NUM, ERR_UNBOX_BOOL, ERR_UNBOX_REF])
+                self.load_slot(base, i * 16, vj, [ERR_UNBOX_NUM, ERR_UNBOX_BOOL, ERR_UNBOX_REF], None)
             }
         }
     }
@@ -403,7 +414,7 @@ impl Lower<'_, '_> {
             }
             _ => {
                 let base = self.b.ins().load(types::I64, mf(), self.ctx, CTX_GLOBAL_VALUES);
-                self.store_slot(base, i * 16, vj, r);
+                self.store_slot(base, i * 16, vj, r, None);
             }
         }
     }
@@ -435,7 +446,7 @@ impl Lower<'_, '_> {
         } else if self.in_mem(v) {
             let c = self.cell_ptr(v);
             let off = self.lay.cell_value;
-            self.load_slot(c, off, var_jv(self.hir, v), [ERR_UNBOX_NUM, ERR_UNBOX_BOOL, ERR_UNBOX_REF])
+            self.load_slot(c, off, var_jv(self.hir, v), [ERR_UNBOX_NUM, ERR_UNBOX_BOOL, ERR_UNBOX_REF], Some(c))
         } else {
             self.use_var(v)
         }
@@ -456,7 +467,7 @@ impl Lower<'_, '_> {
         } else {
             let c = self.cell_ptr(v);
             let off = self.lay.cell_value;
-            self.store_slot(c, off, var_jv(self.hir, v), r);
+            self.store_slot(c, off, var_jv(self.hir, v), r, Some(c));
         }
     }
 
@@ -658,7 +669,7 @@ impl Lower<'_, '_> {
     fn dec_box(&mut self, p: CV) {
         let rc = self.b.ins().load(types::I32, mf(), p, 0);
         let fl = self.b.ins().load(types::I32, mf(), p, 4);
-        let mask = (heap::flag::ACYCLIC | heap::flag::BUFFERED | heap::flag::ARENA) as i64;
+        let mask = heap::QUIET as i64;
         let m = self.b.ins().band_imm_u(fl, mask);
         let quiet = self.b.ins().icmp_imm_u(IntCC::NotEqual, m, 0);
         let above1 = self.b.ins().icmp_imm_u(IntCC::UnsignedGreaterThan, rc, 1);
@@ -1059,12 +1070,12 @@ impl Lower<'_, '_> {
         for v in fresh {
             if let Some(x) = self.cells.get(v).copied() {
                 let old = self.b.use_var(x);
-                let r = self.load_slot(old, self.lay.cell_value, JV::Val, [0; 3]);
+                let r = self.load_slot(old, self.lay.cell_value, JV::Val, [0; 3], Some(old));
                 self.inc_rv(r);
                 let call = self.b.ins().call(self.h.new_cell, &[]);
                 let c = self.b.inst_results(call)[0];
                 self.b.def_var(x, c);
-                self.store_slot(c, self.lay.cell_value, JV::Val, r);
+                self.store_slot(c, self.lay.cell_value, JV::Val, r, Some(c));
                 self.dec(old);
             }
         }
@@ -1656,10 +1667,17 @@ impl Lower<'_, '_> {
     /// Check the words of a slot's value (at `at + off`) and convert to a
     /// `want` (borrowed). `codes` are the errors for a number, a boolean
     /// and a reference.
-    fn load_slot(&mut self, at: CV, off: i32, want: JV, codes: [u32; 3]) -> RV {
+    /// `holder`: the box the slot is in (none for a global).
+    fn load_slot(&mut self, at: CV, off: i32, want: JV, codes: [u32; 3], holder: Option<CV>) -> RV {
         let tag = self.b.ins().load(types::I8, mf(), at, off);
         let tag = self.b.ins().uextend(types::I64, tag);
         let payload = self.b.ins().load(types::I64, mf(), at, off + 8);
+        if cfg!(feature = "owners")
+            && let Some(h) = holder
+            && !matches!(want, JV::Num | JV::Bool)
+        {
+            self.own_word(h, tag, payload, Own::Adopt);
+        }
         match want {
             JV::Val => RV::val(tag, payload),
             JV::Num => {
@@ -1700,27 +1718,77 @@ impl Lower<'_, '_> {
     /// Read field `slot` of the object `p` as `want` (borrowed).
     fn load_field(&mut self, p: CV, slot: u32, want: JV) -> RV {
         let off = Object::field_offset(slot as usize) as i32;
-        self.load_slot(p, off, want, [ERR_FIELD_NUM, ERR_FIELD_BOOL, ERR_FIELD_REF])
+        self.load_slot(p, off, want, [ERR_FIELD_NUM, ERR_FIELD_BOOL, ERR_FIELD_REF], Some(p))
     }
 
     /// Store `r` (a `vj`, owned if counted) into the slot at `at + off`,
     /// then release the old value.
     #[track_caller]
-    fn store_slot(&mut self, at: CV, off: i32, vj: JV, r: RV) {
+    /// `holder`: the box the slot is in (none for a global).
+    fn store_slot(&mut self, at: CV, off: i32, vj: JV, r: RV, holder: Option<CV>) {
         let old_tag = self.b.ins().load(types::I8, mf(), at, off);
         let old_tag = self.b.ins().uextend(types::I64, old_tag);
         let old = self.b.ins().load(types::I64, mf(), at, off + 8);
         let (tag, payload) = self.value_words(vj, r);
         self.b.ins().istore8(mf(), tag, at, off);
         self.b.ins().store(mf(), payload, at, off + 8);
+        if cfg!(feature = "owners")
+            && let Some(h) = holder
+        {
+            self.own_word(h, old_tag, old, Own::Disown);
+            self.own_word(h, tag, payload, Own::Own);
+        }
         self.release_old(old_tag, old);
+    }
+
+    /// Ownership (`owners` build): `holder` now holds the value `t`/`p`
+    /// (`Own`), read it (`Adopt`), or is about to release it (`Disown`).
+    /// Inline for objects, arrays and strings when nothing changes.
+    fn own_word(&mut self, holder: CV, t: CV, p: CV, mode: Own) {
+        let boxed = self.b.ins().icmp_imm_u(IntCC::UnsignedGreaterThanOrEqual, t, self.lay.tag_first_gc);
+        let (tag_obj, tag_arr, tag_str) = (self.lay.tag_obj, self.lay.tag_arr, self.lay.tag_str);
+        let own = mode != Own::Disown;
+        let h = match mode {
+            Own::Own => self.h.own,
+            Own::Adopt => self.h.adopt,
+            Own::Disown => self.h.disown,
+        };
+        self.if_then(boxed, |s| {
+            let is_obj = s.b.ins().icmp_imm_u(IntCC::Equal, t, tag_obj);
+            let is_arr = s.b.ins().icmp_imm_u(IntCC::Equal, t, tag_arr);
+            let is_str = s.b.ins().icmp_imm_u(IntCC::Equal, t, tag_str);
+            let is_box = s.b.ins().bor(is_obj, is_arr);
+            let is_box = s.b.ins().bor(is_box, is_str);
+            let (ob, other, done) = (s.b.create_block(), s.b.create_block(), s.b.create_block());
+            s.b.ins().brif(is_box, ob, &[], other, &[]);
+            s.b.seal_block(ob);
+            s.b.seal_block(other);
+            s.b.switch_to_block(ob);
+            let fl = s.b.ins().load(types::I32, mf(), p, 4);
+            let need = if own {
+                let m = s.b.ins().band_imm_u(fl, (heap::flag::OWNED | heap::flag::ACYCLIC | heap::flag::ARENA) as i64);
+                s.b.ins().icmp_imm_u(IntCC::Equal, m, 0)
+            } else {
+                let m = s.b.ins().band_imm_u(fl, heap::flag::OWNED as i64);
+                s.b.ins().icmp_imm_u(IntCC::NotEqual, m, 0)
+            };
+            s.if_then(need, |s| {
+                s.b.ins().call(h, &[holder, t, p]);
+            });
+            s.b.ins().jump(done, &[]);
+            s.b.switch_to_block(other);
+            s.b.ins().call(h, &[holder, t, p]);
+            s.b.ins().jump(done, &[]);
+            s.b.seal_block(done);
+            s.b.switch_to_block(done);
+        });
     }
 
     /// Store `r` (a `vj`, owned if counted) into field `slot` of `p`.
     #[track_caller]
     fn store_field(&mut self, p: CV, slot: u32, vj: JV, r: RV) {
         let off = Object::field_offset(slot as usize) as i32;
-        self.store_slot(p, off, vj, r);
+        self.store_slot(p, off, vj, r, Some(p));
     }
 
     /// Release a value overwritten in a slot (its tag, widened, and payload).
@@ -1845,6 +1913,9 @@ impl Lower<'_, '_> {
             let tag = self.b.ins().load(types::I8, mf(), at, 0);
             let tag = self.b.ins().uextend(types::I64, tag);
             let payload = self.b.ins().load(types::I64, mf(), at, 8);
+            if cfg!(feature = "owners") && want != JV::Bool {
+                self.own_word(a, tag, payload, Own::Adopt);
+            }
             let (v, good) = if want == JV::Bool {
                 (self.b.ins().ireduce(types::I8, payload), self.b.ins().icmp_imm_u(IntCC::Equal, tag, self.lay.tag_bool))
             } else {
@@ -1899,6 +1970,9 @@ impl Lower<'_, '_> {
         let tag = self.b.ins().load(types::I8, mf(), at, 0);
         let tag = self.b.ins().uextend(types::I64, tag);
         let payload = self.b.ins().load(types::I64, mf(), at, 8);
+        if cfg!(feature = "owners") {
+            self.own_word(a, tag, payload, Own::Adopt);
+        }
         self.b.ins().jump(done, &[tag.into(), payload.into()]);
         self.b.seal_block(slow);
         self.b.switch_to_block(slow);
@@ -1940,7 +2014,7 @@ impl Lower<'_, '_> {
         self.b.switch_to_block(vals);
         let off = self.b.ins().ishl_imm_u(ii, 4);
         let at = self.b.ins().iadd(data, off);
-        self.store_slot(at, 0, vj, r);
+        self.store_slot(at, 0, vj, r, Some(a));
         self.b.ins().jump(done, &[]);
         self.b.seal_block(slow);
         self.b.switch_to_block(slow);

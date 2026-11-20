@@ -18,7 +18,7 @@ Per program:
 import json, os, subprocess, sys, tempfile
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-RTS = os.environ.get("RTS", os.path.join(ROOT, "target/release/rts"))
+RTS = os.path.abspath(os.environ.get("RTS", os.path.join(ROOT, "target/release/rts")))
 AWFY = os.path.join(ROOT, "bench/awfy/ts")
 PROGRAMS = {
     "Havlak": (AWFY, ["harness.ts", "Havlak", "5", "1500"]),
@@ -40,7 +40,7 @@ def summarize(d):
     cyc = [k for k in kinds if k["cyclic"]]
     cands = sum(k["candidates"] for k in kinds) or 1
     cols = d["collections"]  # at_alloc, candidates, traced, garbage, ns, cyclic_candidates, traced_cyclic_only
-    snaps = d["snapshots"]  # at_alloc, live, reachable, then per rule: design, floating, largest, largest_members, regions
+    snaps = d["snapshots"]  # at_alloc, live, reachable, owned, stale_owners, then per rule: design, floating, largest, largest_members, regions
     traced = sum(c[2] for c in cols) or 1
     n = len(snaps) or 1
     mean = lambda i: round(sum(s[i] for s in snaps) / n / MB, 2)
@@ -59,9 +59,10 @@ def summarize(d):
         "exact_mean_mb": mean(2), "exact_max_mb": peak(2),
         "snapshots": len(snaps),
         "unseen_cyclic_mb": round(d["unseen_cyclic_bytes"] / MB, 2),
+        "stale_owners": sum(s[4] for s in snaps),
     }
     for i, rule in enumerate(d["rules"]):
-        o = 3 + 5 * i
+        o = 5 + 5 * i
         r[rule] = {"mean_mb": mean(o), "max_mb": peak(o), "floating_max_mb": peak(o + 1),
                    "largest_region_mb": peak(o + 2), "region_frees": d["region_frees"][i]}
     return r
@@ -88,6 +89,7 @@ def main():
               f"cc traced {r['cc_traced']:9} ({r['cc_traced_cyclic_pct']:5.1f}% from cyclic kinds)  "
               f"MB mean/max: rc {r['rc_mean_mb']:.2f}/{r['rc_max_mb']:.2f}  exact {r['exact_mean_mb']:.2f}/{r['exact_max_mb']:.2f}  "
               + "  ".join(f"{k} {r[k]['mean_mb']:.2f}/{r[k]['max_mb']:.2f} (largest {r[k]['largest_region_mb']:.2f})" for k in ("merge", "owner"))
+              + (f"  stale owners {r['stale_owners']}" if r['stale_owners'] else "")
               + f"  [{' '.join(r['cyclic_kinds'])}]", flush=True)
     out = os.environ.get("OUT", os.path.join(ROOT, "bench/results/census.json"))
     json.dump(rows, open(out, "w"), indent=1)

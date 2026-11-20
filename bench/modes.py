@@ -36,6 +36,8 @@ CONFIGS = {
     "rc-noarena": [RC, "--mem-stats", "--no-arena"],
     "rc-nocc": [RC, "--mem-stats", "--no-cycles"],
     "rc-deferred": [RC, "--mem-stats", "--deferred-rc"],
+    # Ownership reference counting (`--features owners`, docs/memory-model.md).
+    "rc-owners": [os.environ.get("RTS_OWNERS", os.path.join(ROOT, "target/owners/release/rts")), "--mem-stats"],
     "gc": [GC, "--mem-stats"],
     "gc-1.25": ["env", "RTS_GC_GROW=1.25", GC, "--mem-stats"],
     "gc-1.5": ["env", "RTS_GC_GROW=1.5", GC, "--mem-stats"],

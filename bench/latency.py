@@ -8,8 +8,10 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 W = os.path.join(ROOT, "bench/workloads/requests.ts")
 RC = os.environ.get("RTS", os.path.join(ROOT, "target/release/rts"))
 GC = os.environ.get("RTS_GC", os.path.join(ROOT, "target/gc/release/rts"))
+OWN = os.environ.get("RTS_OWNERS", os.path.join(ROOT, "target/owners/release/rts"))
 CONFIGS = {
     "RC + arenas": [RC],
+    "RC, ownership": [OWN],
     "RC, deferred": [RC, "--deferred-rc"],
     "RC, no arenas": [RC, "--no-arena"],
     "RC, no cycle collector": [RC, "--no-cycles"],

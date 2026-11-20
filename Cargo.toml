@@ -25,3 +25,6 @@ lto = "thin"
 gc = []
 # Per-instruction counts, self time and allocations (`rts --profile`).
 profile = []
+# Ownership reference counting (docs/memory-model.md): every box records its
+# owner, and garbage cycles are found by checking only what a box owns.
+owners = []

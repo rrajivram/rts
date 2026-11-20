@@ -76,6 +76,10 @@ pub mod flag {
     pub const MARK: u32 = 1 << 6;
     /// On the zero-count list (deferred reference counting).
     pub const ZCT: u32 = 1 << 7;
+    /// Has an owner (`owners` build; see `own`).
+    pub const OWNED: u32 = 1 << 8;
+    /// Owns, or once owned, another box.
+    pub const OWNS: u32 = 1 << 9;
 }
 
 /// Count given to arena boxes. Far above any real count, so reference-count
@@ -88,6 +92,9 @@ pub struct Header {
     pub rc: Cell<u32>,
     pub flags: Cell<u32>,
     pub vt: &'static VTable,
+    /// The box holding this box's owning reference (0: none), `owners` build.
+    #[cfg(feature = "owners")]
+    pub owner: Cell<usize>,
     /// The next box in the tracing GC's list of all boxes.
     #[cfg(feature = "gc")]
     pub next: Cell<Option<NonNull<Header>>>,
@@ -199,6 +206,8 @@ impl<T: Trace + 'static> Gc<T> {
                     rc: Cell::new(rc),
                     flags: Cell::new(flags),
                     vt: &Vt::<T>::V,
+                    #[cfg(feature = "owners")]
+                    owner: Cell::new(0),
                     #[cfg(feature = "gc")]
                     next: Cell::new(None),
                 },
@@ -350,6 +359,11 @@ fn inc(h: &Header) {
 #[inline(always)]
 fn inc(_: &Header) {}
 
+/// Boxes whose count dropping to a non-zero value can't make a garbage
+/// cycle (or that are already candidates). With owners, an owned box can't:
+/// a borrow went away, its owner still holds it.
+pub const QUIET: u32 = flag::ACYCLIC | flag::BUFFERED | flag::ARENA | if cfg!(feature = "owners") { flag::OWNED } else { 0 };
+
 #[cfg(not(feature = "gc"))]
 #[inline(always)]
 fn dec(p: NonNull<Header>) {
@@ -364,7 +378,7 @@ fn dec(p: NonNull<Header>) {
         } else {
             release(p);
         }
-    } else if h.flags.get() & (flag::ACYCLIC | flag::BUFFERED | flag::ARENA) == 0 {
+    } else if h.flags.get() & QUIET == 0 {
         crate::runtime::cycles::possible_root(p);
     }
 }
@@ -389,6 +403,11 @@ pub fn release(p: NonNull<Header>) {
 fn release_now(p: NonNull<Header>) {
     let h = unsafe { p.as_ref() };
     let vt = h.vt;
+    // The boxes it owns lose their owner as its value drops.
+    #[cfg(feature = "owners")]
+    if h.has(flag::OWNS) {
+        orphan_children(p);
+    }
     if h.has(flag::BUFFERED) {
         // The collector frees the box when it next looks at its buffer.
         h.set(flag::DEAD);
@@ -403,6 +422,147 @@ fn release_now(p: NonNull<Header>) {
     if !h.has(flag::ARENA) {
         free_box(p);
     }
+}
+
+// ───────────── ownership (`owners` build) ─────────────
+//
+// A box's owner is the box holding its first heap reference: an object's
+// field, an array's element, a captured variable's cell. Other references
+// are borrows. Owner links form a forest, and only a box without an owner
+// can become a cycle candidate (see `cycles::collect_owned`). So every path
+// that stores into one of those holders calls `own`, and every path that
+// takes a reference out of one calls `disown` before releasing it: an
+// owner link must never outlive the reference it stands for.
+
+/// How far up the holder's owners `own` looks for the box itself.
+#[cfg(feature = "owners")]
+const OWN_DEPTH: usize = 64;
+
+/// `child` was stored into `holder`: the holder owns it if nothing does
+/// yet. If the holder is itself (transitively) owned by the child, the
+/// store wins: structures are often built bottom-up (a child pointing to
+/// its parent before the parent holds the child), so the older link in
+/// that cycle, the one the child owns on the way to the holder, becomes a
+/// borrow.
+#[cfg(feature = "owners")]
+#[inline]
+pub fn own(holder: NonNull<Header>, child: NonNull<Header>) {
+    let c = unsafe { child.as_ref() };
+    if c.flags.get() & (flag::OWNED | flag::ACYCLIC | flag::ARENA) != 0 || holder == child {
+        return;
+    }
+    own_slow(holder, child, true)
+}
+
+/// `child` was read from `holder`, so the holder holds it: if nothing owns
+/// it (its owner went away while others still held it, as when an array is
+/// copied to a bigger one), the holder does. Never demotes a link.
+#[cfg(feature = "owners")]
+#[inline]
+pub fn adopt(holder: NonNull<Header>, child: NonNull<Header>) {
+    let c = unsafe { child.as_ref() };
+    if c.flags.get() & (flag::OWNED | flag::ACYCLIC | flag::ARENA) != 0 || holder == child {
+        return;
+    }
+    own_slow(holder, child, false)
+}
+
+#[cfg(feature = "owners")]
+#[inline(never)]
+fn own_slow(holder: NonNull<Header>, child: NonNull<Header>, demote: bool) {
+    let (h, c) = unsafe { (holder.as_ref(), child.as_ref()) };
+    if h.has(flag::ARENA) {
+        return;
+    }
+    if c.has(flag::OWNS) {
+        // Is the holder (transitively) owned by the child?
+        let mut q = holder.as_ptr() as usize;
+        let mut n = 0;
+        loop {
+            let up = unsafe { (*(q as *const Header)).owner.get() };
+            if up == 0 {
+                break;
+            }
+            if up == child.as_ptr() as usize {
+                if !demote {
+                    return;
+                }
+                // `q` is owned by the child on the way to the holder.
+                let qh = unsafe { &*(q as *const Header) };
+                qh.owner.set(0);
+                qh.clear(flag::OWNED);
+                break;
+            }
+            n += 1;
+            if n == OWN_DEPTH {
+                return;
+            }
+            q = up;
+        }
+    }
+    c.owner.set(holder.as_ptr() as usize);
+    c.set(flag::OWNED);
+    h.set(flag::OWNS);
+}
+
+/// The reference from `holder` to `child` is going away: if it was the
+/// owning one, the child has no owner now.
+#[cfg(feature = "owners")]
+#[inline]
+pub fn disown(holder: NonNull<Header>, child: NonNull<Header>) {
+    let c = unsafe { child.as_ref() };
+    if c.has(flag::OWNED) && c.owner.get() == holder.as_ptr() as usize {
+        c.owner.set(0);
+        c.clear(flag::OWNED);
+    }
+}
+
+/// `own` for a value (a no-op unless it's a box).
+#[cfg(feature = "owners")]
+#[inline]
+pub fn own_value(holder: NonNull<Header>, v: &crate::runtime::Value) {
+    if let Some(c) = v.gc_header() {
+        own(holder, c);
+    }
+}
+
+/// `adopt` for a value.
+#[cfg(feature = "owners")]
+#[inline]
+pub fn adopt_value(holder: NonNull<Header>, v: &crate::runtime::Value) {
+    if let Some(c) = v.gc_header() {
+        adopt(holder, c);
+    }
+}
+
+/// `disown` for a value.
+#[cfg(feature = "owners")]
+#[inline]
+pub fn disown_value(holder: NonNull<Header>, v: &crate::runtime::Value) {
+    if let Some(c) = v.gc_header() {
+        disown(holder, c);
+    }
+}
+
+/// The box holding a value (`v` must be the value of a heap box).
+#[cfg(feature = "owners")]
+#[inline]
+pub fn header_of<T: Trace + 'static>(v: &T) -> NonNull<Header> {
+    unsafe { NonNull::new_unchecked((v as *const T as *mut u8).sub(Gc::<T>::VALUE_OFFSET) as *mut Header) }
+}
+
+/// A box is being freed: what it owns has no owner now.
+#[cfg(feature = "owners")]
+pub fn orphan_children(p: NonNull<Header>) {
+    let a = p.as_ptr() as usize;
+    let mut visit = |c: NonNull<Header>| {
+        let ch = unsafe { c.as_ref() };
+        if ch.owner.get() == a {
+            ch.owner.set(0);
+            ch.clear(flag::OWNED);
+        }
+    };
+    trace_header(p, &mut Tracer { visit: &mut visit, shared: false });
 }
 
 /// Return a box's memory (its value must already be dropped).
@@ -503,6 +663,8 @@ pub fn start_run() {
     let live = LIVE_BYTES.load(Relaxed);
     START_BYTES.store(live, Relaxed);
     PEAK_BYTES.store(live, Relaxed);
+    #[cfg(not(feature = "gc"))]
+    crate::runtime::cycles::start_run();
 }
 
 #[inline(always)]

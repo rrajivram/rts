@@ -10,7 +10,7 @@ its data built in and loads nothing: open it straight from disk.
 import html, json, math, os, subprocess, sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-LABEL = {"rc": "RC + arenas", "rc-deferred": "RC, deferred", "rc-noarena": "RC, no arenas", "rc-nocc": "RC, no cycle collector",
+LABEL = {"rc": "RC + arenas", "rc-owners": "RC, ownership", "rc-deferred": "RC, deferred", "rc-noarena": "RC, no arenas", "rc-nocc": "RC, no cycle collector",
          "gc": "tracing GC", "gc-1.25": "GC, grow 1.25×", "gc-1.5": "GC, grow 1.5×", "gc-3": "GC, grow 3×",
          "node": "node (JIT)", "jitless": "node --jitless"}
 GROW = [("gc-1.25", 1.25), ("gc-1.5", 1.5), ("gc", 2.0), ("gc-3", 3.0)]
@@ -177,14 +177,14 @@ if prof:
 
 # The thesis measurements: memory over time and pauses (bench/memory.py).
 mem = load("memory.json") or []
-MCFG = [("rc", "RC + arenas", "win"), ("gc", "GC, default", "lose"), ("gc-small", "GC, tuned small", "mid"), ("rc-deferred", "RC, deferred", "alt")]
+MCFG = [("rc", "RC + arenas", "win"), ("gc", "GC, default", "lose"), ("gc-small", "GC, tuned small", "mid"), ("rc-owners", "RC, ownership", "own"), ("rc-deferred", "RC, deferred", "alt")]
 mby = {(r["bench"], r["config"]): r for r in mem}
 mbench = list(dict.fromkeys(r["bench"] for r in mem))
 
 
 def timeline_svg(b):
     W, H, L, B = 300, 130, 34, 18
-    runs = [(c, n, k, mby[(b, c)]) for c, n, k in MCFG[:3] if (b, c) in mby]
+    runs = [(c, n, k, mby[(b, c)]) for c, n, k in MCFG[:4] if (b, c) in mby]
     if not runs:
         return ""
     tmax = max(r["timeline"][-1][0] for *_, r in runs) or 1
@@ -205,7 +205,7 @@ def timeline_svg(b):
 def mem_section():
     if not mem:
         return ""
-    legend = "".join(f'<span><i class="sw-{k}"></i>{esc(n)}</span>' for c, n, k in MCFG[:3])
+    legend = "".join(f'<span><i class="sw-{k}"></i>{esc(n)}</span>' for c, n, k in MCFG[:4])
     charts = "".join(f'<div class="tl">{timeline_svg(b)}</div>' for b in mbench)
     rows = []
     for b in mbench:
@@ -278,8 +278,8 @@ page = f"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <title>rts: RC vs GC</title>
 <style>
-:root {{ --bg:#fbfaf7; --fg:#1d1c1a; --muted:#6b6862; --line:#e4e1da; --panel:#fff; --win:#2f7d5b; --lose:#b5523b; --mid:#c99a2e; --grid:#d8d4cc; }}
-@media (prefers-color-scheme: dark) {{ :root {{ --bg:#191816; --fg:#ece9e3; --muted:#a29e96; --line:#34322e; --panel:#22211e; --win:#5cbf8e; --lose:#e07a60; --mid:#e0b955; --grid:#3d3a35; }} }}
+:root {{ --bg:#fbfaf7; --fg:#1d1c1a; --muted:#6b6862; --line:#e4e1da; --panel:#fff; --win:#2f7d5b; --lose:#b5523b; --mid:#c99a2e; --own:#3a6db0; --grid:#d8d4cc; }}
+@media (prefers-color-scheme: dark) {{ :root {{ --bg:#191816; --fg:#ece9e3; --muted:#a29e96; --line:#34322e; --panel:#22211e; --win:#5cbf8e; --lose:#e07a60; --mid:#e0b955; --own:#7fa9e6; --grid:#3d3a35; }} }}
 body {{ background:var(--bg); color:var(--fg); font:15px/1.5 -apple-system, system-ui, sans-serif; margin:0; padding:32px 16px; }}
 main {{ max-width:980px; margin:0 auto; display:grid; gap:36px; }}
 h1 {{ font:400 30px/1.2 Georgia, serif; margin:0; }} h2 {{ font-size:18px; margin:0 0 6px; }}
@@ -296,10 +296,10 @@ th:first-child, td:first-child {{ text-align:left; }} th {{ color:var(--muted); 
 .w {{ color:var(--win); font-weight:600; }} .l {{ color:var(--lose); font-weight:600; }}
 svg {{ width:100%; max-width:640px; display:block; }} svg text {{ fill:var(--muted); font-size:12px; }}
 svg .lbl {{ fill:var(--fg); }} svg .grid {{ stroke:var(--grid); }} svg .one {{ stroke:var(--muted); }}
-svg .ln-win {{ stroke:var(--win); stroke-width:1.6; }} svg .ln-lose {{ stroke:var(--lose); stroke-width:1.2; }} svg .ln-mid {{ stroke:var(--mid); stroke-width:1.2; }}
+svg .ln-win {{ stroke:var(--win); stroke-width:1.6; }} svg .ln-lose {{ stroke:var(--lose); stroke-width:1.2; }} svg .ln-mid {{ stroke:var(--mid); stroke-width:1.2; }} svg .ln-own {{ stroke:var(--own); stroke-width:1.6; }}
 .tls {{ display:grid; grid-template-columns:repeat(auto-fit,minmax(290px,1fr)); gap:14px; }} .tl svg {{ max-width:none; }}
 .legend {{ display:flex; gap:16px; flex-wrap:wrap; font-size:12px; color:var(--muted); margin:4px 0 10px; }} .legend i {{ display:inline-block; width:14px; height:3px; margin-right:6px; vertical-align:middle; }}
-.sw-win {{ background:var(--win); }} .sw-lose {{ background:var(--lose); }} .sw-mid {{ background:var(--mid); }} .tick {{ color:var(--muted); font-weight:400; }}
+.sw-win {{ background:var(--win); }} .sw-lose {{ background:var(--lose); }} .sw-mid {{ background:var(--mid); }} .sw-own {{ background:var(--own); }} .tick {{ color:var(--muted); font-weight:400; }}
 table.mem th {{ white-space:normal; min-width:70px; }}
 svg .win {{ fill:var(--win); }} svg .lose {{ fill:var(--lose); }} svg .gcline {{ stroke:var(--lose); stroke-width:1.5; }}
 code {{ font-size:12px; }} footer {{ font-size:12px; color:var(--muted); }}

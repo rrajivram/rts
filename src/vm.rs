@@ -2008,7 +2008,7 @@ impl Vm {
                     Instruction::WriteCell { cell: c, value: s } => {
                         let x = value!(s).clone();
                         match &value!(c) {
-                            Value::Cell(cell) => *cell.borrow_mut() = x,
+                            Value::Cell(cell) => crate::runtime::cell_set(cell, x),
                             _ => unreachable!("not a cell"),
                         }
                     }
@@ -2018,7 +2018,7 @@ impl Vm {
                     }
                     Instruction::WriteCapture { capture, value } => {
                         let x = value!(value).clone();
-                        *self.frames[fi].closure.as_ref().unwrap().caps[capture as usize].borrow_mut() = x;
+                        crate::runtime::cell_set(&self.frames[fi].closure.as_ref().unwrap().caps[capture as usize], x);
                     }
                     Instruction::ReadGlobalNumber { output, global } => scalar!(output) = self.global_scalars[global as usize],
                     Instruction::ReadGlobalBool { output, global } => scalar!(output) = self.global_scalars[global as usize],
