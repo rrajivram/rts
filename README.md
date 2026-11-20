@@ -216,6 +216,13 @@ by cause; `bench/latency.py` times each request of a request loop.
 - The exception is cyclic garbage: RC's cycle collector pauses up to 11.6 ms on
   Havlak and 6.0 ms on DeltaBlue, as long as the GC's. That is the open problem.
 - Throughput is about equal (GC 0.98× RC's time at default growth).
+- Next: [docs/memory-model.md](docs/memory-model.md). A heap census shows tuning
+  can't fix the cycle collector: 93–99.9% of its tracing starts at objects whose
+  types really are cyclic. Today's RC holds 30–1300% more than an exact collector
+  on cyclic programs. Grouping objects by *owner* (first referrer) matches exact
+  memory within 6% on every program, with no tracing. The proposal is to replace
+  the cycle collector with ownership: an orphan check whose cost is proportional
+  to the garbage being freed, plus budgeted incremental freeing.
 
 Measurements before 2026-11-17 that used native code are not a fair baseline:
 the GC build barely collected while compiled code ran (950 MB peak on Havlak).

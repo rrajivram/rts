@@ -972,7 +972,12 @@ impl Vm {
                 crate::runtime::cycles::collect(&roots);
             });
         } else {
-            crate::runtime::memtrace::nest(|| crate::runtime::cycles::collect(&[]));
+            if crate::runtime::census::due() {
+                crate::runtime::census::snapshot();
+            }
+            if crate::runtime::cycles::ready() {
+                crate::runtime::memtrace::nest(|| crate::runtime::cycles::collect(&[]));
+            }
         }
     }
 

@@ -1,0 +1,318 @@
+[
+ {
+  "cyclic_kinds": [
+   "Vector",
+   "UnionFindNode",
+   "SimpleLoop",
+   "IdentitySet",
+   "BasicBlockEdge",
+   "BasicBlock"
+  ],
+  "cyclic_alloc_pct": 31.2,
+  "allocated_mb": 2907.9,
+  "cyclic_candidates_pct": 65.2,
+  "collections": 38,
+  "cc_traced": 5964979,
+  "cc_garbage": 3080913,
+  "cc_traced_cyclic_pct": 93.0,
+  "garbage_kinds": {
+   "Vector": 887818,
+   "Array": 887818,
+   "UnionFindNode": 15254,
+   "SimpleLoop": 423057,
+   "IdentitySet": 846114,
+   "BasicBlock": 20852
+  },
+  "rc_mean_mb": 10.35,
+  "rc_max_mb": 16.36,
+  "exact_mean_mb": 7.35,
+  "exact_max_mb": 9.09,
+  "snapshots": 754,
+  "unseen_cyclic_mb": 397.26,
+  "merge": {
+   "mean_mb": 33.94,
+   "max_mb": 72.65,
+   "floating_max_mb": 65.01,
+   "largest_region_mb": 13.03,
+   "region_frees": 1501
+  },
+  "owner": {
+   "mean_mb": 7.76,
+   "max_mb": 9.58,
+   "floating_max_mb": 0.5,
+   "largest_region_mb": 5.71,
+   "region_frees": 17261
+  },
+  "bench": "Havlak"
+ },
+ {
+  "cyclic_kinds": [
+   "Node",
+   "Vector"
+  ],
+  "cyclic_alloc_pct": 30.3,
+  "allocated_mb": 704.8,
+  "cyclic_candidates_pct": 69.8,
+  "collections": 335,
+  "cc_traced": 3180220,
+  "cc_garbage": 2657240,
+  "cc_traced_cyclic_pct": 99.9,
+  "garbage_kinds": {
+   "Node": 1386695,
+   "Vector": 512860,
+   "Array": 512860,
+   "Motion": 244825
+  },
+  "rc_mean_mb": 0.69,
+  "rc_max_mb": 1.25,
+  "exact_mean_mb": 0.32,
+  "exact_max_mb": 0.55,
+  "snapshots": 1615,
+  "unseen_cyclic_mb": 16.36,
+  "merge": {
+   "mean_mb": 0.33,
+   "max_mb": 0.55,
+   "floating_max_mb": 0.08,
+   "largest_region_mb": 0.15,
+   "region_frees": 199238
+  },
+  "owner": {
+   "mean_mb": 0.33,
+   "max_mb": 0.55,
+   "floating_max_mb": 0.08,
+   "largest_region_mb": 0.15,
+   "region_frees": 200386
+  },
+  "bench": "CD"
+ },
+ {
+  "cyclic_kinds": [
+   "Vector",
+   "Variable",
+   "ScaleConstraint",
+   "EqualityConstraint",
+   "StayConstraint",
+   "EditConstraint"
+  ],
+  "cyclic_alloc_pct": 27.3,
+  "allocated_mb": 295.5,
+  "cyclic_candidates_pct": 72.8,
+  "collections": 13,
+  "cc_traced": 1148051,
+  "cc_garbage": 624044,
+  "cc_traced_cyclic_pct": 96.5,
+  "garbage_kinds": {
+   "Vector": 156013,
+   "Array": 156013,
+   "Variable": 156013,
+   "ScaleConstraint": 48000,
+   "EqualityConstraint": 60000,
+   "StayConstraint": 48005
+  },
+  "rc_mean_mb": 5.99,
+  "rc_max_mb": 12.14,
+  "exact_mean_mb": 4.57,
+  "exact_max_mb": 8.8,
+  "snapshots": 137,
+  "unseen_cyclic_mb": 27.4,
+  "merge": {
+   "mean_mb": 4.57,
+   "max_mb": 8.8,
+   "floating_max_mb": 0.0,
+   "largest_region_mb": 8.79,
+   "region_frees": 19
+  },
+  "owner": {
+   "mean_mb": 4.57,
+   "max_mb": 8.8,
+   "floating_max_mb": 0.0,
+   "largest_region_mb": 8.79,
+   "region_frees": 54
+  },
+  "bench": "DeltaBlue"
+ },
+ {
+  "cyclic_kinds": [
+   "Vector",
+   "JsonArray",
+   "JsonObject"
+  ],
+  "cyclic_alloc_pct": 7.6,
+  "allocated_mb": 681.1,
+  "cyclic_candidates_pct": 0.0,
+  "collections": 0,
+  "cc_traced": 0,
+  "cc_garbage": 0,
+  "cc_traced_cyclic_pct": 0.0,
+  "garbage_kinds": {},
+  "rc_mean_mb": 0.21,
+  "rc_max_mb": 0.39,
+  "exact_mean_mb": 0.21,
+  "exact_max_mb": 0.39,
+  "snapshots": 1665,
+  "unseen_cyclic_mb": 7.59,
+  "merge": {
+   "mean_mb": 0.21,
+   "max_mb": 0.39,
+   "floating_max_mb": 0.0,
+   "largest_region_mb": 0.13,
+   "region_frees": 2073
+  },
+  "owner": {
+   "mean_mb": 0.21,
+   "max_mb": 0.39,
+   "floating_max_mb": 0.0,
+   "largest_region_mb": 0.13,
+   "region_frees": 4394
+  },
+  "bench": "Json"
+ },
+ {
+  "cyclic_kinds": [],
+  "cyclic_alloc_pct": 0.0,
+  "allocated_mb": 1874.9,
+  "cyclic_candidates_pct": 0.0,
+  "collections": 0,
+  "cc_traced": 0,
+  "cc_garbage": 0,
+  "cc_traced_cyclic_pct": 0.0,
+  "garbage_kinds": {},
+  "rc_mean_mb": 0.01,
+  "rc_max_mb": 0.01,
+  "exact_mean_mb": 0.01,
+  "exact_max_mb": 0.01,
+  "snapshots": 2,
+  "unseen_cyclic_mb": 0.0,
+  "merge": {
+   "mean_mb": 0.01,
+   "max_mb": 0.01,
+   "floating_max_mb": 0.0,
+   "largest_region_mb": 0.0,
+   "region_frees": 0
+  },
+  "owner": {
+   "mean_mb": 0.01,
+   "max_mb": 0.01,
+   "floating_max_mb": 0.0,
+   "largest_region_mb": 0.0,
+   "region_frees": 0
+  },
+  "bench": "Storage"
+ },
+ {
+  "cyclic_kinds": [
+   "TaskControlBlock",
+   "Packet",
+   "Function",
+   "Cell",
+   "Scheduler"
+  ],
+  "cyclic_alloc_pct": 64.0,
+  "allocated_mb": 2.0,
+  "cyclic_candidates_pct": 67.5,
+  "collections": 2,
+  "cc_traced": 20019,
+  "cc_garbage": 19920,
+  "cc_traced_cyclic_pct": 99.8,
+  "garbage_kinds": {
+   "TaskControlBlock": 2988,
+   "Packet": 3984,
+   "Array": 4482,
+   "Function": 2988,
+   "Cell": 2988,
+   "Scheduler": 498,
+   "HandlerTaskDataRecord": 996,
+   "DeviceTaskDataRecord": 996
+  },
+  "rc_mean_mb": 0.43,
+  "rc_max_mb": 0.71,
+  "exact_mean_mb": 0.03,
+  "exact_max_mb": 0.04,
+  "snapshots": 3,
+  "unseen_cyclic_mb": 0.36,
+  "merge": {
+   "mean_mb": 0.03,
+   "max_mb": 0.04,
+   "floating_max_mb": 0.0,
+   "largest_region_mb": 0.0,
+   "region_frees": 1087
+  },
+  "owner": {
+   "mean_mb": 0.03,
+   "max_mb": 0.04,
+   "floating_max_mb": 0.0,
+   "largest_region_mb": 0.0,
+   "region_frees": 1800
+  },
+  "bench": "Richards"
+ },
+ {
+  "cyclic_kinds": [],
+  "cyclic_alloc_pct": 0.0,
+  "allocated_mb": 3336.7,
+  "cyclic_candidates_pct": 0.0,
+  "collections": 0,
+  "cc_traced": 0,
+  "cc_garbage": 0,
+  "cc_traced_cyclic_pct": 0.0,
+  "garbage_kinds": {},
+  "rc_mean_mb": 0.01,
+  "rc_max_mb": 0.01,
+  "exact_mean_mb": 0.01,
+  "exact_max_mb": 0.01,
+  "snapshots": 9271,
+  "unseen_cyclic_mb": 0.0,
+  "merge": {
+   "mean_mb": 0.01,
+   "max_mb": 0.01,
+   "floating_max_mb": 0.0,
+   "largest_region_mb": 0.0,
+   "region_frees": 0
+  },
+  "owner": {
+   "mean_mb": 0.01,
+   "max_mb": 0.01,
+   "floating_max_mb": 0.0,
+   "largest_region_mb": 0.0,
+   "region_frees": 0
+  },
+  "bench": "requests"
+ },
+ {
+  "cyclic_kinds": [
+   "TreeNode"
+  ],
+  "cyclic_alloc_pct": 52.6,
+  "allocated_mb": 116.3,
+  "cyclic_candidates_pct": 6.9,
+  "collections": 30,
+  "cc_traced": 1731575,
+  "cc_garbage": 1576800,
+  "cc_traced_cyclic_pct": 99.9,
+  "garbage_kinds": {
+   "TreeNode": 788400,
+   "Array": 788400
+  },
+  "rc_mean_mb": 2.28,
+  "rc_max_mb": 4.41,
+  "exact_mean_mb": 0.37,
+  "exact_max_mb": 0.38,
+  "snapshots": 98,
+  "unseen_cyclic_mb": 6.85,
+  "merge": {
+   "mean_mb": 33.59,
+   "max_mb": 69.11,
+   "floating_max_mb": 68.74,
+   "largest_region_mb": 3.0,
+   "region_frees": 9
+  },
+  "owner": {
+   "mean_mb": 11.43,
+   "max_mb": 22.81,
+   "floating_max_mb": 22.43,
+   "largest_region_mb": 1.0,
+   "region_frees": 11768
+  },
+  "bench": "churn"
+ }
+]

@@ -97,6 +97,7 @@ fn main() -> ExitCode {
     let abs = std::fs::canonicalize(&path).map(|p| p.to_string_lossy().into_owned()).unwrap_or(path.clone());
     vm.args = std::iter::once(abs).chain(script_args).collect();
     rts::runtime::memtrace::start_from_env();
+    rts::runtime::census::start_from_env();
     let code = match vm.run_main() {
         Ok(()) => ExitCode::from(vm.exit_code() as u8),
         Err(e) => {
@@ -112,6 +113,7 @@ fn main() -> ExitCode {
     if let Some(p) = vm.profile.as_mut() {
         p.report();
     }
+    rts::runtime::census::finish();
     rts::runtime::memtrace::finish();
     if mem_stats {
         rts::runtime::heap::print_stats();

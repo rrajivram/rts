@@ -4,6 +4,7 @@
 
 pub mod arena;
 pub mod bigint;
+pub mod census;
 pub mod cycles;
 #[cfg(feature = "gc")]
 pub mod gc;

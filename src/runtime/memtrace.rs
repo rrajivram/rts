@@ -5,8 +5,10 @@
 //! a count reaching zero that frees a structure for 20 µs or more. Written
 //! as JSON when the program ends:
 //!
-//!     {"interval_us": 250, "start_bytes": …,
-//!      "samples": [[t_us, live_bytes], …], "pauses": [[t_us, ns, kind], …]}
+//! ```text
+//! {"interval_us": 250, "start_bytes": …,
+//!  "samples": [[t_us, live_bytes], …], "pauses": [[t_us, ns, kind], …]}
+//! ```
 //!
 //! `start_bytes` is what was live when the program started running
 //! (compiled code and all): the program's own memory is above it.

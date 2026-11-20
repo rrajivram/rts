@@ -92,6 +92,12 @@ pub fn possible_root(p: NonNull<Header>) {
 /// Whether enough candidates are buffered to be worth a collection.
 #[inline(always)]
 pub fn wanted() -> bool {
+    ready() || super::census::due()
+}
+
+/// Whether enough candidates are buffered (without the census).
+#[inline(always)]
+pub fn ready() -> bool {
     let s = st();
     s.roots.len() >= s.threshold
 }
@@ -141,6 +147,8 @@ pub fn collect(uncounted: &[usize]) {
         STATS.pause(start.elapsed(), super::memtrace::Kind::Cycles);
         return;
     }
+    let census = if super::census::on() { Some(super::census::before_collect(&live_roots)) } else { None };
+    let mut traced = 0usize;
     for &p in &live_roots {
         let h = unsafe { p.as_ref() };
         if color(h) == GRAY {
@@ -149,6 +157,7 @@ pub fn collect(uncounted: &[usize]) {
         set_color(h, GRAY);
         stack.push(p);
         while let Some(n) = stack.pop() {
+            traced += 1;
             each_child(n, |c| {
                 let ch = unsafe { c.as_ref() };
                 ch.rc.set(ch.rc.get() - 1);
@@ -221,6 +230,9 @@ pub fn collect(uncounted: &[usize]) {
     // Free them: first pin every white box (so the references between them,
     // released while their values drop, can't free a box twice), then drop
     // all values, then free all boxes.
+    if let Some(est) = census {
+        super::census::after_collect(live_roots.len(), traced, &garbage, start.elapsed().as_nanos() as u64, est);
+    }
     for &p in &garbage {
         let h = unsafe { p.as_ref() };
         h.rc.set(u32::MAX / 2);

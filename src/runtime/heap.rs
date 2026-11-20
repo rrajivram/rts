@@ -215,6 +215,10 @@ impl<T: Trace + 'static> Gc<T> {
         }
         if flags & flag::ARENA == 0 {
             STATS.boxes.set(STATS.boxes.get() + 1);
+            #[cfg(not(feature = "gc"))]
+            if crate::runtime::census::on() {
+                crate::runtime::census::born(g.header_ptr(), layout.size());
+            }
         }
         STATS.allocated.set(STATS.allocated.get() + 1);
         g
@@ -388,6 +392,10 @@ fn release_now(p: NonNull<Header>) {
     if h.has(flag::BUFFERED) {
         // The collector frees the box when it next looks at its buffer.
         h.set(flag::DEAD);
+        #[cfg(not(feature = "gc"))]
+        if crate::runtime::census::on() {
+            crate::runtime::census::freed(p);
+        }
         unsafe { (vt.drop_value)(p) };
         return;
     }
@@ -399,6 +407,10 @@ fn release_now(p: NonNull<Header>) {
 
 /// Return a box's memory (its value must already be dropped).
 pub fn free_box(p: NonNull<Header>) {
+    #[cfg(not(feature = "gc"))]
+    if crate::runtime::census::on() {
+        crate::runtime::census::freed(p);
+    }
     let layout = unsafe { (p.as_ref().vt.layout)(p) };
     STATS.boxes.set(STATS.boxes.get() - 1);
     unsafe { Global.deallocate(p.cast(), layout) };
