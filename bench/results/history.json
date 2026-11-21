@@ -126,5 +126,13 @@
   "rc_geomean_s": 0.1101,
   "gc_geomean_s": 0.1078,
   "jitless_geomean_s": 0.4524
+ },
+ {
+  "commit": "7c6825c",
+  "date": "2026-11-20",
+  "step": "Incremental ownership checks (slices under 1 ms, paced by allocation), survivors, buffer compaction",
+  "rc_geomean_s": 0.1062,
+  "gc_geomean_s": 0.1044,
+  "jitless_geomean_s": 0.4405
  }
 ]

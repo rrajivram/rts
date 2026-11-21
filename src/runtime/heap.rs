@@ -52,6 +52,15 @@ pub struct Tracer<'a> {
     pub shared: bool,
 }
 
+/// Set when a trace skipped a mutably borrowed cell (its children unseen).
+pub static OPAQUE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// A trace skipped a mutably borrowed cell.
+#[cold]
+pub fn opaque() {
+    OPAQUE.store(true, Relaxed);
+}
+
 impl Tracer<'_> {
     #[inline]
     pub fn edge<T: Trace + 'static>(&mut self, g: &Gc<T>) {
@@ -80,6 +89,24 @@ pub mod flag {
     pub const OWNED: u32 = 1 << 8;
     /// Owns, or once owned, another box.
     pub const OWNS: u32 = 1 << 9;
+    /// In the ownership check under way (`owners` build; see
+    /// `cycles::collect_owned`). Above every `QUIET` bit: see `noisy`.
+    pub const MEMBER: u32 = 1 << 10;
+    /// A member whose count dropped during the check: live.
+    pub const TOUCHED: u32 = 1 << 11;
+    /// An unowned box a check found live. Its references from members at
+    /// that check stay in the `INDEG` bits: while its count is higher, an
+    /// ordinary check leaves it to the full check.
+    pub const SURVIVOR: u32 = 1 << 12;
+    /// On the collector's list of survivors left to the full check (which
+    /// frees the box if its count reached zero meanwhile).
+    pub const HELD: u32 = 1 << 13;
+    /// During a check, a member's count of references from other members:
+    /// three bits, the excess over 7 in the check's side table. (Bits 17
+    /// and up hold an object's inline capacity.)
+    pub const INDEG_SHIFT: u32 = 14;
+    pub const INDEG_MAX: u32 = 7;
+    pub const INDEG_MASK: u32 = INDEG_MAX << INDEG_SHIFT;
 }
 
 /// Count given to arena boxes. Far above any real count, so reference-count
@@ -364,6 +391,20 @@ fn inc(_: &Header) {}
 /// a borrow went away, its owner still holds it.
 pub const QUIET: u32 = flag::ACYCLIC | flag::BUFFERED | flag::ARENA | if cfg!(feature = "owners") { flag::OWNED } else { 0 };
 
+/// Owners build: a decrement to a non-zero count takes the slow path when
+/// the box has no `QUIET` bit, or is a member of the check under way (the
+/// check's barrier: see `cycles::collect_owned`). One test: every `QUIET`
+/// bit is below `MEMBER`, so `(flags & NOISY_MASK) - 1` wraps or lands at
+/// `MEMBER - 1` or above exactly then.
+pub const NOISY_MASK: u32 = QUIET | if cfg!(feature = "owners") { flag::MEMBER } else { 0 };
+pub const NOISY_FROM: u32 = if cfg!(feature = "owners") { flag::MEMBER - 1 } else { u32::MAX };
+const _: () = assert!(QUIET < flag::MEMBER);
+
+#[inline(always)]
+pub fn noisy(flags: u32) -> bool {
+    (flags & NOISY_MASK).wrapping_sub(1) >= NOISY_FROM
+}
+
 #[cfg(not(feature = "gc"))]
 #[inline(always)]
 fn dec(p: NonNull<Header>) {
@@ -378,7 +419,7 @@ fn dec(p: NonNull<Header>) {
         } else {
             release(p);
         }
-    } else if h.flags.get() & QUIET == 0 {
+    } else if noisy(h.flags.get()) {
         crate::runtime::cycles::possible_root(p);
     }
 }
@@ -408,8 +449,9 @@ fn release_now(p: NonNull<Header>) {
     if h.has(flag::OWNS) {
         orphan_children(p);
     }
-    if h.has(flag::BUFFERED) {
-        // The collector frees the box when it next looks at its buffer.
+    if h.flags.get() & (flag::BUFFERED | if cfg!(feature = "owners") { flag::MEMBER | flag::HELD } else { 0 }) != 0 {
+        // The collector frees the box when it next looks at its buffer
+        // (or, for a member of the check under way, when the check ends).
         h.set(flag::DEAD);
         #[cfg(not(feature = "gc"))]
         if crate::runtime::census::on() {

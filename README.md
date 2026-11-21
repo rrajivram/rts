@@ -227,9 +227,14 @@ by cause; `bench/latency.py` times each request of a request loop.
   target/owners`, 2026-11-20). On the cyclic programs it has the lowest memory
   of any strategy, 1.3–3.8× below the GC tuned for small memory: Havlak 13.4
   MB mean / 15.7 peak, against 24.2 / 38.3 for today's RC and 20.8 / 35.6 for
-  the GC. It ties today's RC on the acyclic ones. Longest pauses fall (Havlak
-  14.7 → 3.7 ms), but DeltaBlue's is still 6.1 ms. Throughput costs 1.31×.
+  the GC. It ties today's RC on the acyclic ones. Throughput costs 1.31×.
   Details in [docs/memory-model.md](docs/memory-model.md).
+- Incremental checks in the ownership build (2026-11-21): **no pause reaches
+  1 ms on any program** (longest 0.97 ms, DeltaBlue; was 6.1 ms), with memory
+  still the lowest of any strategy on the cyclic programs (Havlak 15.2 MB
+  mean / 21.7 peak, DeltaBlue 9.3 / 18.4). Throughput 1.27×. Weak spot:
+  during large checks, short pauses come close together (Havlak's program
+  gets 38% of its worst 10 ms window; the tuned GC's gets 4%).
 
 Measurements before 2026-11-17 that used native code are not a fair baseline:
 the GC build barely collected while compiled code ran (950 MB peak on Havlak).

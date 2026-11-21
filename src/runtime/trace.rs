@@ -4,10 +4,12 @@
 //! A `RefCell` that is mutably borrowed at a safepoint is skipped: for the
 //! cycle collector that is safe (its children merely look externally
 //! referenced); the tracing GC never collects while such a borrow exists.
+//! A skipped cell is reported (`heap::opaque`): the ownership check, which
+//! spans safepoints, needs to know when a trace was incomplete.
 
 use std::cell::RefCell;
 
-use super::heap::{Trace, Tracer};
+use super::heap::{opaque, Trace, Tracer};
 use super::regexp::RegExp;
 use super::task::{Accessor, Bound, CoState, Combinator, Coroutine, Job, NativeIter, Promise, PromiseState, Reaction, Symbol};
 use super::*;
@@ -22,6 +24,18 @@ impl Trace for Value {
         } else if let Value::Class(c) = self {
             trace_class(c, t);
         }
+    }
+}
+
+/// A function's or array's own properties object.
+fn trace_props(p: &RefCell<Option<Gc<Object>>>, t: &mut Tracer) {
+    match p.try_borrow() {
+        Ok(p) => {
+            if let Some(o) = &*p {
+                t.edge(o);
+            }
+        }
+        Err(_) => opaque(),
     }
 }
 
@@ -66,6 +80,8 @@ impl Trace for RefCell<Value> {
     fn trace(&self, t: &mut Tracer) {
         if let Ok(v) = self.try_borrow() {
             v.trace(t);
+        } else {
+            opaque();
         }
     }
 }
@@ -86,18 +102,17 @@ impl Trace for Object {
 
 impl Trace for Array {
     fn trace(&self, t: &mut Tracer) {
-        if let Ok(store) = self.store.try_borrow()
-            && let ArrStore::Val(vs) = &*store
-        {
-            for v in vs {
-                v.trace(t);
+        match self.store.try_borrow() {
+            Ok(store) => {
+                if let ArrStore::Val(vs) = &*store {
+                    for v in vs {
+                        v.trace(t);
+                    }
+                }
             }
+            Err(_) => opaque(),
         }
-        if let Ok(p) = self.props.try_borrow()
-            && let Some(o) = &*p
-        {
-            t.edge(o);
-        }
+        trace_props(&self.props, t);
     }
 }
 
@@ -106,11 +121,7 @@ impl Trace for Closure {
         for c in self.caps.iter() {
             t.edge(c);
         }
-        if let Ok(p) = self.props.try_borrow()
-            && let Some(o) = &*p
-        {
-            t.edge(o);
-        }
+        trace_props(&self.props, t);
     }
 }
 
@@ -121,6 +132,8 @@ impl Trace for MapObj {
                 k.0.trace(t);
                 v.trace(t);
             }
+        } else {
+            opaque();
         }
     }
 }
@@ -131,6 +144,8 @@ impl Trace for SetObj {
             for k in s.iter() {
                 k.0.trace(t);
             }
+        } else {
+            opaque();
         }
     }
 }
@@ -164,6 +179,8 @@ impl Trace for Coroutine {
     fn trace(&self, t: &mut Tracer) {
         if let Ok(st) = self.st.try_borrow() {
             trace_co_state(&st, t);
+        } else {
+            opaque();
         }
     }
 }
@@ -195,6 +212,8 @@ impl Trace for Promise {
                 }
                 PromiseState::Fulfilled(v) | PromiseState::Rejected(v) => v.trace(t),
             }
+        } else {
+            opaque();
         }
     }
 }
@@ -226,6 +245,8 @@ impl Trace for Combinator {
             for v in vs.iter() {
                 v.trace(t);
             }
+        } else {
+            opaque();
         }
         t.edge(&self.result);
     }

@@ -215,17 +215,128 @@ sizes. Only the memory strategy differs.
 - The census confirms it: DeltaBlue holds within 9% of exact, and Havlak,
   Json, Storage and requests hold exactly what an exact collector would.
 
+## Incremental checks (2026-11-21)
+
+Goal: no pause over 1 ms, without giving back the memory.
+
+**What the long pauses were.** A log of every check (`RTS_CC_LOG=1`) showed
+two different problems:
+
+- Most checks found nothing. On Havlak, 3 070 of 3 565 checks freed no
+  garbage, and checks took 1.8 s of a 4.9 s run. A few unowned roots held
+  from the stack, owning 40 000 boxes between them, were queued again each
+  time a temporary reference to them dropped. Every check traced their
+  whole tree again. On DeltaBlue, 265 of 275 checks found nothing.
+- The checks that did find garbage were large: DeltaBlue's dead constraint
+  graph is 96 000 boxes. Tracing it took 1.8 ms before any freeing, so
+  freeing incrementally alone couldn't reach 1 ms.
+
+**The design.** A check now runs as phases in slices of at most 500 µs at
+safepoints, with the program running in between (`cycles::collect_owned`).
+
+- Counts are left alone. A member's references from other members are
+  counted beside it, in three spare flag bits plus a side table. The program
+  keeps counting normally while the check is under way.
+- The barrier is one test the decrement already makes. A member carries a
+  flag above every quiet bit, so `heap::noisy` sends its decrements, even
+  from inline compiled code, to `possible_root`, which marks it `TOUCHED`.
+  Increments need no barrier: a new reference raises the count above the
+  member's in-member references, and that alone makes it live.
+- One step runs in one go: a last pass over the members still gray. A gray
+  member that is untouched, and whose count equals its in-member
+  references, is referenced only by those references. They all still exist
+  (removing one would have touched it), and they all come from gray members
+  (a black one would have reached it). So what is still gray after the pass
+  is closed garbage. The rest (sorting the candidates, gathering, counting,
+  propagating, freeing) is sliced, since garbage can't change.
+- A member whose count reaches zero during the check keeps its box until
+  the check ends. A trace that meets a mutably borrowed cell during
+  propagation abandons the check (frees nothing). Traces now report such
+  cells (`heap::opaque`).
+
+**What measurement changed along the way.**
+
+1. *Pace by allocation, not time.* With a time gap between slices, churn
+   made garbage faster than the check got through it: each check was twice
+   the last, up to 114 MB. Now the program may allocate 4 bytes per step of
+   check work before the next slice is due, so garbage can't outrun the
+   check.
+2. *Survivors.* An unowned box found live remembers its in-member
+   references. While its count is still above that number, an ordinary
+   check leaves it out, and the full check (when the heap has grown by an
+   eighth) looks at it. A first version kept survivors permanently buffered
+   and lost the signal that their count dropped: DeltaBlue held 43 MB.
+3. *Every survivor stays on the full check's list.* A second version
+   listed only the survivors a check skipped, and Havlak leaked to 64 MB.
+   A structure kept alive by a reference to an *owned* box inside it dies
+   when that reference goes. The owned box's decrement is quiet, so nothing
+   is queued.
+4. *Compact the candidate buffer, separately from checking.* A box whose
+   count reaches zero while buffered keeps its memory until the buffer is
+   processed. During a long check the buffer reached 183 000 entries, 11 MB
+   of dead boxes. Now the buffer is compacted every 10 000 new entries, even
+   during a check: dead boxes freed, owned ones dropped. A check starts when
+   enough live candidates remain (adapted from 256 to 16 384).
+
+The object header's inline-capacity field moved up one bit (to 17; at most
+32 767 inline slots, more spill as before) to make room.
+
+### Results (`bench/memory.py`, `bench/mmu.py`)
+
+Memory MB mean / peak, and the longest pause in ms. "Before" is the atomic
+ownership checks above; the other columns are from the same run.
+
+| program | RC today | ownership, before | **ownership, incremental** | GC tuned small |
+|---|---|---|---|---|
+| Havlak | 24.1 / 38.3, 11.6 | 13.4 / 15.7, 3.7 | **15.2 / 21.7, 0.67** | 21.1 / 32.4, 6.6 |
+| DeltaBlue | 11.6 / 19.7, 6.2 | 8.6 / 14.0, 6.1 | **9.3 / 18.4, 0.97** | 12.1 / 25.7, 6.4 |
+| CD | 1.26 / 2.06, 0.71 | 0.90 / 1.58, 0.36 | **0.92 / 1.47, 0.38** | 2.80 / 5.20, 1.06 |
+| churn | 3.98 / 5.70, 2.3 | 1.00 / 1.29, 0.35 | **0.99 / 1.27, 0.43** | 1.24 / 1.67, 0.29 |
+| Richards | 0.56 / 1.20, 0.51 | 0.32 / 0.76, 0.24 | **0.31 / 0.69, 0.28** | 1.20 / 2.38, 0.02 |
+| Json | 0.69 / 1.06, 0.12 | 0.64 / 1.33, 0.19 | **0.62 / 1.18, 0.19** | 4.21 / 7.45, 2.2 |
+| Storage | 0.54 / 1.04, 0.33 | 0.56 / 1.09, 0.21 | **0.57 / 1.09, 0.16** | 2.65 / 4.95, 0.85 |
+| requests | 2.33 / 13.8, 0.10 | 2.22 / 13.3, 0.60 | **2.16 / 13.4, 0.06** | 3.16 / 16.6, 1.0 |
+
+- **No pause reaches 1 ms** on any program (longest: 0.97 ms, DeltaBlue).
+  p99 is 0.6 ms or less everywhere. Before: 6.1 ms (DeltaBlue), 3.7 ms
+  (Havlak).
+- **Memory**: still the lowest of any strategy on every cyclic program.
+  Against the atomic checks, the means rose 0–14% (Havlak 13.4 → 15.2,
+  DeltaBlue 8.6 → 9.3), and Havlak's and DeltaBlue's peaks rose 30–40%:
+  garbage made during a check waits for it to finish, and a survivor's
+  garbage waits for a full check. `RTS_CC_FULL=1` (no survivors): Havlak
+  13.7 / 17.3, DeltaBlue 9.3 / 18.1, with Havlak 1.3× slower.
+- **Throughput**: geomean 1.27× today's RC (was 1.30×). Havlak runs 1.21×,
+  down from 1.46×: the wasted checks are gone.
+- **Utilization is the remaining weakness.** Short pauses can still come
+  close together. Minimum mutator utilization, the worst share of any
+  window the program got to run:
+
+  | program | window | RC today | **ownership** | GC tuned small |
+  |---|---|---|---|---|
+  | Havlak | 2 ms / 10 ms | 0% / 0% | **12% / 38%** | 0% / 4% |
+  | DeltaBlue | 2 ms / 10 ms | 0% / 37% | **7% / 32%** | 0% / 13% |
+  | churn | 2 ms / 10 ms | 0% / 29% | **34% / 37%** | 37% / 38% |
+
+  Better than either alternative on Havlak; on DeltaBlue's 10 ms window,
+  slightly below today's RC, whose one 6 ms pause leaves the rest of the
+  window free. The pacing rate trades this against memory
+  (`RTS_CC_BYTES_PER_STEP`): at 16 bytes per step, Havlak and DeltaBlue
+  reach 50% at 10 ms, but their peaks grow to 27 and 29 MB. The default (4)
+  takes the memory side. Raising utilization without that cost means less
+  work per check: each garbage box is visited in about eight passes.
+- Verify is the one step not sliced, a pass over the members still gray
+  (about 3 ns each). A check of a million boxes would make it a 3 ms pause.
+
 ## Risks and open questions
 
 - **Ownership churn.** An object moved between containers (popped from one
   worklist, pushed onto another) loses its owner each time; the check costs
   the size of its owned subtree. Cheap for leaves, expensive if large owned
   structures move around. Measure checks per second and their sizes.
-- **Unowned roots.** If a large structure stays unowned and its count changes
-  often (a root passed around through variables that are counted), every
-  change is a check over the whole tree. Possible fixes: frame-owned roots,
-  or not counting borrows from variables at all (borrowed parameters already
-  aren't).
+- **Unowned roots.** A large structure held from the stack was traced at
+  every check (Havlak). Survivors fixed that, at some memory cost (above).
+  Frame-owned roots would fix it without the memory cost.
 - **Space.** An owner link per object of a cyclic kind (8 bytes; acyclic
   kinds need none). That fights the memory thesis; alternatives are a side
   table, or owner-by-page.
@@ -244,12 +355,8 @@ sizes. Only the memory strategy differs.
 2. ~~Unowned-root checks, cycle collector off.~~ Done in the owners build.
    Memory target met. The pause target (≤ 1 ms everywhere) is not: Havlak
    3.7 ms, DeltaBlue 6.1 ms.
-3. **Bound each check.** The remaining pauses are single checks over large
-   sets: a dead constraint graph, or unowned roots with large trees. Options:
-   - free the garbage incrementally (the freeing half of the pause);
-   - cap a check's size and split it, which needs to know that nothing
-     mutated the part already traced;
-   - find why Havlak still has unowned roots with large trees (ownership
-     missed somewhere).
+3. ~~Bound each check.~~ Done: incremental checks (above). No pause over
+   1 ms on any program. Open: utilization during large checks, and the
+   verify pass, which grows with the check.
 4. **Make ownership the default build**, once throughput is measured
    (`bench/modes.py`, config `rc-owners`).

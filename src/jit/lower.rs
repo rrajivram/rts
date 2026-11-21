@@ -669,9 +669,14 @@ impl Lower<'_, '_> {
     fn dec_box(&mut self, p: CV) {
         let rc = self.b.ins().load(types::I32, mf(), p, 0);
         let fl = self.b.ins().load(types::I32, mf(), p, 4);
-        let mask = heap::QUIET as i64;
-        let m = self.b.ins().band_imm_u(fl, mask);
-        let quiet = self.b.ins().icmp_imm_u(IntCC::NotEqual, m, 0);
+        // `!heap::noisy(fl)`.
+        let m = self.b.ins().band_imm_u(fl, heap::NOISY_MASK as i64);
+        let quiet = if cfg!(feature = "owners") {
+            let m1 = self.b.ins().iadd_imm_s(m, -1);
+            self.b.ins().icmp_imm_u(IntCC::UnsignedLessThan, m1, heap::NOISY_FROM as i64)
+        } else {
+            self.b.ins().icmp_imm_u(IntCC::NotEqual, m, 0)
+        };
         let above1 = self.b.ins().icmp_imm_u(IntCC::UnsignedGreaterThan, rc, 1);
         let fast = self.b.ins().band(quiet, above1);
         let (fb, sb, done) = (self.b.create_block(), self.b.create_block(), self.b.create_block());

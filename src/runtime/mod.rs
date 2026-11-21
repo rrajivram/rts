@@ -429,8 +429,10 @@ pub struct Object {
 
 /// Inline slots for objects whose fields aren't known in advance.
 const MIN_INLINE: usize = 4;
-/// Where the inline slot count sits in the box header's flags.
-const CAP_SHIFT: u32 = 16;
+/// Where the inline slot count sits in the box header's flags (above the
+/// collector's bits).
+const CAP_SHIFT: u32 = 17;
+const _: () = assert!(heap::flag::INDEG_MASK < 1 << CAP_SHIFT);
 const MAX_INLINE: usize = (u32::MAX >> CAP_SHIFT) as usize;
 
 impl Object {
